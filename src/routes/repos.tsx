@@ -9,6 +9,7 @@ import { Switch } from "@/components/ui/switch";
 import { readPrs } from "@/lib/prs-db";
 import { invoke } from "@/lib/tauri";
 import { safeOpenUrl } from "@/lib/ui";
+import { useRepoSearch } from "@/lib/use-repo-search";
 import { type LocalRepo, parseGitRemote, useLocalRepos } from "@/stores/local-repos";
 import { usePrFilters } from "@/stores/pr-filters";
 import { useWatchedRepos } from "@/stores/watched-repos";
@@ -186,20 +187,11 @@ function AddRepoMenu({
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const ghRepos = useQuery({
-    queryKey: ["repos"],
-    queryFn: () => invoke<string[]>("gh_list_repos"),
-    enabled: menuOpen,
-    staleTime: 5 * 60_000,
-  });
   const q = query.trim();
   const isUrl = /^(https?:\/\/|git@|ssh:\/\/)/.test(q) || q.endsWith(".git");
-  const list = useMemo(() => {
-    const all = ghRepos.data ?? [];
-    if (isUrl) return [];
-    const f = q.toLowerCase();
-    return f ? all.filter((r) => r.toLowerCase().includes(f)) : all;
-  }, [ghRepos.data, q, isUrl]);
+  // Don't burn a search request on something that's plainly a clone URL.
+  const ghRepos = useRepoSearch(isUrl ? "" : query, menuOpen);
+  const list = isUrl ? [] : ghRepos.results;
 
   return (
     <div className="relative">
@@ -233,7 +225,7 @@ function AddRepoMenu({
                 <li className="px-2 py-1.5 text-xs text-muted-foreground">Loading your repos…</li>
               ) : list.length === 0 ? (
                 <li className="px-2 py-1.5 text-xs text-muted-foreground">
-                  No repositories found.
+                  {ghRepos.isSearching ? "Searching…" : "No repositories found."}
                 </li>
               ) : (
                 // Toggle watch; keep the menu open so you can pick several at once.
@@ -248,6 +240,9 @@ function AddRepoMenu({
                       {full}
                     </PopoverItem>
                   ))
+              )}
+              {ghRepos.isSearching && list.length > 0 && (
+                <li className="px-2 py-1.5 text-xs text-muted-foreground">Searching…</li>
               )}
             </ul>
           )}

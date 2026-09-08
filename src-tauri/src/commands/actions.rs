@@ -441,26 +441,122 @@ pub async fn gh_user(state: State<'_, AppState>, login: String) -> AppResult<Use
     Ok(res.json().await?)
 }
 
+/// Page a repo-list endpoint, collecting `full_name`s.
+/// `extra` carries endpoint-specific query params (affiliation, sort, …).
+async fn page_repo_list(
+    state: &AppState,
+    token: &str,
+    url: &str,
+    extra: &[(&str, &str)],
+) -> AppResult<Vec<String>> {
+    // Same defensive cap as the other paginated readers: 50 x 100 = 5000 repos.
+    const MAX_PAGES: u32 = 50;
+    let mut out: Vec<String> = Vec::new();
+    let mut page = 1u32;
+    loop {
+        let page_s = page.to_string();
+        let mut q: Vec<(&str, &str)> = vec![("per_page", "100"), ("page", page_s.as_str())];
+        q.extend_from_slice(extra);
+        let res = auth_request(state, token, reqwest::Method::GET, url)
+            .query(&q)
+            .send()
+            .await?;
+        let res = check(res).await?;
+        let repos: Vec<Value> = res.json().await?;
+        let n = repos.len();
+        for r in repos {
+            if let Some(full) = r.get("full_name").and_then(|v| v.as_str()) {
+                out.push(full.to_string());
+            }
+        }
+        if n < 100 || page >= MAX_PAGES {
+            break;
+        }
+        page += 1;
+    }
+    Ok(out)
+}
+
 /// List repositories the user can access (owned, collaborator, org member),
-/// most-recently-pushed first — used to pick a repo for Dependabot alerts.
+/// most-recently-pushed first — the instant default list behind the repo
+/// pickers, and the repo chooser for Dependabot alerts.
+///
+/// Deliberately only `/user/repos`: walking every org's repo list instead is
+/// complete but far too slow on large orgs (thousands of repos => a minute or
+/// more). Repos this endpoint can't see — notably `internal` ones the user
+/// reads via org/enterprise base permissions rather than a team — are reached
+/// by typing, through `gh_search_repos`.
 #[tauri::command]
 pub async fn gh_list_repos(state: State<'_, AppState>) -> AppResult<Vec<String>> {
     let token = creds::require_token()?;
-    let url = format!("{API}/user/repos");
-    let res = auth_request(&state, &token, reqwest::Method::GET, &url)
-        .query(&[
-            ("per_page", "100"),
+    page_repo_list(
+        &state,
+        &token,
+        &format!("{API}/user/repos"),
+        &[
             ("sort", "pushed"),
             ("affiliation", "owner,collaborator,organization_member"),
-        ])
-        .send()
-        .await?;
-    let res = check(res).await?;
-    let repos: Vec<Value> = res.json().await?;
-    Ok(repos
-        .into_iter()
-        .filter_map(|r| r.get("full_name").and_then(|v| v.as_str()).map(String::from))
-        .collect())
+        ],
+    )
+    .await
+}
+
+/// The `user:`/`org:` qualifiers that scope a repo search to everything this
+/// viewer can see. GitHub's search returns *nothing* for private and internal
+/// repos without them. Cached briefly — org membership changes rarely, and this
+/// is on the typeahead path.
+async fn repo_search_scope(state: &AppState, token: &str) -> AppResult<String> {
+    const SCOPE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+    const KEY: &str = "repo-search-scope";
+    if let Some(v) = state.cache_get(KEY, SCOPE_TTL) {
+        if let Some(s) = v.as_str() {
+            return Ok(s.to_string());
+        }
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    if let Ok(v) = crate::clients::github::viewer(state, token).await {
+        parts.push(format!("user:{}", v.login));
+    }
+    let res = auth_request(
+        state,
+        token,
+        reqwest::Method::GET,
+        &format!("{API}/user/orgs"),
+    )
+    .query(&[("per_page", "100")])
+    .send()
+    .await?;
+    let orgs: Vec<Value> = check(res).await?.json().await?;
+    for o in orgs {
+        if let Some(login) = o.get("login").and_then(|v| v.as_str()) {
+            parts.push(format!("org:{login}"));
+        }
+    }
+
+    let scope = parts.join(" ");
+    state.cache_put_etag(KEY.to_string(), Value::String(scope.clone()), None);
+    Ok(scope)
+}
+
+/// Repository typeahead — the other half of `gh_list_repos`. Scopes the query
+/// to the viewer's own account plus every org they belong to, so it finds
+/// repos `/user/repos` omits (internal repos held via base permissions) without
+/// paying to enumerate whole orgs. Callers should debounce: GitHub's search
+/// endpoint allows only ~30 requests/minute.
+#[tauri::command]
+pub async fn gh_search_repos(state: State<'_, AppState>, query: String) -> AppResult<Vec<String>> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let token = creds::require_token()?;
+    let scope = repo_search_scope(&state, &token).await?;
+    // No scope at all would search all of GitHub; return nothing instead.
+    if scope.is_empty() {
+        return Ok(Vec::new());
+    }
+    crate::clients::github::search_repos(&state, &token, &format!("{q} in:name {scope}")).await
 }
 
 #[tauri::command]

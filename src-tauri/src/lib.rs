@@ -357,6 +357,7 @@ pub fn run() {
             commands::actions::gh_disable_auto_merge,
             commands::actions::gh_dependabot_alerts,
             commands::actions::gh_list_repos,
+            commands::actions::gh_search_repos,
             commands::actions::gh_user,
             commands::actions::gh_update_branch,
             commands::actions::gh_set_draft,

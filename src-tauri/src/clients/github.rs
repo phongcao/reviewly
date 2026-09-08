@@ -239,15 +239,17 @@ fn rate_limit_wait(res: &Response) -> Option<u64> {
 /// without overriding the frontend's own (longer) staleness cadence.
 const SEARCH_TTL: Duration = Duration::from_secs(60);
 
-/// One throttled, cached, auto-retrying GET against `/search/issues`, returning
-/// the parsed JSON body. Identical concurrent queries coalesce on the cache.
+/// One throttled, cached, auto-retrying GET against a `/search/*` endpoint,
+/// returning the parsed JSON body. Identical concurrent queries coalesce on the
+/// cache. `path` is the endpoint (e.g. `/search/issues`, `/search/repositories`).
 async fn search_get(
     state: &AppState,
     token: &str,
+    path: &str,
     params: &[(&str, &str)],
 ) -> AppResult<serde_json::Value> {
     let key = format!(
-        "search?{}",
+        "{path}?{}",
         params.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")
     );
     if let Some(v) = state.cache_get(&key, SEARCH_TTL) {
@@ -260,7 +262,7 @@ async fn search_get(
         return Ok(v);
     }
 
-    let url = format!("{API}/search/issues");
+    let url = format!("{API}{path}");
     // Conditional request: a 304 returns our cached body and does NOT count
     // against the rate limit, so revalidating an expired entry is ~free.
     let etag = state.cache_etag(&key);
@@ -311,6 +313,7 @@ pub async fn search_prs(state: &AppState, token: &str, query: &str) -> AppResult
         let v = search_get(
             state,
             token,
+            "/search/issues",
             &[
                 ("q", query),
                 ("per_page", "100"),
@@ -335,7 +338,7 @@ pub async fn search_prs(state: &AppState, token: &str, query: &str) -> AppResult
 /// Total number of issues/PRs matching a search query (uses `total_count`,
 /// so it's accurate beyond the 50-item page cap and cheap with `per_page=1`).
 pub async fn search_count(state: &AppState, token: &str, query: &str) -> AppResult<u64> {
-    let v = search_get(state, token, &[("q", query), ("per_page", "1")]).await?;
+    let v = search_get(state, token, "/search/issues", &[("q", query), ("per_page", "1")]).await?;
     Ok(v.get("total_count").and_then(|c| c.as_u64()).unwrap_or(0))
 }
 
@@ -404,6 +407,28 @@ pub async fn list_repo_pulls(
         page += 1;
     }
     Ok(out)
+}
+
+/// Repository typeahead. `query` must already carry its scope qualifiers
+/// (`org:` / `user:`) — GitHub's search returns nothing for private or internal
+/// repos otherwise. Shares the search gate, cache and retry with the PR search.
+pub async fn search_repos(state: &AppState, token: &str, query: &str) -> AppResult<Vec<String>> {
+    let v = search_get(
+        state,
+        token,
+        "/search/repositories",
+        &[("q", query), ("per_page", "50"), ("sort", "updated")],
+    )
+    .await?;
+    Ok(v.get("items")
+        .and_then(|i| i.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|r| r.get("full_name").and_then(|f| f.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 pub async fn get_pull(
