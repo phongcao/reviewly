@@ -1,5 +1,6 @@
 import { AiReview } from "@/components/ai-review";
 import type { AiAction } from "@/lib/ai-actions";
+import { useAttachBridge } from "@/lib/ai/attach-bridge";
 import { buildReviewContext } from "@/lib/ai/context";
 import { parsePatch } from "@/lib/diff";
 import { type PullDetail, type PullFile, invoke } from "@/lib/tauri";
@@ -24,6 +25,9 @@ export function ChatWindowPage() {
   const { owner, repo, number: numberStr } = useParams({ from: "/chat/$owner/$repo/$number" });
   const number = Number(numberStr);
   const prKey = `${owner}/${repo}#${number}`;
+  // Attachments pinned in the main window arrive over this bridge (and our own
+  // removals go back the same way).
+  useAttachBridge(prKey);
 
   const detail = useQuery({
     queryKey: ["pull", owner, repo, number],
@@ -126,7 +130,12 @@ export function ChatWindowPage() {
         ) : detail.error || !detail.data ? (
           <p className="px-1 py-6 text-center text-xs text-destructive">Couldn't load this PR.</p>
         ) : (
-          <AiReview prKey={prKey} context={context} executeAction={executeAction} />
+          <AiReview
+            prKey={prKey}
+            context={context}
+            executeAction={executeAction}
+            files={files.data ?? []}
+          />
         )}
       </div>
     </div>

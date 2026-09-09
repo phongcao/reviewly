@@ -39,6 +39,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { UserAvatar } from "@/components/user-avatar";
 import { UserHoverCard } from "@/components/user-hover-card";
 import type { AiAction } from "@/lib/ai-actions";
+import { useAttachBridge } from "@/lib/ai/attach-bridge";
 import { buildReviewContext } from "@/lib/ai/context";
 import { parsePatch } from "@/lib/diff";
 import { isTestFile } from "@/lib/focus";
@@ -187,6 +188,13 @@ export function PRDetailPage() {
     setPersistedTab(prViewKey, next);
   };
   const [chatOpen, setChatOpen] = useState(false);
+  // Mounted here rather than inside AiReview: the chat panel unmounts when
+  // collapsed, and the bridge must keep listening so a detached chat window's
+  // edits still land in this window's store.
+  useAttachBridge(`${owner}/${repo}#${number}`);
+  // Once detached, that window owns the conversation — "Ask AI" raises it
+  // instead of re-opening the inline panel (two live views would both stream).
+  const chatDetachedRef = useRef(false);
   const [activeFile, setActiveFile] = useState<string | null>(null);
   // Review-screen search: Cmd+F find-in-diff, Cmd+P filter the file tree.
   const [findOpen, setFindOpen] = useState(false);
@@ -728,6 +736,7 @@ export function PRDetailPage() {
     const existing = await WebviewWindow.getByLabel(label);
     if (existing) {
       await existing.setFocus();
+      chatDetachedRef.current = true;
       setChatOpen(false);
       return;
     }
@@ -741,11 +750,29 @@ export function PRDetailPage() {
       resizable: true,
     });
     win.once("tauri://error", (e) => {
+      chatDetachedRef.current = false;
       toast.error(
         `Couldn't open the chat window — ${String((e as { payload?: unknown }).payload)}`,
       );
     });
+    chatDetachedRef.current = true;
     setChatOpen(false);
+  }
+
+  // Reveal the chat after code has been pinned to it from the diff.
+  async function revealChat() {
+    if (chatDetachedRef.current) {
+      const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+      const label = `chat-${owner}-${repo}-${number}`.replace(/[^a-zA-Z0-9_-]/g, "_");
+      const existing = await WebviewWindow.getByLabel(label);
+      if (existing) {
+        await existing.setFocus();
+        return;
+      }
+      // The user closed it — fall back to the inline panel.
+      chatDetachedRef.current = false;
+    }
+    setChatOpen(true);
   }
 
   // Fetch the currently-viewed file's HEAD content so the diff viewer can
@@ -1372,6 +1399,9 @@ export function PRDetailPage() {
                       headSha={headSha}
                       viewedKey={vk}
                       fileLinesLoading={fileContent.isLoading && fileContent.dataUpdatedAt === 0}
+                      onAskAi={() => {
+                        void revealChat();
+                      }}
                     />
                   ) : (
                     <EmptyState
@@ -1570,6 +1600,7 @@ export function PRDetailPage() {
                 prKey={`${owner}/${repo}#${number}`}
                 context={reviewContext}
                 executeAction={executeAiAction}
+                files={fileList}
               />
             </div>
           </div>

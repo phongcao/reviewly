@@ -1,9 +1,12 @@
 import { CommentByline } from "@/components/comment-byline";
 import { Composer } from "@/components/composer";
+import { DiffSelectionToolbar } from "@/components/diff-selection-toolbar";
 import { MarkdownBody } from "@/components/markdown-body";
 import { ReactionsBar } from "@/components/reactions-bar";
 import { ReviewThreadGroup } from "@/components/review-thread";
 import { TooltipFor } from "@/components/tooltip-for";
+import { buildSnippet, refFromLines } from "@/lib/ai/attach";
+import { attachContext } from "@/lib/ai/attach-bridge";
 import { type DiffLine, type Hunk, parsePatch, toSplit } from "@/lib/diff";
 import { detectLanguage, highlightLine } from "@/lib/lang";
 import type { DraftComment, ReviewThread, ReviewThreadGraphQL } from "@/lib/tauri";
@@ -19,6 +22,7 @@ import {
   ExternalLink,
   Link as LinkIcon,
   MessageSquarePlus,
+  Sparkles,
   TextQuote,
   UnfoldVertical,
   WrapText,
@@ -59,6 +63,8 @@ interface Props {
   viewedKey?: string | null;
   /** True while the full HEAD file content is still loading (for context UX). */
   fileLinesLoading?: boolean;
+  /** Opens (or focuses) the AI chat after code is pinned to it from the diff. */
+  onAskAi?: () => void;
 }
 
 interface GapInfo {
@@ -82,6 +88,10 @@ interface ThreadMeta {
   number: number;
   reviewThreads: ReviewThreadGraphQL[];
   viewerLogin?: string;
+  /** Enough to let the comment popover pin its line range to the chat. */
+  patch: string | null;
+  fileLines?: string[];
+  onAskAi?: () => void;
 }
 const ThreadMetaContext = createContext<ThreadMeta | null>(null);
 
@@ -129,6 +139,7 @@ export function DiffViewer({
   headSha,
   viewedKey,
   fileLinesLoading = false,
+  onAskAi,
 }: Props) {
   const hunks = useMemo(() => parsePatch(patch), [patch]);
   const lang = useMemo(() => detectLanguage(path), [path]);
@@ -316,6 +327,11 @@ export function DiffViewer({
       setRangeStart(null);
     },
     startDrag: (anchor) => {
+      // Drop any leftover text selection: a gutter drag makes none of its own
+      // (the gutter is select-none + preventDefault), so a stale one from an
+      // earlier drag would keep the "Ask AI" toolbar floating over the comment
+      // popover we're about to open.
+      window.getSelection()?.removeAllRanges();
       setDragAnchor(anchor);
       setDragEnd(anchor);
       setPopoverAt(null);
@@ -434,8 +450,22 @@ export function DiffViewer({
           </div>
         </div>
         {nullPatchExpanded && fullLines.length > 0 && (
-          <ThreadMetaContext.Provider value={{ owner, repo, number, reviewThreads, viewerLogin }}>
+          <ThreadMetaContext.Provider
+            value={{ owner, repo, number, reviewThreads, viewerLogin, patch, fileLines, onAskAi }}
+          >
+            <DiffSelectionToolbar
+              rootRef={rootRef}
+              path={path}
+              patch={patch}
+              view={view}
+              prKey={`${owner}/${repo}#${number}`}
+              fileLines={fileLines}
+              onAskAi={onAskAi}
+            />
             <div
+              ref={rootRef}
+              data-selectable
+              data-path={path}
               className={cn(
                 "font-mono text-xs",
                 density === "compact" ? "leading-[1.3]" : "leading-[1.55]",
@@ -459,11 +489,23 @@ export function DiffViewer({
   }
 
   return (
-    <ThreadMetaContext.Provider value={{ owner, repo, number, reviewThreads, viewerLogin }}>
+    <ThreadMetaContext.Provider
+      value={{ owner, repo, number, reviewThreads, viewerLogin, patch, fileLines, onAskAi }}
+    >
       {toolbar}
+      <DiffSelectionToolbar
+        rootRef={rootRef}
+        path={path}
+        patch={patch}
+        view={view}
+        prKey={`${owner}/${repo}#${number}`}
+        fileLines={fileLines}
+        onAskAi={onAskAi}
+      />
       <div
         ref={rootRef}
         data-selectable
+        data-path={path}
         className={cn(
           "font-mono text-xs",
           density === "compact" ? "leading-[1.3]" : "leading-[1.55]",
@@ -1018,7 +1060,6 @@ function RowUnified({
   const selected = isInRange(lineNum, side, ui);
   const isPopoverHere =
     ui.popoverAt != null && ui.popoverAt.side === side && ui.popoverAt.line === lineNum;
-  const canComment = lineNum != null;
 
   if (isHunk) {
     return <HunkHeaderBar text={line.text} gutter="w-24" />;
@@ -1026,25 +1067,20 @@ function RowUnified({
 
   return (
     <>
+      {/* No role/tabIndex on the row: `[role="button"] { user-select: none }`
+          (globals.css) would beat the inherited `text` from [data-selectable]
+          and make the diff unselectable. Keyboard commenting lives on the
+          CommentTrigger button instead, which is a real focusable button. */}
       <div
         data-line={line.newLine ?? undefined}
-        // Keyboard-focusable so a comment can be placed without the mouse:
-        // Enter (or space) opens the comment popover for this line.
-        tabIndex={canComment ? 0 : undefined}
-        role={canComment ? "button" : undefined}
-        aria-label={canComment ? `Line ${lineNum} — press Enter to comment` : undefined}
-        onKeyDown={
-          canComment
-            ? (e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  ui.open({ side, line: lineNum as number }, e.shiftKey);
-                }
-              }
-            : undefined
-        }
+        // Selection → "Ask AI" reads the file/line range off these (see lib/ai/attach).
+        // `data-line` stays new-line-only — focusLine/navComment need it unique.
+        data-diff-row=""
+        data-side={side}
+        data-new-line={line.newLine ?? undefined}
+        data-old-line={line.oldLine ?? undefined}
         className={cn(
-          "group flex outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-primary",
+          "group flex",
           selected ? "border-l-2 border-l-primary bg-primary/15" : lineBgClass(line.kind),
         )}
       >
@@ -1227,27 +1263,18 @@ function Half({
   const selected = isInRange(lineNum, side, ui);
   const isPopoverHere =
     ui.popoverAt != null && ui.popoverAt.side === side && ui.popoverAt.line === lineNum;
-  const canComment = lineNum != null;
 
   return (
     <div className="min-w-0">
+      {/* See RowUnified: no role="button" here, or the row stops being selectable. */}
       <div
         data-line={side === "RIGHT" ? (line.newLine ?? undefined) : undefined}
-        tabIndex={canComment ? 0 : undefined}
-        role={canComment ? "button" : undefined}
-        aria-label={canComment ? `Line ${lineNum} — press Enter to comment` : undefined}
-        onKeyDown={
-          canComment
-            ? (e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  ui.open({ side, line: lineNum as number }, e.shiftKey);
-                }
-              }
-            : undefined
-        }
+        data-diff-row=""
+        data-side={side}
+        data-new-line={line.newLine ?? undefined}
+        data-old-line={line.oldLine ?? undefined}
         className={cn(
-          "group flex outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-primary",
+          "group flex",
           selected ? "border-l-2 border-l-primary bg-primary/15" : lineBgClass(line.kind),
         )}
       >
@@ -1335,7 +1362,7 @@ function CommentTrigger({
         type="button"
         onClick={(e) => onClick(e.shiftKey)}
         className="absolute inset-0 m-auto flex h-4 w-4 items-center justify-center rounded text-primary opacity-0 hover:bg-primary/20 hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-1 focus-visible:ring-primary group-hover:opacity-80"
-        aria-label="Add comment (shift-click to extend range)"
+        aria-label="Add comment (shift-click, or shift+Enter, to extend range)"
       >
         <MessageSquarePlus className="size-3" />
       </button>
@@ -1352,9 +1379,24 @@ function CommentPopover({
   ui: CommentUiState;
   onSubmit: (c: DraftComment) => void;
 }) {
+  const meta = useContext(ThreadMetaContext);
   const r = rangeBounds(ui);
   if (!r) return null;
   const multi = r.from !== r.to;
+
+  // The same "pin this range to the chat" action the selection toolbar offers,
+  // reachable here without a mouse drag over the code itself.
+  function askAi(range: { side: Side; from: number; to: number }) {
+    if (!meta) return;
+    const code = buildSnippet(meta.patch, range.side, range.from, range.to, meta.fileLines);
+    attachContext(
+      `${meta.owner}/${meta.repo}#${meta.number}`,
+      refFromLines(path, range.side, range.from, range.to, code),
+    );
+    ui.close();
+    meta.onAskAi?.();
+  }
+
   return (
     <div className="mx-2 my-1.5 rounded-md border border-border/40 bg-popover/95 px-4 py-3 font-sans shadow-md backdrop-blur-xl">
       {/* The same Composer used in the Conversation tab — with a line chip in
@@ -1371,6 +1413,16 @@ function CommentPopover({
             <span className="rounded-md bg-primary/15 px-1.5 py-0.5 font-mono text-[11px] font-medium text-primary">
               {multi ? `Lines ${r.from}–${r.to}` : `Line ${r.from}`}
             </span>
+            {meta?.onAskAi && (
+              <button
+                type="button"
+                onClick={() => askAi(r)}
+                className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground/70 transition-colors hover:bg-primary/10 hover:text-primary"
+              >
+                <Sparkles className="size-3" />
+                Ask AI
+              </button>
+            )}
             {!multi && (
               <span className="inline-flex items-center gap-1 text-muted-foreground/55">
                 Shift-click another <MessageSquarePlus className="size-3" /> to extend

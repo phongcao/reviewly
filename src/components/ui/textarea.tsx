@@ -6,21 +6,46 @@ import { cn } from "@/lib/utils";
 import * as React from "react";
 import { createPortal } from "react-dom";
 
+/** One row of the `@` autocomplete (e.g. a changed file in the PR). */
+export interface MentionItem {
+  id: string;
+  label: string;
+  hint?: string;
+}
+
 export type TextareaProps = React.TextareaHTMLAttributes<HTMLTextAreaElement> & {
   /** Accepted for compat with coss/ui input-group; ignored here. */
   unstyled?: boolean;
   /** Disable the `:shortcode:` emoji autocomplete (on by default). */
   noEmoji?: boolean;
+  /**
+   * Enable an `@`-triggered autocomplete. `onPick` returns the literal text to
+   * splice in place of the `@token` — return nothing to just remove it (the
+   * caller is presumably showing the picked item some other way, e.g. a chip).
+   */
+  mentions?: {
+    search: (query: string) => MentionItem[];
+    onPick: (item: MentionItem) => string | void;
+  };
 };
 
-/** A `:` immediately after start/whitespace, followed by ≥1 shortcode char. */
-function detectColon(value: string, caret: number): { query: string; from: number } | null {
-  const before = value.slice(0, caret);
-  const m = before.match(/(?:^|[\s(])(:)([a-z0-9_+]+)$/i);
+/** A trigger char immediately after start/whitespace, plus its query. */
+function detectToken(
+  value: string,
+  caret: number,
+  re: RegExp,
+): { query: string; from: number } | null {
+  const m = value.slice(0, caret).match(re);
   if (!m) return null;
   const query = m[2];
   return { query, from: caret - query.length - 1 };
 }
+
+/** `:` then ≥1 shortcode char. */
+const EMOJI_RE = /(?:^|[\s(])(:)([a-z0-9_+]+)$/i;
+/** `@` then any run of non-space, non-`@` chars — `*` so a bare `@` opens the
+ *  list, and the class admits `/`, `.` and `-` so file paths work. */
+const MENTION_RE = /(?:^|[\s(])(@)([^\s@]*)$/;
 
 /** Set a controlled textarea's value so React's onChange fires (native setter). */
 function setNativeValue(el: HTMLTextAreaElement, value: string) {
@@ -29,8 +54,16 @@ function setNativeValue(el: HTMLTextAreaElement, value: string) {
   el.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
+type Popup =
+  | { kind: "emoji"; items: EmojiMatch[] }
+  | { kind: "mention"; items: MentionItem[] }
+  | null;
+
 const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
-  ({ className, unstyled: _unstyled, noEmoji, onChange, onKeyDown, onBlur, ...props }, ref) => {
+  (
+    { className, unstyled: _unstyled, noEmoji, mentions, onChange, onKeyDown, onBlur, ...props },
+    ref,
+  ) => {
     const innerRef = React.useRef<HTMLTextAreaElement | null>(null);
     const setRefs = (el: HTMLTextAreaElement | null) => {
       innerRef.current = el;
@@ -38,11 +71,11 @@ const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
       else if (ref) ref.current = el;
     };
 
-    const [matches, setMatches] = React.useState<EmojiMatch[]>([]);
+    const [popup, setPopup] = React.useState<Popup>(null);
     const [active, setActive] = React.useState(0);
     const [pos, setPos] = React.useState<{ x: number; y: number } | null>(null);
     const fromRef = React.useRef(0);
-    const open = !noEmoji && pos !== null && matches.length > 0;
+    const open = pos !== null && popup !== null && popup.items.length > 0;
 
     const close = () => setPos(null);
 
@@ -61,16 +94,30 @@ const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
     }, [pos]);
 
     function refresh(el: HTMLTextAreaElement) {
-      if (noEmoji) return;
       const caret = el.selectionStart ?? el.value.length;
-      const found = detectColon(el.value, caret);
-      const hits = found ? searchEmoji(found.query) : [];
-      if (!found || hits.length === 0) {
+
+      // Mentions take precedence; the two triggers can never both match, so at
+      // most one popup is ever open.
+      let next: Popup = null;
+      let from = 0;
+      const mention = mentions ? detectToken(el.value, caret, MENTION_RE) : null;
+      if (mention) {
+        next = { kind: "mention", items: mentions?.search(mention.query) ?? [] };
+        from = mention.from;
+      } else if (!noEmoji) {
+        const emoji = detectToken(el.value, caret, EMOJI_RE);
+        if (emoji) {
+          next = { kind: "emoji", items: searchEmoji(emoji.query) };
+          from = emoji.from;
+        }
+      }
+
+      if (!next || next.items.length === 0) {
         close();
         return;
       }
-      fromRef.current = found.from;
-      setMatches(hits);
+      fromRef.current = from;
+      setPopup(next);
       setActive(0);
       const c = getCaretCoordinates(el, caret);
       const rect = el.getBoundingClientRect();
@@ -80,11 +127,16 @@ const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
       });
     }
 
-    function pick(m: EmojiMatch) {
+    function pick(index: number) {
       const el = innerRef.current;
-      if (!el) return;
+      if (!el || !popup) return;
+      const item = popup.items[index];
+      if (!item) return;
       const caret = el.selectionStart ?? el.value.length;
-      const insert = `${m.char} `;
+      const insert =
+        popup.kind === "emoji"
+          ? `${(item as EmojiMatch).char} `
+          : (mentions?.onPick(item as MentionItem) ?? "");
       const next = el.value.slice(0, fromRef.current) + insert + el.value.slice(caret);
       setNativeValue(el, next);
       const at = fromRef.current + insert.length;
@@ -95,27 +147,26 @@ const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
       close();
     }
 
-    function handleChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
-      onChange?.(e);
-      refresh(e.currentTarget);
-    }
-
     function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
-      if (open) {
+      if (open && popup) {
         if (e.key === "ArrowDown") {
           e.preventDefault();
-          setActive((i) => (i + 1) % matches.length);
+          setActive((i) => (i + 1) % popup.items.length);
           return;
         }
         if (e.key === "ArrowUp") {
           e.preventDefault();
-          setActive((i) => (i - 1 + matches.length) % matches.length);
+          setActive((i) => (i - 1 + popup.items.length) % popup.items.length);
           return;
         }
         if (e.key === "Enter" || e.key === "Tab") {
           e.preventDefault();
           e.stopPropagation();
-          pick(matches[active]);
+          pick(active);
+          // IMPORTANT: return without calling `onKeyDown` — that early exit is
+          // what stops the AI chat composer (Enter = send) from firing off a
+          // message when the user meant to pick a completion. stopPropagation
+          // alone would NOT do it: both handlers sit on this same element.
           return;
         }
         if (e.key === "Escape") {
@@ -125,7 +176,7 @@ const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
           return;
         }
         // Caret-moving keys leave the value unchanged (so `refresh` won't fire),
-        // but move the caret away from the `:query` — close so the popup can't
+        // but move the caret away from the token — close so the popup can't
         // linger detached from the token it was anchored to.
         if (
           e.key === "ArrowLeft" ||
@@ -138,6 +189,11 @@ const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
         }
       }
       onKeyDown?.(e);
+    }
+
+    function handleChange(e: React.ChangeEvent<HTMLTextAreaElement>) {
+      onChange?.(e);
+      refresh(e.currentTarget);
     }
 
     return (
@@ -158,20 +214,24 @@ const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
         />
         {open &&
           pos &&
+          popup &&
           createPortal(
             // biome-ignore lint/a11y/useKeyWithMouseEvents: keyboard handled on the textarea
             <div
-              className="fixed z-[100] max-h-60 w-56 overflow-y-auto rounded-lg border border-border/60 bg-popover/95 p-1 text-sm shadow-xl backdrop-blur-xl"
+              className={cn(
+                "fixed z-[100] max-h-60 overflow-y-auto rounded-lg border border-border/60 bg-popover/95 p-1 text-sm shadow-xl backdrop-blur-xl",
+                popup.kind === "mention" ? "w-80" : "w-56",
+              )}
               style={{ left: pos.x, top: pos.y }}
               onMouseDown={(e) => e.preventDefault()}
             >
-              {matches.map((m, i) => (
+              {popup.items.map((item, i) => (
                 <button
-                  key={m.shortcode}
+                  key={popup.kind === "emoji" ? (item as EmojiMatch).shortcode : (item as MentionItem).id}
                   type="button"
                   onMouseDown={(e) => {
                     e.preventDefault();
-                    pick(m);
+                    pick(i);
                   }}
                   onMouseEnter={() => setActive(i)}
                   className={cn(
@@ -179,8 +239,28 @@ const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
                     i === active ? "bg-primary/15 text-foreground" : "text-muted-foreground",
                   )}
                 >
-                  <span className="text-base leading-none">{m.char}</span>
-                  <span className="truncate font-mono text-xs">:{m.shortcode}:</span>
+                  {popup.kind === "emoji" ? (
+                    <>
+                      <span className="text-base leading-none">{(item as EmojiMatch).char}</span>
+                      <span className="truncate font-mono text-xs">
+                        :{(item as EmojiMatch).shortcode}:
+                      </span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="shrink-0 truncate font-mono text-xs text-foreground">
+                        {(item as MentionItem).label}
+                      </span>
+                      {(item as MentionItem).hint && (
+                        <span
+                          dir="rtl"
+                          className="min-w-0 flex-1 truncate text-right font-mono text-[11px] text-muted-foreground/60"
+                        >
+                          {(item as MentionItem).hint}
+                        </span>
+                      )}
+                    </>
+                  )}
                 </button>
               ))}
             </div>,
