@@ -23,6 +23,7 @@ import {
   Link as LinkIcon,
   MessageSquarePlus,
   Sparkles,
+  SquarePen,
   TextQuote,
   UnfoldVertical,
   WrapText,
@@ -54,6 +55,8 @@ interface Props {
   focusLine?: number | null;
   /** Bumps on every focus request so repeat clicks re-trigger the scroll/flash. */
   focusNonce?: number;
+  /** Hand off to the local editor at an exact line. Omitted with no clone. */
+  onOpenInEditor?: (path: string, line: number) => void;
   /** PR head sha — enables GitHub permalinks for the file/line copy actions. */
   headSha?: string | null;
   /**
@@ -92,6 +95,8 @@ interface ThreadMeta {
   patch: string | null;
   fileLines?: string[];
   onAskAi?: () => void;
+  /** Open this file at a line in the reviewer's editor; absent with no clone. */
+  onOpenInEditor?: (line: number) => void;
 }
 const ThreadMetaContext = createContext<ThreadMeta | null>(null);
 
@@ -136,6 +141,7 @@ export function DiffViewer({
   density = "comfortable",
   focusLine,
   focusNonce,
+  onOpenInEditor,
   headSha,
   viewedKey,
   fileLinesLoading = false,
@@ -160,11 +166,23 @@ export function DiffViewer({
 
   const lineCtx: LineRenderCtx = { wrap: diffWrap };
 
-  // Scroll to + flash a target line when the guided tour jumps here. The
-  // `focusLine` carries a fresh value per request (incl. repeat clicks).
+  // Has a *new* focus request arrived on this render? Derived here rather than
+  // tracked inside one of the effects below, so both consumers (the scroll-to-
+  // line effect and the scroll-position restore) read the same answer without
+  // depending on the order React happens to run them in. Retired by the effect
+  // at the end of this component.
+  const seenFocusNonce = useRef(focusNonce);
+  const freshFocus = focusNonce !== seenFocusNonce.current;
+
+  // Scroll to + flash a target line when the guided tour jumps here.
+  //
+  // Gated on `freshFocus`, not just `focusLine != null`: the caller never clears
+  // `focusLine` back to null, so without this the effect re-fires on every
+  // later file change and flashes whatever unrelated line happens to share that
+  // number in the newly-opened file.
   // biome-ignore lint/correctness/useExhaustiveDependencies: re-run on focusLine even when path is unchanged
   useEffect(() => {
-    if (focusLine == null) return;
+    if (focusLine == null || !freshFocus) return;
     const root = rootRef.current;
     if (!root) return;
     let raf = 0;
@@ -208,10 +226,6 @@ export function DiffViewer({
   // biome-ignore lint/correctness/useExhaustiveDependencies: reset on file change
   useEffect(() => setNullPatchExpanded(false), [path]);
 
-  // Last focus request this component acted on, so a file change that arrives
-  // WITH a jump can be told apart from an ordinary one. See the effect below.
-  const lastFocusNonce = useRef(focusNonce);
-
   // Remember where the reviewer was in each file's diff, so leaving a file and
   // coming back resumes mid-file instead of snapping to the top — the position
   // is half of "where was I", and losing it on every `[` / `]` is what makes a
@@ -229,13 +243,7 @@ export function DiffViewer({
     // scrollIntoView off the same `path` change, and restoring underneath it
     // would yank the reviewer away from the step they just opened.
     //
-    // Keyed off a FRESH nonce, not `focusLine != null`: `focusLine` is never
-    // cleared back to null, so testing it would disable restore permanently
-    // after the first jump.
-    const focusing = focusNonce !== lastFocusNonce.current;
-    lastFocusNonce.current = focusNonce;
-
-    if (!focusing) {
+    if (!freshFocus) {
       const saved = viewedKey
         ? (useViewedFiles.getState().scrollOffsets?.[viewedKey]?.[path] ?? 0)
         : 0;
@@ -256,9 +264,14 @@ export function DiffViewer({
     return () => {
       if (viewedKey) useViewedFiles.getState().setScrollOffset(viewedKey, path, sc.scrollTop);
     };
-    // `focusNonce` is a dependency so the ref above stays current even when a
-    // jump lands on the file that's already open.
-  }, [path, viewedKey, focusNonce]);
+    // `freshFocus` is derived from `focusNonce`, so it belongs in the deps.
+  }, [path, viewedKey, freshFocus]);
+
+  // Declared after both readers so `freshFocus` stays true for the whole commit
+  // in which the request arrived, then goes false.
+  useEffect(() => {
+    seenFocusNonce.current = focusNonce;
+  });
 
   const gapFor = (idx: number): GapInfo | null => {
     if (!fileLines || fileLines.length === 0) return null;
@@ -494,7 +507,19 @@ export function DiffViewer({
         </div>
         {nullPatchExpanded && fullLines.length > 0 && (
           <ThreadMetaContext.Provider
-            value={{ owner, repo, number, reviewThreads, viewerLogin, patch, fileLines, onAskAi }}
+            value={{
+              owner,
+              repo,
+              number,
+              reviewThreads,
+              viewerLogin,
+              patch,
+              fileLines,
+              onAskAi,
+              onOpenInEditor: onOpenInEditor
+                ? (line: number) => onOpenInEditor(path, line)
+                : undefined,
+            }}
           >
             <DiffSelectionToolbar
               rootRef={rootRef}
@@ -1464,6 +1489,19 @@ function CommentPopover({
               >
                 <Sparkles className="size-3" />
                 Ask AI
+              </button>
+            )}
+            {meta?.onOpenInEditor && (
+              <button
+                type="button"
+                onClick={() => {
+                  meta.onOpenInEditor?.(r.from);
+                  ui.close();
+                }}
+                className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-2xs font-medium text-muted-foreground/70 transition-colors hover:bg-primary/10 hover:text-primary"
+              >
+                <SquarePen className="size-3" />
+                Open in editor
               </button>
             )}
             {!multi && (

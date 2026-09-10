@@ -488,9 +488,45 @@ export function PRDetailPage() {
   const currentFile = fileList.find((f) => f.filename === current) ?? null;
   // Review context pane — surrounding code beside the diff. Never feeds the
   // viewed-files store: reading a dependency isn't reviewing a change.
+  const lastEditorTargetId = useEditorPrefs((s) => s.lastTargetId);
+  const setLastEditorTargetId = useEditorPrefs((s) => s.setLastTargetId);
   const contextOpen = useReviewContext((s) => s.open);
   const toggleContext = useReviewContext((s) => s.toggle);
   const changedPaths = useMemo(() => fileList.map((f) => f.filename), [fileList]);
+
+  // Hand a diff line off to the reviewer's editor, opened on that exact line.
+  // Only offered when a clone is mapped — there is nothing on disk to open
+  // otherwise. Reuses the target the reviewer last picked in the header menu.
+  const openInEditor = useCallback(
+    async (file: string, line: number) => {
+      if (!localRepo) return;
+      const targets = await invoke<LocalEditorTarget[]>("local_editor_targets").catch(() => []);
+      const target =
+        targets.find((t) => t.id === lastEditorTargetId) ??
+        targets.find((t) => t.isDefault) ??
+        targets[0];
+      if (!target) {
+        toast.info("No supported editor found", {
+          description: "Install Zed, VS Code, or Cursor, or set $EDITOR to an installed editor.",
+        });
+        return;
+      }
+      try {
+        await invoke("open_local_editor", {
+          path: localRepo.path,
+          targetId: target.id,
+          file,
+          line,
+        });
+        setLastEditorTargetId(target.id);
+      } catch {
+        toast.error(`Couldn't open ${target.label}`, {
+          description: "The editor may have been removed or renamed.",
+        });
+      }
+    },
+    [localRepo, lastEditorTargetId, setLastEditorTargetId],
+  );
   // Cmd+P filter — narrows the file tree by filename (case-insensitive).
   const visibleFiles = fileFilter.trim()
     ? scopedFiles.filter((f) => f.filename.toLowerCase().includes(fileFilter.trim().toLowerCase()))
@@ -1446,6 +1482,7 @@ export function PRDetailPage() {
                       density={diffDensity}
                       focusLine={focusLine}
                       focusNonce={focusNonce}
+                      onOpenInEditor={localRepo ? openInEditor : undefined}
                       headSha={headSha}
                       viewedKey={vk}
                       fileLinesLoading={fileContent.isLoading && fileContent.dataUpdatedAt === 0}

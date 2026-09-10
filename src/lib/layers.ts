@@ -471,6 +471,19 @@ export const RISK_CHIP: Record<LayerRisk, string> = {
   high: "text-warning bg-warning/12",
 };
 
+/**
+ * Risk as a bare dot, for the stepper where there's no room for words.
+ *
+ * `low` is deliberately empty — an unmarked step reads as "nothing special
+ * here", which is what low risk means. Marking all three would spend ink on the
+ * layers that need least attention and flatten the signal.
+ */
+export const RISK_DOT: Record<LayerRisk, string> = {
+  low: "",
+  medium: "bg-info",
+  high: "bg-warning",
+};
+
 /** Short category labels for the file tree. Lowercase and single-word, matching
  * `HIDE_LABEL`, because the row has ~35px to spare. */
 export const CATEGORY_LABEL: Record<string, string> = {

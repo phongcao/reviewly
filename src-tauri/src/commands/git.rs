@@ -1297,31 +1297,211 @@ pub async fn local_editor_targets() -> AppResult<Vec<LocalEditorTarget>> {
     Ok(targets)
 }
 
+/// Per-editor CLI syntax for "open this file, at this line".
+///
+/// Every editor spells this differently, and the spelling is a property of the
+/// editor rather than of the review UI — so it lives here, next to the table
+/// that detects them, instead of being assembled in React.
+///
+/// An editor we don't have syntax for (including a synthetic `env-*` target
+/// built from `$EDITOR`) falls back to opening the file: landing in the right
+/// file and scrolling is still far better than opening the repository root, and
+/// guessing a flag risks the editor treating it as a filename.
+fn editor_cli_args(target_id: &str, file: &str, line: Option<u32>, column: Option<u32>) -> Vec<String> {
+    let Some(line) = line else {
+        return vec![file.to_string()];
+    };
+    // `<file>:<line>[:<col>]`, shared by the VS Code family, Zed and Sublime.
+    let suffixed = || {
+        let mut at = format!("{file}:{line}");
+        if let Some(c) = column {
+            at.push_str(&format!(":{c}"));
+        }
+        at
+    };
+    match target_id {
+        // VS Code and its forks need `-g` to read the suffix as a location
+        // rather than as a path containing colons.
+        "code" | "cursor" | "windsurf" => vec!["-g".to_string(), suffixed()],
+        "zed" | "sublime" => vec![suffixed()],
+        // JetBrains takes explicit flags, with the file last.
+        "webstorm" | "intellij" => {
+            let mut v = vec!["--line".to_string(), line.to_string()];
+            if let Some(c) = column {
+                v.push("--column".to_string());
+                v.push(c.to_string());
+            }
+            v.push(file.to_string());
+            v
+        }
+        "xcode" => vec!["-l".to_string(), line.to_string(), file.to_string()],
+        _ => vec![file.to_string()],
+    }
+}
+
+/// Resolve what to hand the editor: a file inside the repo when one is named,
+/// otherwise the repository itself (the long-standing behaviour).
+fn editor_open_path(repo_path: &str, file: Option<&str>) -> String {
+    match file {
+        Some(f) if !f.trim().is_empty() => {
+            let p = std::path::Path::new(f);
+            if p.is_absolute() {
+                f.to_string()
+            } else {
+                std::path::Path::new(repo_path).join(f).to_string_lossy().into_owned()
+            }
+        }
+        _ => repo_path.to_string(),
+    }
+}
+
 #[tauri::command]
-pub async fn open_local_editor(path: String, target_id: String) -> AppResult<()> {
+pub async fn open_local_editor(
+    path: String,
+    target_id: String,
+    file: Option<String>,
+    line: Option<u32>,
+    column: Option<u32>,
+) -> AppResult<()> {
     let target = local_editor_targets()
         .await?
         .into_iter()
         .find(|target| target.id == target_id)
         .ok_or_else(|| AppError::Other("editor is not installed".into()))?;
 
+    let opened = editor_open_path(&path, file.as_deref());
+
     if let Some(cmd) = target.command {
         crate::commands::ai::cli_command(&cmd)
-            .arg(path)
+            .args(editor_cli_args(&target_id, &opened, line, column))
             .spawn()
             .map_err(|e| AppError::Other(format!("failed to open editor: {e}")))?;
         return Ok(());
     }
 
     if let Some(app) = target.app_name {
+        // `open -a` has no line syntax; the file itself is as close as it gets.
         Command::new("open")
             .arg("-a")
             .arg(app)
-            .arg(path)
+            .arg(opened)
             .spawn()
             .map_err(|e| AppError::Other(format!("failed to open editor: {e}")))?;
         return Ok(());
     }
 
     Err(AppError::Other("editor is not installed".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{editor_cli_args, editor_open_path};
+
+    #[test]
+    fn without_a_line_every_editor_just_gets_the_path() {
+        for id in ["code", "cursor", "zed", "sublime", "intellij", "xcode", "env-vim"] {
+            assert_eq!(editor_cli_args(id, "/r/a.ts", None, None), vec!["/r/a.ts"], "{id}");
+        }
+    }
+
+    #[test]
+    fn vscode_family_uses_goto() {
+        assert_eq!(
+            editor_cli_args("code", "/r/a.ts", Some(42), None),
+            vec!["-g", "/r/a.ts:42"]
+        );
+        assert_eq!(
+            editor_cli_args("cursor", "/r/a.ts", Some(42), Some(7)),
+            vec!["-g", "/r/a.ts:42:7"]
+        );
+        assert_eq!(
+            editor_cli_args("windsurf", "/r/a.ts", Some(1), None),
+            vec!["-g", "/r/a.ts:1"]
+        );
+    }
+
+    #[test]
+    fn zed_and_sublime_take_the_suffix_bare() {
+        assert_eq!(editor_cli_args("zed", "/r/a.ts", Some(9), None), vec!["/r/a.ts:9"]);
+        assert_eq!(
+            editor_cli_args("sublime", "/r/a.ts", Some(9), Some(3)),
+            vec!["/r/a.ts:9:3"]
+        );
+    }
+
+    #[test]
+    fn jetbrains_uses_flags_with_the_file_last() {
+        assert_eq!(
+            editor_cli_args("intellij", "/r/a.ts", Some(12), None),
+            vec!["--line", "12", "/r/a.ts"]
+        );
+        assert_eq!(
+            editor_cli_args("webstorm", "/r/a.ts", Some(12), Some(4)),
+            vec!["--line", "12", "--column", "4", "/r/a.ts"]
+        );
+    }
+
+    #[test]
+    fn xcode_uses_dash_l() {
+        assert_eq!(
+            editor_cli_args("xcode", "/r/a.swift", Some(5), None),
+            vec!["-l", "5", "/r/a.swift"]
+        );
+    }
+
+    #[test]
+    fn an_unknown_editor_opens_the_file_rather_than_guessing_a_flag() {
+        assert_eq!(
+            editor_cli_args("env-helix", "/r/a.ts", Some(5), Some(2)),
+            vec!["/r/a.ts"]
+        );
+    }
+
+    #[test]
+    fn a_path_with_spaces_is_passed_through_untouched() {
+        // Args are handed to the process individually, so no quoting is needed
+        // — and adding any would reach the editor as literal characters.
+        assert_eq!(
+            editor_cli_args("code", "/r/my dir/a b.ts", Some(3), None),
+            vec!["-g", "/r/my dir/a b.ts:3"]
+        );
+    }
+
+    #[test]
+    fn a_relative_file_resolves_against_the_repo_root() {
+        assert_eq!(editor_open_path("/r", Some("src/a.ts")), "/r/src/a.ts");
+    }
+
+    #[test]
+    fn an_absolute_file_is_left_alone() {
+        assert_eq!(editor_open_path("/r", Some("/other/a.ts")), "/other/a.ts");
+    }
+
+    #[test]
+    fn no_file_still_opens_the_repository() {
+        assert_eq!(editor_open_path("/r", None), "/r");
+        assert_eq!(editor_open_path("/r", Some("")), "/r");
+        assert_eq!(editor_open_path("/r", Some("   ")), "/r");
+    }
+
+    /// Back-compat guard: the header menu still calls this command with only
+    /// `{path, targetId}`. Making `file`/`line`/`column` required would break
+    /// "open the repository" at runtime, where nothing else would catch it.
+    #[test]
+    fn the_legacy_two_argument_payload_still_deserializes() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            path: String,
+            target_id: String,
+            file: Option<String>,
+            line: Option<u32>,
+            column: Option<u32>,
+        }
+        // Exactly what the legacy header-menu call site sends.
+        let a: Args = serde_json::from_str(r#"{"path":"/r","targetId":"code"}"#).unwrap();
+        assert_eq!(a.path, "/r");
+        assert_eq!(a.target_id, "code");
+        assert!(a.file.is_none() && a.line.is_none() && a.column.is_none());
+    }
 }

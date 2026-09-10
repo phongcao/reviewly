@@ -10,6 +10,7 @@ import {
   type LayerPlan,
   type LayerStats,
   RISK_CHIP,
+  RISK_DOT,
   RISK_LABEL,
   type ReviewLayer,
   heuristicLayers,
@@ -394,6 +395,7 @@ export function LayerBar(props: BarProps) {
               type="button"
               onClick={() => enterLayer(layer)}
               aria-current={isActive ? "step" : undefined}
+              title={`${layer.title} · ${RISK_LABEL[layer.risk]} · ${s.viewed}/${s.files} reviewed`}
               className={cn(
                 "flex shrink-0 items-center gap-1.5 rounded-md px-1.5 py-1 text-xs transition-colors",
                 isActive
@@ -414,6 +416,12 @@ export function LayerBar(props: BarProps) {
                 {s.done ? <Check className="size-2.5" /> : i + 1}
               </span>
               <span className="max-w-[11rem] truncate">{layer.title}</span>
+              {RISK_DOT[layer.risk] && (
+                <span
+                  className={cn("size-1.5 shrink-0 rounded-full", RISK_DOT[layer.risk])}
+                  aria-hidden
+                />
+              )}
               <span className="shrink-0 tabular-nums text-muted-foreground/70">
                 {s.viewed}/{s.files}
               </span>
