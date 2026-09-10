@@ -19,6 +19,7 @@ import {
   type StepKind,
   type TourLayer,
   parseTourKey,
+  verdictDisplay,
 } from "@/lib/guided";
 import { detectLanguage, highlightLine } from "@/lib/lang";
 import { heuristicLayers, reconcileLayers } from "@/lib/layers";
@@ -594,6 +595,7 @@ function DeepTour({
           provider={oldest?.provider ?? ""}
           generatedAt={oldest?.generatedAt ?? Date.now()}
           progress={progress}
+          coverage={{ done: info.done.length, total: info.total }}
           focusIndex={focusIndex}
           onFocusConsumed={() => clearFocus(prKey)}
           stale={!!headSha && !!entry?.headSha && entry.headSha !== headSha}
@@ -953,6 +955,7 @@ function Tour({
   provider,
   generatedAt,
   progress,
+  coverage,
   focusIndex,
   onFocusConsumed,
   stale,
@@ -971,6 +974,12 @@ function Tour({
   /** Epoch ms the tour was generated. */
   generatedAt: number;
   progress: TourProgress;
+  /**
+   * How much of the PR the plan actually covers, for a tour assembled layer by
+   * layer. Omitted for a single-pass tour, which always saw the whole PR (up to
+   * the diff budget) in one call.
+   */
+  coverage?: { done: number; total: number };
   /** A stop to jump to once, on the reviewer's explicit request (opening one
    * layer of a deep tour). Null on every other render. */
   focusIndex?: number | null;
@@ -1250,6 +1259,25 @@ function Tour({
 
   const setLastVerdict = useReviewVerdict((s) => s.setLast);
   const verdict = plan.verdict ? VERDICT_META[plan.verdict] : null;
+
+  // A deep tour's verdict is folded from the layers that have LANDED, so an
+  // early "Suggests approve" can speak for a fraction of the PR. `verdictDisplay`
+  // owns that decision — see its comment for why approve is treated unlike the
+  // other two.
+  const display = verdictDisplay(plan.verdict, coverage);
+  const partial = display.partial;
+  const verdictLabel = verdict
+    ? partial
+      ? `${verdict.label} · ${partial.done} of ${partial.total} layers`
+      : verdict.label
+    : "";
+  const verdictTitle = partial
+    ? `Folded from the ${partial.done} layer${partial.done === 1 ? "" : "s"} toured so far. ${
+        partial.total - partial.done
+      } still untoured — this is not a verdict on the whole PR.`
+    : undefined;
+
+  const withheldApprove = display.kind === "withheld";
   const suggestionIdxs = useMemo(
     () => visible.filter((i) => !!plan.steps[i].suggestion),
     [visible, plan.steps],
@@ -1292,15 +1320,20 @@ function Tour({
       const s = plan.steps[i];
       if (s.suggestion) addComment(s, i, s.suggestion);
     }
-    if (plan.verdict) setLastVerdict(VERDICT_META[plan.verdict].event);
+    // Seeding APPROVE from a partial tour is the actual hazard the withheld
+    // chip exists to avoid — a label that says one thing while the Submit
+    // dialog is pre-set to another would be worse than saying nothing.
+    if (plan.verdict && display.seed) setLastVerdict(VERDICT_META[plan.verdict].event);
     toast.success(
       fresh.length > 0
         ? `${fresh.length} comment${fresh.length === 1 ? "" : "s"} added to your review`
         : "All suggestions are already in your review",
       {
-        description: verdict
-          ? `${verdict.label.replace("Suggests", "Suggested verdict:")} — open Submit to finish`
-          : "Open Submit to finish",
+        description: withheldApprove
+          ? `${partial?.done} of ${partial?.total} layers read clean — tour the rest before approving`
+          : verdict
+            ? `${verdictLabel.replace("Suggests", "Suggested verdict:")} — open Submit to finish`
+            : "Open Submit to finish",
       },
     );
   }
@@ -1408,17 +1441,28 @@ function Tour({
             </p>
             {(verdict || suggestionIdxs.length > 0) && (
               <div className="ml-auto flex shrink-0 items-center gap-2">
-                {verdict && (
+                {withheldApprove && partial ? (
+                  <span
+                    className="inline-flex items-center gap-1.5 rounded-full bg-foreground/[0.06] px-2.5 py-1 text-2xs font-medium text-muted-foreground"
+                    title={`Every layer toured so far reads clean, but ${
+                      partial.total - partial.done
+                    } of ${partial.total} are still untoured. Reviewly won't suggest approving a PR it hasn't finished reading.`}
+                  >
+                    <Layers className="size-3" />
+                    {partial.done} of {partial.total} layers read clean
+                  </span>
+                ) : verdict ? (
                   <span
                     className={cn(
                       "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-2xs font-medium",
                       verdict.chip,
                     )}
+                    title={verdictTitle}
                   >
                     <verdict.icon className="size-3" />
-                    {verdict.label}
+                    {verdictLabel}
                   </span>
-                )}
+                ) : null}
                 {suggestionIdxs.length > 0 && (
                   <Button size="xs" onClick={draftAsReview}>
                     <Sparkles className="size-3" />

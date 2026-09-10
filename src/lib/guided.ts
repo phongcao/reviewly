@@ -246,3 +246,43 @@ export function parseGuided(content: string): GuidedPlan | null {
   }
   return { summary, tour, verdict, verdictReason, steps };
 }
+
+/** How much of the PR a layer-by-layer tour has actually read. */
+export interface TourCoverage {
+  done: number;
+  total: number;
+}
+
+/** What the tour's verdict should look like, and whether it may act. */
+export interface VerdictDisplay {
+  kind: "none" | "verdict" | "withheld";
+  /** Coverage to name in the label, or null when the tour read everything. */
+  partial: TourCoverage | null;
+  /** May acting on the tour pre-set the reviewer's review verdict? */
+  seed: boolean;
+}
+
+/**
+ * Decide how to present a tour's verdict given how much of the PR it read.
+ *
+ * The asymmetry is the point. `request_changes` needs one objecting layer and
+ * is sound the moment one appears, so partial coverage doesn't weaken it — it
+ * is merely scoped, so the reviewer can see how much was read. "Nothing here
+ * blocks" is different: it is only true of code that has actually been read, so
+ * an `approve` folded from a fraction of the layers is withheld entirely rather
+ * than shown with a caveat, and never pre-sets the reviewer's verdict.
+ *
+ * A tour with no coverage information is a single-pass tour, which saw the
+ * whole PR (up to the diff budget) in one call.
+ */
+export function verdictDisplay(
+  verdict: GuidedVerdict | undefined,
+  coverage?: TourCoverage,
+): VerdictDisplay {
+  if (!verdict) return { kind: "none", partial: null, seed: false };
+
+  const partial = coverage && coverage.done < coverage.total ? coverage : null;
+  if (!partial) return { kind: "verdict", partial: null, seed: true };
+  if (verdict === "approve") return { kind: "withheld", partial, seed: false };
+  return { kind: "verdict", partial, seed: true };
+}
