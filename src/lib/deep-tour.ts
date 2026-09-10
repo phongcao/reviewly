@@ -1,4 +1,4 @@
-import { STEP_CAP_LAYER, stepBudget } from "@/lib/ai/budget";
+import { layerStepCap, stepBudget } from "@/lib/ai/budget";
 import {
   type ContextOptions,
   LAYER_DIFF_BUDGET,
@@ -211,7 +211,7 @@ export function buildTourJobs(o: {
       };
       const ctx = o.buildContext(subset, { budget: LAYER_DIFF_BUDGET, scope });
       const system = buildGuidedSystem({
-        steps: stepBudget(ctx.size, { cap: STEP_CAP_LAYER }),
+        steps: stepBudget(ctx.size, { cap: layerStepCap(ctx.size) }),
         size: ctx.size,
         layer: scope,
       });

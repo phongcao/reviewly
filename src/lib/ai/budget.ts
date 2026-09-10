@@ -38,9 +38,26 @@ export interface CountBand {
  * fan out over layers (see `shouldFanOut`), not to ask one call for more. */
 export const STEP_CAP_SINGLE = 24;
 
-/** Ceiling for one layer's call in a fanned-out deep tour. Lower than the single
- * cap because the total is the sum across layers, which is unbounded. */
-export const STEP_CAP_LAYER = 12;
+/** Floor for one layer's ceiling in a fanned-out deep tour — what a normally
+ * sized layer gets. Lower than the single cap because a tour's total is the sum
+ * across layers; `layerStepCap` is how a bigger layer earns more than this. */
+export const STEP_CAP_LAYER_MIN = 12;
+
+/** Ceiling for one layer's call however big the layer is. Equal to the single
+ * cap because the binding constraint is the same one — past ~24 steps a single
+ * reply risks the model's output limit — and no one slice should be allowed to
+ * ask for more than a whole-PR call would. */
+export const STEP_CAP_LAYER_MAX = STEP_CAP_SINGLE;
+
+/** Visible units past which a layer counts as oversized and starts earning
+ * extra stops. Sits where `stepBudget`'s own target crosses
+ * `STEP_CAP_LAYER_MIN`, so the cap is continuous across the knee rather than
+ * jumping. */
+const LAYER_CAP_KNEE = 13;
+
+/** Extra stops per visible unit past the knee — a bit over half the base rate,
+ * so roughly one more stop per 2 further files or ~200 further changed lines. */
+const LAYER_CAP_SLOPE = 0.4;
 
 /** Ceiling on layers. Past ~10 slices the layering stops being a reading order
  * and becomes a second file tree. */
@@ -86,6 +103,36 @@ export function stepBudget(s: PrSize, opts?: { cap?: number }): CountBand {
   const target = Math.round(3 + reviewUnits(s) * 0.7);
   const max = Math.min(opts?.cap ?? STEP_CAP_SINGLE, Math.max(5, target));
   return { min: Math.max(2, Math.round(max * 0.5)), max };
+}
+
+/**
+ * Ceiling for ONE layer's call in a fanned-out deep tour, scaled to the layer.
+ *
+ * A flat cap made every oversized layer look identical to the model: past ~13
+ * visible units `stepBudget`'s target ran into the ceiling, so a 9-file layer
+ * and a 60-file layer were both handed the same "6 to 12 stops" and came back
+ * the same length. The ceiling now grows with what the model can SEE of the
+ * layer — visible units, never total — so a big slice earns more stops without
+ * ever being asked to narrate code that was truncated out of its context.
+ *
+ * | visible units | ~layer size          | cap |
+ * |---------------|----------------------|-----|
+ * | ≤13           | 8 files, 400 lines   | 12  |
+ * | 20            | 12 files, 650 lines  | 15  |
+ * | 30            | 18 files, 950 lines  | 19  |
+ * | 43+           | 25 files, 1.4k lines | 24  |
+ *
+ * The tour's total is still the sum over layers (at most `LAYER_CAP` of them),
+ * which is the price of covering a PR too big for one call honestly.
+ */
+export function layerStepCap(s: PrSize): number {
+  const over = reviewUnits(s) - LAYER_CAP_KNEE;
+  if (over <= 0) return STEP_CAP_LAYER_MIN;
+  return clamp(
+    Math.round(STEP_CAP_LAYER_MIN + over * LAYER_CAP_SLOPE),
+    STEP_CAP_LAYER_MIN,
+    STEP_CAP_LAYER_MAX,
+  );
 }
 
 /**
