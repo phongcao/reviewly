@@ -5,6 +5,7 @@ import { TitleBar } from "@/app/title-bar";
 import { useAppBehaviorSync } from "@/app/use-app-behavior-sync";
 import { useAuthBootstrap } from "@/app/use-auth-bootstrap";
 import { useClipboardSniff } from "@/app/use-clipboard-sniff";
+import { useDeepTourEvents } from "@/app/use-deep-tour-events";
 import { useDependabotEvents } from "@/app/use-dependabot-events";
 import { useGlobalShortcuts } from "@/app/use-global-shortcuts";
 import { useGuidedEvents } from "@/app/use-guided-events";
@@ -83,6 +84,7 @@ export function AppLayout({ children }: { children: ReactNode }) {
   usePrSync();
   useGuidedEvents();
   useLayersEvents();
+  useDeepTourEvents();
   useDependabotEvents();
   useNativeChrome();
   useNotifSync();

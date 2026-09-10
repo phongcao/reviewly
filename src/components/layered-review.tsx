@@ -1,9 +1,11 @@
 import { TooltipFor } from "@/components/tooltip-for";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import { buildLayerContext } from "@/lib/ai/context";
-import { LAYERED_SYSTEM } from "@/lib/ai/prompts";
+import { layerBudget } from "@/lib/ai/budget";
+import { type ContextOptions, type ReviewContext, buildLayerContext } from "@/lib/ai/context";
+import { buildLayeredSystem } from "@/lib/ai/prompts";
 import { useAiAvailable } from "@/lib/ai/use-ai-available";
+import { useDeepTourRunner } from "@/lib/ai/use-deep-tour";
 import {
   type LayerPlan,
   type LayerRisk,
@@ -20,11 +22,21 @@ import type { PullFile } from "@/lib/tauri";
 import { invoke } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import { PROVIDER_LABEL, aiInvokeArgs, useAiProvider } from "@/stores/ai";
+import { useDeepTour } from "@/stores/deep-tour";
+import { useDeepTourGen } from "@/stores/deep-tour-gen";
 import { useLayers } from "@/stores/layers";
 import { useLayersGen } from "@/stores/layers-gen";
 import { useReviewPrefs } from "@/stores/review-prefs";
 import { useViewedFiles } from "@/stores/viewed-files";
-import { AlertTriangle, Check, Layers, RefreshCw, SplitSquareVertical, X } from "lucide-react";
+import {
+  AlertTriangle,
+  Check,
+  Compass,
+  Layers,
+  RefreshCw,
+  SplitSquareVertical,
+  X,
+} from "lucide-react";
 import { type ReactNode, useCallback, useEffect, useMemo } from "react";
 import { toast } from "sonner";
 
@@ -155,13 +167,19 @@ const RISK_CHIP: Record<LayerRisk, string> = {
 interface BarProps {
   scope: LayerScope;
   prKey: string;
-  /** Self-contained PR context (metadata + diff) for the planner. */
-  context: string;
+  /** Self-contained PR context (metadata + diff) for the planner, plus the PR's
+   * size — which sets how many layers the plan asks for. */
+  context: ReviewContext;
   files: PullFile[];
   headSha?: string;
   viewedKey: string | null;
   /** Open a file in the diff pane (used when moving between layers). */
   onSelectFile: (path: string) => void;
+  /** Rebuild the review context for a subset of the PR's files — a per-layer
+   * tour needs one context per layer. */
+  buildContext: (subset: PullFile[], opts?: ContextOptions) => ReviewContext;
+  /** Switch the review to the guided pane, where the tour renders. */
+  onOpenGuided?: () => void;
 }
 
 /**
@@ -178,6 +196,15 @@ export function LayerBar(props: BarProps) {
   const error = useLayersGen((s) => s.error[prKey]);
   const setViewed = useViewedFiles((s) => s.setViewed);
   const aiName = PROVIDER_LABEL[provider];
+  const runDeepTour = useDeepTourRunner({
+    prKey,
+    files,
+    headSha,
+    buildContext: props.buildContext,
+  });
+  // A layer already toured, or one being toured right now.
+  const touredLayers = useDeepTour((s) => s.byPr[prKey]?.byLayer);
+  const tourGen = useDeepTourGen((s) => s.byPr[prKey]);
 
   // Recover the "planning" state when a background run for this PR is still
   // going after navigating away or refreshing (the Rust task outlives both).
@@ -202,7 +229,10 @@ export function LayerBar(props: BarProps) {
       // and handing the agent a checkout turns a ~20s call into a multi-minute
       // agentic run for a plan that wouldn't get better.
       cwd: null,
-      prompt: `${LAYERED_SYSTEM}${custom}\n\n# Pull request\n${buildLayerContext(props.context, files)}`,
+      prompt: `${buildLayeredSystem({
+        layers: layerBudget(props.context.size),
+        size: props.context.size,
+      })}${custom}\n\n# Pull request\n${buildLayerContext(props.context.text, files)}`,
     }).catch((e) => useLayersGen.getState().fail(prKey, String(e)));
   }, [prKey, headSha, aiInstructions, props.context, files]);
 
@@ -438,13 +468,39 @@ export function LayerBar(props: BarProps) {
               </ul>
             )}
           </div>
-          <Button
-            size="sm"
-            variant={activeStats.done ? "outline" : "default"}
-            onClick={completeLayer}
-          >
-            {activeStats.done ? "Next layer" : "Mark layer reviewed"}
-          </Button>
+          <div className="flex shrink-0 items-center gap-1.5">
+            {available === true && props.onOpenGuided && (
+              <Button
+                size="sm"
+                variant="outline"
+                disabled={
+                  !!tourGen?.running.includes(active.id) ||
+                  !!tourGen?.queued.some((j) => j.layerId === active.id)
+                }
+                onClick={() => {
+                  // Already toured: just go read it rather than paying for the
+                  // same call twice.
+                  if (!touredLayers?.[active.id]) runDeepTour([active.id]);
+                  // Either way this is an explicit "take me to THIS layer" —
+                  // the tour jumps to its first stop, now or once it lands.
+                  // Set after `runDeepTour`, which may have restarted the entry
+                  // (and with it, dropped any pending request).
+                  useDeepTour.getState().focusLayer(prKey, active.id);
+                  props.onOpenGuided?.();
+                }}
+              >
+                <Compass className="size-3.5" />
+                {touredLayers?.[active.id] ? "Read tour" : "Tour this layer"}
+              </Button>
+            )}
+            <Button
+              size="sm"
+              variant={activeStats.done ? "outline" : "default"}
+              onClick={completeLayer}
+            >
+              {activeStats.done ? "Next layer" : "Mark layer reviewed"}
+            </Button>
+          </div>
         </div>
       )}
     </Shell>

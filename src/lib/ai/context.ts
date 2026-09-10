@@ -1,3 +1,4 @@
+import { type PrSize, toCoverage } from "@/lib/ai/budget";
 import type { PullDetail, PullFile } from "@/lib/tauri";
 
 /** Total character budget for the diff portion of the AI context. Claude and
@@ -5,6 +6,17 @@ import type { PullDetail, PullFile } from "@/lib/tauri";
  * an argument (well under ARG_MAX at this size), so a large PR gets a richer,
  * less-truncated diff without risking a spawn failure. */
 const DIFF_BUDGET = 90_000;
+
+/** Budget for one layer's call in a fanned-out deep tour. Smaller than the
+ * whole-PR budget because a single layer rarely binds against it, and a shorter
+ * prompt keeps each of the many calls fast. */
+export const LAYER_DIFF_BUDGET = 60_000;
+
+/** Floor on a single file's share of the budget. Below this a slice is a few
+ * hunk headers and no code — it teaches the model nothing and only costs it
+ * attention, so past the point where every file could get this much we omit the
+ * tail (and say so) instead of shredding everything. */
+const MIN_SLICE = 2_000;
 
 /** Lower rank = more important to show the model first. */
 function fileRank(name: string): number {
@@ -23,19 +35,48 @@ function fileRank(name: string): number {
   return 0; // source
 }
 
+/** One layer of a layered plan, as described to a per-layer tour call. */
+export interface LayerScopeInfo {
+  title: string;
+  intent: string;
+  focus: string[];
+  /** 0-based position in the plan. */
+  index: number;
+  total: number;
+}
+
+export interface ContextOptions {
+  /** Character budget for the diff. Defaults to `DIFF_BUDGET`. */
+  budget?: number;
+  /** Present when this context covers ONE layer rather than the whole PR —
+   * renders the "## This slice" block that fences the call's scope. */
+  scope?: LayerScopeInfo;
+}
+
+/** A built context plus what the model can actually see of the PR, which is what
+ * every count budget is derived from. */
+export interface ReviewContext {
+  text: string;
+  size: PrSize;
+}
+
 /**
  * Build a self-contained AI review context from a PR's metadata + diff.
- * Files are ordered by reviewer-relevance (source → tests → config →
- * generated), big changes first; the diff is budget-bounded with **per-file
- * truncation** (never a silent tail-drop), and what got cut is reported so the
- * model knows it didn't see everything.
+ *
+ * Files are ordered by reviewer-relevance (source → tests → config → generated),
+ * big changes first. The diff is budget-bounded by **fair-share water-filling**:
+ * each file may take at most `remaining / filesLeft`, recomputed every
+ * iteration, so unused share flows forward and one oversize file can no longer
+ * consume the budget and take the rest of the PR down with it. What got cut is
+ * reported to the model in a `## Note`, and to the caller as `size.coverage`.
  */
 export function buildReviewContext(
   detail: PullDetail,
   files: PullFile[],
   repoKey: string,
   number: number,
-): string {
+  opts?: ContextOptions,
+): ReviewContext {
   const d = detail;
   const head = [
     `Pull request ${repoKey}#${number}: ${d.title}`,
@@ -53,31 +94,57 @@ export function buildReviewContext(
     return b.additions + b.deletions - (a.additions + a.deletions);
   });
 
-  let budget = DIFF_BUDGET;
+  let remaining = opts?.budget ?? DIFF_BUDGET;
+  let left = sorted.length;
   const blocks: string[] = [];
   const omitted: string[] = [];
   let truncated = 0;
+  let churn = 0;
+  let shownFiles = 0;
+  let shownChurn = 0;
 
   for (const f of sorted) {
+    // Recomputed per file, so budget an earlier file didn't need is available
+    // to this one — while no single file can starve the ones behind it.
+    const share = Math.max(MIN_SLICE, Math.floor(remaining / Math.max(1, left)));
+    left--;
+
+    const fileChurn = f.additions + f.deletions;
+    churn += fileChurn;
+
     const label = `### ${f.filename} (+${f.additions} / -${f.deletions})`;
     if (!f.patch) {
+      // Binary, or a pure rename — listed so the model knows it changed, but
+      // there is nothing to read and nothing to charge against the budget.
       blocks.push(`${label}\n(no textual diff)`);
       continue;
     }
+
     const full = `${label}\n\`\`\`diff\n${f.patch}\n\`\`\``;
-    if (full.length <= budget) {
+    if (full.length <= share && full.length <= remaining) {
       blocks.push(full);
-      budget -= full.length;
+      remaining -= full.length;
+      shownFiles++;
+      shownChurn += fileChurn;
       continue;
     }
-    // Doesn't fit: truncate this file's patch to what's left, rather than
-    // dropping it (and everything after) silently.
-    const room = budget - label.length - 40;
+
+    // Doesn't fit its share: show as much as the share allows rather than
+    // dropping the file entirely.
+    const room = Math.min(share, remaining) - label.length - 40;
     if (room > 400) {
-      const cut = f.patch.slice(0, room);
+      const raw = f.patch.slice(0, room);
+      // Cut on a line boundary so the model never sees half a diff line — but
+      // don't give back more than 200 chars chasing one.
+      const nl = raw.lastIndexOf("\n");
+      const cut = nl >= room - 200 ? raw.slice(0, nl) : raw;
       blocks.push(`${label}\n\`\`\`diff\n${cut}\n… (diff truncated)\n\`\`\``);
       truncated++;
-      budget = 0;
+      remaining = Math.max(0, remaining - (cut.length + label.length + 40));
+      shownFiles++;
+      // Truncation-aware: a half-shown file contributes half its lines, so
+      // `coverage` reflects what the model can really review.
+      shownChurn += Math.round(fileChurn * (cut.length / f.patch.length));
     } else {
       omitted.push(f.filename);
     }
@@ -93,7 +160,35 @@ export function buildReviewContext(
   }
   const footer = notes.length > 0 ? `\n\n## Note\n${notes.join(" ")}` : "";
 
-  return `${head}\n\n## Diff\n\n${blocks.join("\n\n")}${footer}`;
+  const scope = opts?.scope ? `\n\n${renderScope(opts.scope, files.length)}` : "";
+
+  return {
+    text: `${head}${scope}\n\n## Diff\n\n${blocks.join("\n\n")}${footer}`,
+    size: {
+      files: files.length,
+      churn,
+      shownFiles,
+      shownChurn,
+      coverage: toCoverage(shownChurn, churn),
+    },
+  };
+}
+
+/**
+ * The "you are reading one slice" block. It has to be emphatic: a per-layer call
+ * sees a fraction of the PR, and without an explicit fence the model treats the
+ * files it wasn't given as missing and flags their absence.
+ */
+function renderScope(s: LayerScopeInfo, fileCount: number): string {
+  const lines = [
+    `## This slice (layer ${s.index + 1} of ${s.total}: "${s.title}")`,
+    `You are touring ONE layer of a larger pull request.${s.intent ? ` What this layer changes: ${s.intent}` : ""}`,
+  ];
+  if (s.focus.length > 0) lines.push(`Verify while reading: ${s.focus.join("; ")}`);
+  lines.push(
+    `The ${fileCount} file(s) below are the ENTIRE scope of this call. Every other file in the PR is being toured separately by another call — never anchor a step outside these files, and never flag a file as missing just because it isn't here.`,
+  );
+  return lines.join("\n");
 }
 
 /**

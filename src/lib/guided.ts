@@ -16,10 +16,26 @@ export interface GuidedStep {
   detail: string;
   /** Optional ready-to-post review comment (only when the stop deserves one). */
   suggestion?: string;
+  /** Which layer of a deep tour produced this stop. Never set by the model —
+   * stamped during `mergeDeepTour`, and absent on a classic whole-PR tour. */
+  layerId?: string;
 }
 
 /** The tour's overall recommendation, surfaced as a suggested review verdict. */
 export type GuidedVerdict = "approve" | "request_changes" | "comment";
+
+/** One layer heading in a merged deep tour, in the partition's reading order.
+ * Carries `index`/`total` so a heading can say "Layer 2 of 10" even when the
+ * layers in between haven't been toured yet. */
+export interface TourLayer {
+  id: string;
+  title: string;
+  /** 1-based position in the WHOLE partition, not among the landed layers. */
+  index: number;
+  total: number;
+  /** How many of this layer's stops are in the merged step list. */
+  steps: number;
+}
 
 export interface GuidedPlan {
   /** One sentence: what this PR does. */
@@ -31,6 +47,32 @@ export interface GuidedPlan {
   /** One-sentence justification for the verdict (why approve / what blocks). */
   verdictReason?: string;
   steps: GuidedStep[];
+  /** Layer headings for a merged deep tour, in plan order. Absent on a classic
+   * whole-PR tour, which has no layers to divide. */
+  layers?: TourLayer[];
+}
+
+/**
+ * Background-task key prefix for ONE layer of a deep tour. The backend keys AI
+ * runs by an opaque string and broadcasts `ai:done` to every listener, so each
+ * surface needs a disjoint namespace — a classic whole-PR tour uses the bare
+ * `prKey`, the layered planner uses `layers:`, and a deep tour uses this. Same
+ * reasoning as `LAYERS_KEY_PREFIX` in `@/lib/layers`.
+ */
+export const TOUR_KEY_PREFIX = "tour:";
+
+/** `tour:<layerId>@<owner>/<repo>#<number>` — `@` appears in neither half, so
+ * the split back apart is unambiguous. */
+export const tourKey = (prKey: string, layerId: string): string =>
+  `${TOUR_KEY_PREFIX}${layerId}@${prKey}`;
+
+/** Inverse of `tourKey`; null for any key that isn't a deep-tour layer. */
+export function parseTourKey(key: string): { prKey: string; layerId: string } | null {
+  if (!key.startsWith(TOUR_KEY_PREFIX)) return null;
+  const rest = key.slice(TOUR_KEY_PREFIX.length);
+  const at = rest.indexOf("@");
+  if (at <= 0 || at === rest.length - 1) return null;
+  return { layerId: rest.slice(0, at), prKey: rest.slice(at + 1) };
 }
 
 /** Coerce a raw verdict string to a known value, or undefined. */

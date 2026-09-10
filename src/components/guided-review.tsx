@@ -3,18 +3,34 @@ import { IconButton } from "@/components/icon-button";
 import { KiteLoader } from "@/components/kite-loader";
 import { MarkdownBody } from "@/components/markdown-body";
 import { Button } from "@/components/ui/button";
-import { CLONE_ABSENT_CLAUSE, GUIDED_SYSTEM } from "@/lib/ai/prompts";
+import { Spinner } from "@/components/ui/spinner";
+import { STEP_CAP_SINGLE, shouldFanOut, stepBudget } from "@/lib/ai/budget";
+import type { ContextOptions, ReviewContext } from "@/lib/ai/context";
+import { CLONE_ABSENT_CLAUSE, buildGuidedSystem } from "@/lib/ai/prompts";
 import { useAiAvailable } from "@/lib/ai/use-ai-available";
+import { useDeepTourRunner } from "@/lib/ai/use-deep-tour";
+import { type DeepTourProgress, deepTourProgress, mergeDeepTour, stepId } from "@/lib/deep-tour";
 import { parsePatch } from "@/lib/diff";
 import { relativeTime } from "@/lib/format";
-import type { GuidedStep, GuidedVerdict, StepKind } from "@/lib/guided";
+import {
+  type GuidedPlan,
+  type GuidedStep,
+  type GuidedVerdict,
+  type StepKind,
+  type TourLayer,
+  parseTourKey,
+} from "@/lib/guided";
 import { detectLanguage, highlightLine } from "@/lib/lang";
+import { heuristicLayers, reconcileLayers } from "@/lib/layers";
 import type { DraftComment, PullFile } from "@/lib/tauri";
 import { invoke } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import { PROVIDER_LABEL, aiInvokeArgs, useAiProvider } from "@/stores/ai";
-import { type GuidedEntry, useGuided } from "@/stores/guided";
+import { type DeepTourEntry, useDeepTour } from "@/stores/deep-tour";
+import { useDeepTourGen } from "@/stores/deep-tour-gen";
+import { useGuided } from "@/stores/guided";
 import { useGuidedGen } from "@/stores/guided-gen";
+import { useLayers } from "@/stores/layers";
 import { useLocalRepos } from "@/stores/local-repos";
 import { useReviewPrefs } from "@/stores/review-prefs";
 import { type ReviewEvent, useReviewVerdict } from "@/stores/review-verdict";
@@ -27,6 +43,7 @@ import {
   Compass,
   FileCode,
   HelpCircle,
+  Layers,
   ListOrdered,
   MessageSquare,
   RefreshCw,
@@ -36,13 +53,26 @@ import {
   ThumbsUp,
   X,
 } from "lucide-react";
-import { type ComponentType, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type ComponentType,
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { toast } from "sonner";
 
 interface Props {
   prKey: string;
-  /** Self-contained PR context (metadata + diff). */
-  context: string;
+  /** Self-contained PR context (metadata + diff) plus the size the model can
+   * actually see, which sets how many stops the tour asks for. */
+  context: ReviewContext;
+  /** Rebuild the context for an arbitrary subset of the PR's files. A deep tour
+   * needs one context per layer; going through the owner avoids threading the
+   * raw PR detail down here just to call `buildReviewContext` again. */
+  buildContext: (subset: PullFile[], opts?: ContextOptions) => ReviewContext;
   files: PullFile[];
   /** Head SHA of the PR right now — used to flag a stale (out-of-date) tour. */
   headSha?: string;
@@ -107,6 +137,32 @@ const VERDICT_META: Record<
   },
 };
 
+/**
+ * How the tour reads and writes the reviewer's progress.
+ *
+ * `Tour` is used by two surfaces whose progress is keyed differently: the
+ * classic whole-PR tour stores `seen` / `dismissed` as indices into a single
+ * fixed `steps` array, while a fanned-out deep tour grows its step list as
+ * layers land and so must key progress by a stable per-step id. Rather than
+ * duplicate the tour UI, `Tour` takes plain step indices and lets the caller
+ * decide what they mean.
+ */
+export interface TourProgress {
+  /** Indices of stops the reviewer dismissed (hidden from the tour). */
+  dismissed: Set<number>;
+  /** Indices of stops the reviewer has already read. The rail marks these done
+   * rather than inferring it from position: in a deep tour the list grows, and
+   * a stop that lands ahead of the cursor has not been read just because it now
+   * sits behind it. */
+  seen: Set<number>;
+  /** Index to resume on. */
+  lastActive: number;
+  markSeen: (index: number) => void;
+  setLastActive: (index: number) => void;
+  dismiss: (index: number) => void;
+  restoreDismissed: () => void;
+}
+
 /** Seconds elapsed while `running` is true; resets to 0 when it flips off. */
 function useElapsed(running: boolean): number {
   const [secs, setSecs] = useState(0);
@@ -127,6 +183,7 @@ function useElapsed(running: boolean): number {
 export function GuidedReview({
   prKey,
   context,
+  buildContext,
   files,
   headSha,
   onAddComment,
@@ -150,6 +207,14 @@ export function GuidedReview({
     invoke<string[]>("ai_inflight")
       .then((keys) => {
         if (keys.includes(prKey)) useGuidedGen.getState().start(prKey);
+        // Re-attach to any deep-tour layers the backend is still running. Jobs
+        // that were queued but never started are gone (prompts are in-memory
+        // only) — the "Continue" button re-derives those from what's stored.
+        const mine = keys
+          .map(parseTourKey)
+          .filter((t): t is { prKey: string; layerId: string } => t?.prKey === prKey)
+          .map((t) => t.layerId);
+        if (mine.length > 0) useDeepTourGen.getState().adopt(prKey, mine);
       })
       .catch(() => {});
   }, [prKey]);
@@ -161,12 +226,21 @@ export function GuidedReview({
     return localRepos.find((r) => r.owner === owner && r.repo === repo)?.path ?? null;
   }, [prKey, localRepos]);
 
+  const deepEntry = useDeepTour((s) => s.byPr[prKey]);
+  const deepGen = useDeepTourGen((s) => s.byPr[prKey]);
+  const deepBusy = (deepGen?.running.length ?? 0) > 0 || (deepGen?.queued.length ?? 0) > 0;
+
+  /** The reviewer's custom instructions, as a prompt section. */
+  const custom = useMemo(
+    () => (aiInstructions.trim() ? `\n\n# Reviewer's instructions\n${aiInstructions.trim()}` : ""),
+    [aiInstructions],
+  );
+
+  const startDeep = useDeepTourRunner({ prKey, files, headSha, buildContext });
+
   // Kick off generation in the background task. It keeps running (and lands the
   // result via the app-wide `ai:done` listener) regardless of this component.
-  const start = useCallback(() => {
-    const custom = aiInstructions.trim()
-      ? `\n\n# Reviewer's instructions\n${aiInstructions.trim()}`
-      : "";
+  const startSingle = useCallback(() => {
     useGuidedGen.getState().start(prKey);
     invoke("ai_review_bg", {
       key: prKey,
@@ -175,9 +249,27 @@ export function GuidedReview({
       cwd,
       // No local clone → the model sees only the diff; the clause forbids the
       // unverifiable repo-wide claims that produce fabricated false alarms.
-      prompt: `${GUIDED_SYSTEM}${custom}${cwd ? "" : CLONE_ABSENT_CLAUSE}\n\n# Pull request\n${context}`,
+      prompt: `${buildGuidedSystem({ steps: stepBudget(context.size), size: context.size })}${custom}${cwd ? "" : CLONE_ABSENT_CLAUSE}\n\n# Pull request\n${context.text}`,
     }).catch((e) => useGuidedGen.getState().fail(prKey, String(e)));
-  }, [prKey, headSha, aiInstructions, context, cwd]);
+  }, [prKey, headSha, custom, context, cwd]);
+
+  // How many layers a deep tour would cover, kept reactive so the count updates
+  // if a layer plan lands while this pane is open. Memoized because the offline
+  // fallback walks every file in the PR.
+  const layersEntry = useLayers((s) => s.byPr[prKey]);
+  const deepLayerCount = useMemo(() => {
+    if (files.length === 0) return 0;
+    const base = layersEntry?.plan ?? heuristicLayers(files);
+    return reconcileLayers(base, files).layers.length;
+  }, [layersEntry, files]);
+
+  // A PR past the fan-out threshold cannot be covered honestly by one call, so
+  // that's the default there. The reviewer can still force either mode.
+  const fanOut = shouldFanOut(context.size);
+  const start = useCallback(() => {
+    if (fanOut) startDeep();
+    else startSingle();
+  }, [fanOut, startDeep, startSingle]);
 
   // Auto-start the tour on first open when the reviewer opted in (Settings →
   // Guided tour). Guarded so it fires at most once per PR and never when a tour
@@ -187,17 +279,66 @@ export function GuidedReview({
   const autoStartedFor = useRef<string | null>(null);
   useEffect(() => {
     if (autoStartedFor.current === prKey) return;
+    // A deep tour already covering this PR (stored or in flight) is a tour —
+    // auto-start must not fan out over it a second time.
+    if (deepEntry || deepBusy) return;
     if (autoStartTour && !entry && !pending && available === true) {
       autoStartedFor.current = prKey;
       start();
     }
-  }, [prKey, autoStartTour, entry, pending, available, start]);
+  }, [prKey, autoStartTour, entry, pending, available, start, deepEntry, deepBusy]);
 
   // Stop a running generation (kills the AI CLI on the backend).
   const cancel = useCallback(() => {
     invoke("ai_cancel", { key: prKey }).catch(() => {});
     useGuidedGen.getState().done(prKey);
   }, [prKey]);
+
+  // The classic tour's progress is stored BY INDEX, which is safe here because
+  // its step list is written once and never grows.
+  const markSeen = useGuided((s) => s.markSeen);
+  const setLastActive = useGuided((s) => s.setLastActive);
+  const dismissStep = useGuided((s) => s.dismiss);
+  const restoreDismissed = useGuided((s) => s.restoreDismissed);
+  const dismissed = entry?.dismissed;
+  const lastActive = entry?.lastActive;
+  const seen = entry?.seen;
+  const progress = useMemo<TourProgress>(
+    () => ({
+      dismissed: new Set(dismissed ?? []),
+      seen: new Set(seen ?? []),
+      lastActive: lastActive ?? 0,
+      markSeen: (i) => markSeen(prKey, i),
+      setLastActive: (i) => setLastActive(prKey, i),
+      dismiss: (i) => dismissStep(prKey, i),
+      restoreDismissed: () => restoreDismissed(prKey),
+    }),
+    [prKey, dismissed, seen, lastActive, markSeen, setLastActive, dismissStep, restoreDismissed],
+  );
+
+  // A deep tour outranks a classic one: it's strictly more coverage of the same
+  // PR, and it's what the reviewer asked for (or what the size triggered).
+  if (deepEntry || deepBusy) {
+    return (
+      <DeepTour
+        prKey={prKey}
+        entry={deepEntry}
+        files={files}
+        headSha={headSha}
+        aiName={aiName}
+        onRun={startDeep}
+        onSinglePass={() => {
+          useDeepTourGen.getState().cancelAll(prKey);
+          useDeepTour.getState().reset(prKey);
+          startSingle();
+        }}
+        onAddComment={onAddComment}
+        onPostComment={onPostComment}
+        onOpenFile={onOpenFile}
+        onScrolledChange={onScrolledChange}
+      />
+    );
+  }
 
   if (!entry) {
     return (
@@ -208,6 +349,15 @@ export function GuidedReview({
         error={genError ?? null}
         onStart={start}
         onCancel={cancel}
+        deep={
+          deepLayerCount > 1
+            ? {
+                layers: deepLayerCount,
+                nudge: stepBudget(context.size).max >= STEP_CAP_SINGLE,
+                onStart: () => startDeep(),
+              }
+            : undefined
+        }
       />
     );
   }
@@ -217,19 +367,299 @@ export function GuidedReview({
   return (
     <Tour
       prKey={prKey}
-      entry={entry}
+      plan={entry.plan}
+      provider={entry.provider}
+      generatedAt={entry.generatedAt}
+      progress={progress}
       stale={stale}
       files={files}
       regenerating={pending}
       onRegenerate={() => {
         resetPlan(prKey);
-        start();
+        startSingle();
       }}
       onAddComment={onAddComment}
       onPostComment={onPostComment}
       onOpenFile={onOpenFile}
       onScrolledChange={onScrolledChange}
     />
+  );
+}
+
+/**
+ * A tour that was fanned out over the PR's layers: one AI call per layer, merged
+ * for display. Total stops are unbounded because they're the sum across layers,
+ * and each call only ever had to hold one slice.
+ *
+ * Batches land independently and out of order, so everything here derives from
+ * whatever has arrived: the plan is re-merged on every render, and progress is
+ * keyed by stable step id rather than array index, because the step list grows
+ * underneath the reviewer while they're reading it.
+ */
+function DeepTour({
+  prKey,
+  entry,
+  files,
+  headSha,
+  aiName,
+  onRun,
+  onSinglePass,
+  onAddComment,
+  onPostComment,
+  onOpenFile,
+  onScrolledChange,
+}: {
+  prKey: string;
+  entry: DeepTourEntry | undefined;
+  files: PullFile[];
+  headSha?: string;
+  aiName: string;
+  /** (Re)run layers: the ids given, or every layer still missing a tour —
+   * `force` redoes the ones already toured too. */
+  onRun: (only?: string[], opts?: { force?: boolean }) => void;
+  /** Abandon the fan-out and fall back to a single whole-PR call. */
+  onSinglePass: () => void;
+  onAddComment: (c: DraftComment) => void;
+  onPostComment?: (c: { path: string; line: number; body: string }) => Promise<void>;
+  onOpenFile: (path: string, line?: number) => void;
+  onScrolledChange?: (scrolled: boolean) => void;
+}) {
+  const gen = useDeepTourGen((s) => s.byPr[prKey]);
+  const dismissStep = useDeepTour((s) => s.dismiss);
+  const restoreDismissed = useDeepTour((s) => s.restoreDismissed);
+  const markSeenStep = useDeepTour((s) => s.markSeen);
+  const setLastActive = useDeepTour((s) => s.setLastActive);
+  const clearFocus = useDeepTour((s) => s.clearFocus);
+
+  const running = gen?.running ?? [];
+  const queued = gen?.queued ?? [];
+  const busy = useMemo(
+    () => new Set([...running, ...queued.map((j) => j.layerId)]),
+    [running, queued],
+  );
+  const failedIds = useMemo(
+    () =>
+      Object.entries(gen?.errors ?? {})
+        .filter(([, v]) => !!v)
+        .map(([id]) => id),
+    [gen?.errors],
+  );
+
+  const plan = useMemo(() => (entry ? mergeDeepTour(entry, files) : null), [entry, files]);
+  const info: DeepTourProgress = useMemo(
+    () => deepTourProgress(entry, files, busy),
+    [entry, files, busy],
+  );
+
+  // Index ↔ stable id, rebuilt whenever the merged plan changes. This is the
+  // whole point of id-keyed progress: after a new layer lands, index 4 may be a
+  // different stop, but the id the reviewer dismissed still resolves correctly.
+  const ids = useMemo(() => (plan ? plan.steps.map(stepId) : []), [plan]);
+  const dismissedIds = entry?.dismissed;
+  const seenIds = entry?.seen;
+  const lastActiveId = entry?.lastActiveId;
+  const progress = useMemo<TourProgress>(() => {
+    const hidden = new Set(dismissedIds ?? []);
+    const read = new Set(seenIds ?? []);
+    const dismissed = new Set<number>();
+    const seen = new Set<number>();
+    ids.forEach((id, i) => {
+      if (hidden.has(id)) dismissed.add(i);
+      if (read.has(id)) seen.add(i);
+    });
+    const resume = lastActiveId ? ids.indexOf(lastActiveId) : -1;
+    return {
+      dismissed,
+      // Read state is per stop, by stable id — the whole point of id-keyed
+      // progress. Stops that land later read as new, however far up the merged
+      // list their layer inserts them.
+      seen,
+      lastActive: resume >= 0 ? resume : 0,
+      markSeen: (i) => {
+        const id = ids[i];
+        if (id) markSeenStep(prKey, id);
+      },
+      setLastActive: (i) => {
+        const id = ids[i];
+        if (id) setLastActive(prKey, id);
+      },
+      dismiss: (i) => {
+        const id = ids[i];
+        if (id) dismissStep(prKey, id);
+      },
+      restoreDismissed: () => restoreDismissed(prKey),
+    };
+  }, [
+    ids,
+    dismissedIds,
+    seenIds,
+    lastActiveId,
+    prKey,
+    markSeenStep,
+    setLastActive,
+    dismissStep,
+    restoreDismissed,
+  ]);
+
+  // A layer the reviewer explicitly opened from the layered view: jump to its
+  // first stop once the batch is in. Only that intent moves the cursor — a
+  // layer arriving from "Continue" must not yank the reviewer out of the stop
+  // they're reading.
+  const focusLayerId = entry?.focusLayerId;
+  const focusIndex = useMemo(() => {
+    if (!focusLayerId || !plan) return null;
+    const i = plan.steps.findIndex((s) => s.layerId === focusLayerId);
+    return i >= 0 ? i : null;
+  }, [focusLayerId, plan]);
+  // The layer landed but produced no stops (or its files left the PR): there is
+  // nothing to jump to, so drop the request instead of leaving it pending.
+  useEffect(() => {
+    if (focusLayerId && focusIndex === null && entry?.byLayer[focusLayerId]) clearFocus(prKey);
+  }, [focusLayerId, focusIndex, entry, prKey, clearFocus]);
+
+  const layerTitle = (id: string): string =>
+    entry?.plan.layers.find((l) => l.id === id)?.title ?? id;
+
+  const strip = (
+    <DeepTourStrip
+      done={info.done.length}
+      total={info.total || entry?.plan.layers.length || 0}
+      // The merged list, not the sum of the batches: the merge drops duplicate
+      // stops, so the batch sum can read a stop or two high.
+      steps={plan?.steps.length ?? info.steps}
+      running={running.map(layerTitle)}
+      queued={queued.length}
+      failed={failedIds.map((id) => ({ id, title: layerTitle(id) }))}
+      missing={info.missing}
+      onCancel={() => useDeepTourGen.getState().cancelAll(prKey)}
+      onRetry={(id) => onRun([id])}
+      onContinue={() => onRun(info.missing)}
+      onSinglePass={onSinglePass}
+    />
+  );
+
+  // Nothing has landed yet: show the progress on its own rather than an empty
+  // tour shell.
+  if (!plan || plan.steps.length === 0) {
+    return (
+      <div className="flex h-full flex-col">
+        {strip}
+        <div className="flex flex-1 items-center justify-center px-6">
+          <p className="max-w-sm text-center text-sm text-muted-foreground">
+            {busy.size > 0
+              ? `${aiName} is touring each layer in turn. Stops appear here as each one lands.`
+              : "No stops yet."}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  const oldest = Object.values(entry?.byLayer ?? {}).sort(
+    (a, b) => a.generatedAt - b.generatedAt,
+  )[0];
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      {strip}
+      <div className="min-h-0 flex-1">
+        <Tour
+          prKey={prKey}
+          plan={plan}
+          provider={oldest?.provider ?? ""}
+          generatedAt={oldest?.generatedAt ?? Date.now()}
+          progress={progress}
+          focusIndex={focusIndex}
+          onFocusConsumed={() => clearFocus(prKey)}
+          stale={!!headSha && !!entry?.headSha && entry.headSha !== headSha}
+          files={files}
+          regenerating={busy.size > 0}
+          onRegenerate={() => onRun(undefined, { force: true })}
+          onAddComment={onAddComment}
+          onPostComment={onPostComment}
+          onOpenFile={onOpenFile}
+          onScrolledChange={onScrolledChange}
+        />
+      </div>
+    </div>
+  );
+}
+
+/** The layer-by-layer progress bar above a deep tour. */
+function DeepTourStrip({
+  done,
+  total,
+  steps,
+  running,
+  queued,
+  failed,
+  missing,
+  onCancel,
+  onRetry,
+  onContinue,
+  onSinglePass,
+}: {
+  done: number;
+  total: number;
+  steps: number;
+  running: string[];
+  queued: number;
+  failed: { id: string; title: string }[];
+  missing: string[];
+  onCancel: () => void;
+  onRetry: (layerId: string) => void;
+  onContinue: () => void;
+  onSinglePass: () => void;
+}) {
+  const busy = running.length > 0 || queued > 0;
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5 border-b border-hairline px-3 py-1.5 text-xs">
+      <span className="inline-flex items-center gap-1.5 font-medium text-foreground/80">
+        <Layers className="size-3.5 text-primary" />
+        Layer {Math.min(done + running.length, total)} of {total}
+      </span>
+      <span className="text-muted-foreground">
+        {steps} stop{steps === 1 ? "" : "s"} so far
+      </span>
+      {busy && (
+        <span className="inline-flex items-center gap-1.5 text-muted-foreground">
+          <Spinner className="size-3" />
+          {running.length > 0 ? running.join(", ") : "queued"}
+          {queued > 0 && ` · ${queued} waiting`}
+        </span>
+      )}
+      {failed.map((f) => (
+        <button
+          key={f.id}
+          type="button"
+          onClick={() => onRetry(f.id)}
+          className="inline-flex items-center gap-1 rounded bg-destructive/12 px-1.5 py-0.5 text-destructive hover:bg-destructive/20"
+        >
+          <AlertTriangle className="size-3" />
+          {f.title} failed · Retry
+        </button>
+      ))}
+      <div className="ml-auto flex items-center gap-1">
+        {busy ? (
+          <Button size="xs" variant="ghost" onClick={onCancel}>
+            <X className="size-3" />
+            Stop all
+          </Button>
+        ) : (
+          <>
+            {missing.length > 0 && (
+              <Button size="xs" variant="ghost" onClick={onContinue}>
+                <RefreshCw className="size-3" />
+                Continue · {missing.length} left
+              </Button>
+            )}
+            <Button size="xs" variant="ghost" onClick={onSinglePass}>
+              Single pass instead
+            </Button>
+          </>
+        )}
+      </div>
+    </div>
   );
 }
 
@@ -248,6 +678,7 @@ function Intro({
   error,
   onStart,
   onCancel,
+  deep,
 }: {
   aiName: string;
   available: boolean | undefined;
@@ -255,6 +686,9 @@ function Intro({
   error: string | null;
   onStart: () => void;
   onCancel?: () => void;
+  /** The unbounded, layer-by-layer alternative. `nudge` is set when this PR is
+   * big enough that a single pass will hit its step ceiling. */
+  deep?: { layers: number; nudge: boolean; onStart: () => void };
 }) {
   const elapsed = useElapsed(pending);
   const unavailable = available === false;
@@ -433,10 +867,31 @@ function Intro({
             )}
           </>
         ) : (
-          <Button size="sm" onClick={onStart} disabled={unavailable}>
-            <Sparkles className="size-3.5" />
-            Start guided tour
-          </Button>
+          <div className="flex flex-col items-center gap-2">
+            <div className="flex items-center gap-2">
+              <Button size="sm" onClick={onStart} disabled={unavailable}>
+                <Sparkles className="size-3.5" />
+                Start guided tour
+              </Button>
+              {deep && (
+                <Button
+                  size="sm"
+                  variant={deep.nudge ? "default" : "outline"}
+                  onClick={deep.onStart}
+                  disabled={unavailable}
+                >
+                  <Layers className="size-3.5" />
+                  Deep tour · {deep.layers} layers
+                </Button>
+              )}
+            </div>
+            {deep?.nudge && (
+              <p className="max-w-sm text-center text-[11px] text-muted-foreground">
+                This PR is large enough that a single pass will cap out — a deep tour covers it
+                layer by layer, with no limit on stops.
+              </p>
+            )}
+          </div>
         )}
       </div>
 
@@ -459,7 +914,12 @@ function Intro({
 
 function Tour({
   prKey,
-  entry,
+  plan,
+  provider,
+  generatedAt,
+  progress,
+  focusIndex,
+  onFocusConsumed,
   stale,
   files,
   regenerating,
@@ -470,7 +930,17 @@ function Tour({
   onScrolledChange,
 }: {
   prKey: string;
-  entry: GuidedEntry;
+  plan: GuidedPlan;
+  /** Which AI produced the tour ("claude" | "codex"). */
+  provider: string;
+  /** Epoch ms the tour was generated. */
+  generatedAt: number;
+  progress: TourProgress;
+  /** A stop to jump to once, on the reviewer's explicit request (opening one
+   * layer of a deep tour). Null on every other render. */
+  focusIndex?: number | null;
+  /** The jump has been made — the caller should drop the request. */
+  onFocusConsumed?: () => void;
   stale: boolean;
   files: PullFile[];
   regenerating: boolean;
@@ -480,16 +950,12 @@ function Tour({
   onOpenFile: (path: string, line?: number) => void;
   onScrolledChange?: (scrolled: boolean) => void;
 }) {
-  const plan = entry.plan;
   const total = plan.steps.length;
   // A "clean bill of health" tour: a summary + verdict but nothing to walk
   // through. The step nav / spine / counter all collapse to just the verdict.
   const noSteps = total === 0;
   const preferPost = useReviewPrefs((s) => s.defaultSuggestionAction === "post");
-  const markSeen = useGuided((s) => s.markSeen);
-  const setLastActive = useGuided((s) => s.setLastActive);
-  const dismiss = useGuided((s) => s.dismiss);
-  const restoreDismissed = useGuided((s) => s.restoreDismissed);
+  const { markSeen, setLastActive, dismiss, restoreDismissed } = progress;
   const localRepos = useLocalRepos((s) => s.repos);
   // The PR's local clone path — gives the per-step AI check real code to read
   // against (the "Check with AI" button only appears when this exists).
@@ -528,7 +994,7 @@ function Tour({
     },
     [files, onOpenFile],
   );
-  const [active, setActive] = useState(() => Math.max(0, Math.min(entry.lastActive, total - 1)));
+  const [active, setActive] = useState(() => Math.max(0, Math.min(progress.lastActive, total - 1)));
   const [posted, setPosted] = useState<Set<number>>(new Set());
   const [filter, setFilter] = useState<StepKind | null>(null);
   const [tourScrolled, setTourScrolled] = useState(false);
@@ -562,7 +1028,7 @@ function Tour({
   );
 
   // Stops the reviewer dismissed (handled questions / concerns) are hidden.
-  const dismissedSet = useMemo(() => new Set(entry.dismissed ?? []), [entry.dismissed]);
+  const dismissedSet = progress.dismissed;
 
   // Per-kind counts (of the *remaining* stops) → which "focus" chips to show.
   const counts = useMemo(() => {
@@ -584,6 +1050,36 @@ function Tour({
         .filter((i) => !dismissedSet.has(i) && (!filter || plan.steps[i].kind === filter)),
     [plan.steps, filter, dismissedSet],
   );
+
+  // Layer headings for a merged deep tour. Keyed off the VISIBLE order, so a
+  // kind filter that empties a layer drops its heading too, and a layer split
+  // by the filter still heads each run it survives in.
+  const layerById = useMemo(
+    () => new Map((plan.layers ?? []).map((l) => [l.id, l])),
+    [plan.layers],
+  );
+  const layerHeads = useMemo(() => {
+    const heads = new Map<number, TourLayer>();
+    if (!plan.layers?.length) return heads;
+    let prev: string | undefined;
+    for (const i of visible) {
+      const id = plan.steps[i].layerId;
+      const layer = id ? layerById.get(id) : undefined;
+      if (layer && id !== prev) heads.set(i, layer);
+      prev = id;
+    }
+    return heads;
+  }, [visible, plan.steps, plan.layers, layerById]);
+  // Stops per layer among the visible ones — the denominator of the
+  // layer-relative counter, and the "N stops" on each heading.
+  const layerCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const i of visible) {
+      const id = plan.steps[i].layerId;
+      if (id) counts.set(id, (counts.get(id) ?? 0) + 1);
+    }
+    return counts;
+  }, [visible, plan.steps]);
 
   // Move ±1 through the *visible* set (respects an active kind filter).
   const move = useCallback(
@@ -609,11 +1105,19 @@ function Tour({
   const atFirst = pos <= 0;
   const atLast = pos >= visible.length - 1;
 
+  // Where the cursor sits INSIDE its layer. The global "3 / 40" is the wrong
+  // unit of progress once a tour is layered — the question a reviewer is
+  // actually asking is whether they're through the layer in front of them.
+  const activeLayer = layerById.get(plan.steps[active]?.layerId ?? "");
+  const layerPos = activeLayer
+    ? visible.filter((i) => i <= active && plan.steps[i].layerId === activeLayer.id).length
+    : 0;
+
   // Persist resume position + mark the visited step as seen.
   useEffect(() => {
-    markSeen(prKey, active);
-    setLastActive(prKey, active);
-  }, [prKey, active, markSeen, setLastActive]);
+    markSeen(active);
+    setLastActive(active);
+  }, [active, markSeen, setLastActive]);
 
   useEffect(() => {
     const root = scrollRef.current;
@@ -660,7 +1164,7 @@ function Tour({
         // 81: dismiss the active stop; the effect on `visible` re-snaps to the
         // next remaining stop automatically.
         e.preventDefault();
-        dismiss(prKey, active);
+        dismiss(active);
       } else if (e.key === "Enter" || e.key === "d") {
         // 81: advance to the next (undismissed) stop.
         e.preventDefault();
@@ -669,7 +1173,7 @@ function Tour({
     }
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [active, plan.steps, openStep, move, dismiss, prKey]);
+  }, [active, plan.steps, openStep, move, dismiss]);
 
   // The active (colored) step is exactly the one whose sticky header is pinned
   // at the top: the last visible section that has scrolled to/above the top
@@ -725,6 +1229,26 @@ function Tour({
     [beginJump],
   );
 
+  // An explicitly requested stop (the reviewer opened one layer of a deep tour).
+  // `active` is seeded once from the resume point, so a later request has to
+  // move it here. The ref makes the jump idempotent: `onFocusConsumed` is an
+  // inline callback, so without it a parent re-render before the request
+  // clears would drag the cursor back off whatever the reviewer moved to.
+  const consumedFocus = useRef<number | null>(null);
+  useEffect(() => {
+    if (focusIndex == null || focusIndex >= plan.steps.length) {
+      if (focusIndex == null) consumedFocus.current = null;
+      return;
+    }
+    if (consumedFocus.current === focusIndex) return;
+    consumedFocus.current = focusIndex;
+    // A kind filter would hide the stop we were asked to open (and the
+    // snap-to-visible effect would immediately pull the cursor elsewhere).
+    setFilter(null);
+    jumpTo(focusIndex);
+    onFocusConsumed?.();
+  }, [focusIndex, plan.steps.length, jumpTo, onFocusConsumed]);
+
   // Promote every (undismissed) suggested comment into the pending review at
   // once, and seed the suggested verdict so the submit popover opens on it.
   function draftAsReview() {
@@ -774,9 +1298,24 @@ function Tour({
             <div className="ml-auto flex shrink-0 items-center gap-1">
               {!noSteps && (
                 <>
-                  <span className="mr-1 text-xs tabular-nums text-muted-foreground">
-                    {Math.max(1, pos + 1)} / {visible.length}
-                  </span>
+                  {activeLayer ? (
+                    <span className="mr-1 flex items-baseline gap-1.5 text-xs tabular-nums">
+                      <span
+                        className="font-medium text-foreground/75"
+                        title={`${activeLayer.title} — layer ${activeLayer.index} of ${activeLayer.total}`}
+                      >
+                        L{activeLayer.index} · {Math.max(1, layerPos)} /{" "}
+                        {layerCounts.get(activeLayer.id) ?? 0}
+                      </span>
+                      <span className="text-muted-foreground/50">
+                        {Math.max(1, pos + 1)} / {visible.length}
+                      </span>
+                    </span>
+                  ) : (
+                    <span className="mr-1 text-xs tabular-nums text-muted-foreground">
+                      {Math.max(1, pos + 1)} / {visible.length}
+                    </span>
+                  )}
                   <Button
                     size="icon-sm"
                     variant="ghost"
@@ -829,8 +1368,8 @@ function Tour({
         <div className="px-5 pt-2">
           <div className="flex items-center gap-2">
             <p className="min-w-0 truncate text-xs text-muted-foreground/70">
-              Toured by {entry.provider === "codex" ? "Codex" : "Claude"} ·{" "}
-              {relativeTime(new Date(entry.generatedAt).toISOString())}
+              Toured by {provider === "codex" ? "Codex" : "Claude"} ·{" "}
+              {relativeTime(new Date(generatedAt).toISOString())}
             </p>
             {(verdict || suggestionIdxs.length > 0) && (
               <div className="ml-auto flex shrink-0 items-center gap-2">
@@ -915,9 +1454,16 @@ function Tour({
               {visible.map((i, p) => {
                 const step = plan.steps[i];
                 const K = KIND[step.kind] ?? KIND.orient;
-                const done = p < pos;
                 const isActive = p === pos;
-                return (
+                // Read state, not position: a layer that lands ahead of the
+                // cursor must not inherit the checkmarks of the stops it was
+                // inserted behind.
+                const done = progress.seen.has(i) && !isActive;
+                const head = layerHeads.get(i);
+                // The spine should break where a layer does, rather than run
+                // through the heading that separates them.
+                const groupEnd = p < lastPos && layerHeads.has(visible[p + 1]);
+                const node = (
                   <button
                     key={i}
                     type="button"
@@ -931,7 +1477,7 @@ function Tour({
                       <span
                         className={cn(
                           "w-px flex-1",
-                          p === 0
+                          p === 0 || head
                             ? "bg-transparent"
                             : p <= pos
                               ? "bg-foreground/35"
@@ -964,7 +1510,7 @@ function Tour({
                       <span
                         className={cn(
                           "w-px flex-1",
-                          p === lastPos
+                          p === lastPos || groupEnd
                             ? "bg-transparent"
                             : p < pos
                               ? "bg-foreground/35"
@@ -997,6 +1543,20 @@ function Tour({
                     </span>
                   </button>
                 );
+                if (!head) return node;
+                return (
+                  <Fragment key={`g${i}`}>
+                    <p className="mb-1 mt-3 flex items-baseline gap-1.5 px-2 first:mt-0">
+                      <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/50">
+                        Layer {head.index}/{head.total}
+                      </span>
+                      <span className="min-w-0 flex-1 truncate text-[11px] font-medium text-foreground/70">
+                        {head.title}
+                      </span>
+                    </p>
+                    {node}
+                  </Fragment>
+                );
               })}
             </div>
           </aside>
@@ -1016,8 +1576,9 @@ function Tour({
             </div>
           )}
 
-          {plan.steps.map((step, i) =>
-            visible.includes(i) ? (
+          {plan.steps.map((step, i) => {
+            if (!visible.includes(i)) return null;
+            const stop = (
               <Step
                 key={i}
                 setRef={(el) => {
@@ -1035,11 +1596,34 @@ function Tour({
                     : undefined
                 }
                 onCheckAI={cwd ? checkWithAI : undefined}
-                onDismiss={() => dismiss(prKey, i)}
+                onDismiss={() => dismiss(i)}
                 onOpenFile={openStep}
               />
-            ) : null,
-          )}
+            );
+            // A merged deep tour is one list of stops drawn from many layers.
+            // Without a boundary the strata the planner chose are invisible and
+            // the reviewer just sees the list get longer.
+            const head = layerHeads.get(i);
+            if (!head) return stop;
+            const n = layerCounts.get(head.id) ?? 0;
+            return (
+              <Fragment key={`g${i}`}>
+                <div className="mb-3 mt-7 flex items-center gap-2.5">
+                  <span className="shrink-0 rounded-full bg-foreground/[0.06] px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                    Layer {head.index} of {head.total}
+                  </span>
+                  <span className="min-w-0 truncate text-xs font-medium text-foreground/80">
+                    {head.title}
+                  </span>
+                  <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground/60">
+                    {n} stop{n === 1 ? "" : "s"}
+                  </span>
+                  <span className="h-px min-w-4 flex-1 bg-hairline" />
+                </div>
+                {stop}
+              </Fragment>
+            );
+          })}
 
           <div className="flex flex-col items-center gap-1.5 py-6">
             {atLast ? (
@@ -1057,7 +1641,7 @@ function Tour({
               </Button>
             )}
             {dismissedSet.size > 0 && (
-              <Button size="xs" variant="ghost" onClick={() => restoreDismissed(prKey)}>
+              <Button size="xs" variant="ghost" onClick={() => restoreDismissed()}>
                 <RotateCcw className="size-3" />
                 Restore {dismissedSet.size} dismissed
               </Button>

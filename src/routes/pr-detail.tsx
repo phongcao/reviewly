@@ -40,7 +40,7 @@ import { UserAvatar } from "@/components/user-avatar";
 import { UserHoverCard } from "@/components/user-hover-card";
 import type { AiAction } from "@/lib/ai-actions";
 import { useAttachBridge } from "@/lib/ai/attach-bridge";
-import { buildReviewContext } from "@/lib/ai/context";
+import { type ContextOptions, type ReviewContext, buildReviewContext } from "@/lib/ai/context";
 import { parsePatch } from "@/lib/diff";
 import { isTestFile } from "@/lib/focus";
 import { relativeTime } from "@/lib/format";
@@ -127,6 +127,14 @@ type DetailTab = "files" | "conversation" | "commits" | "checks";
  * back on replication lag. If GitHub never shows it, the next natural refetch
  * reconciles, so a failed/inconsistent submit can't keep showing a stale state.
  */
+/** Stand-in while the PR detail is still loading — every consumer of a
+ * `ReviewContext` renders behind a loading guard, so this is never sent to a
+ * model; it exists so `buildContext` can stay a plain non-null function. */
+const EMPTY_CONTEXT: ReviewContext = {
+  text: "",
+  size: { files: 0, churn: 0, shownFiles: 0, shownChurn: 0, coverage: 1 },
+};
+
 function mergeReview(
   qc: ReturnType<typeof useQueryClient>,
   owner: string,
@@ -869,14 +877,18 @@ export function PRDetailPage() {
   });
 
   // Self-contained review context: PR metadata + description + the full diff
-  // (capped) so the AI can review without filesystem access.
-  const reviewContext = useMemo(
-    () =>
+  // (capped) so the AI can review without filesystem access. Exposed as a
+  // BUILDER as well as a value: a deep tour rebuilds it scoped to one layer's
+  // files, and going through here keeps `detail` from having to be threaded
+  // down the component tree just to rebuild a context.
+  const buildContext = useCallback(
+    (subset: PullFile[], opts?: ContextOptions): ReviewContext =>
       detail.data
-        ? buildReviewContext(detail.data, files.data ?? [], `${owner}/${repo}`, number)
-        : "",
-    [detail.data, files.data, owner, repo, number],
+        ? buildReviewContext(detail.data, subset, `${owner}/${repo}`, number, opts)
+        : EMPTY_CONTEXT,
+    [detail.data, owner, repo, number],
   );
+  const reviewContext = useMemo(() => buildContext(fileList), [buildContext, fileList]);
 
   if (detail.isLoading) {
     return <PRDetailLoading />;
@@ -1289,6 +1301,7 @@ export function PRDetailPage() {
           <GuidedReview
             prKey={`${owner}/${repo}#${number}`}
             context={reviewContext}
+            buildContext={buildContext}
             files={fileList}
             headSha={headSha}
             onAddComment={(c) => addComment(prKey, c)}
@@ -1319,10 +1332,12 @@ export function PRDetailPage() {
             scope={layers}
             prKey={prViewKey}
             context={reviewContext}
+            buildContext={buildContext}
             files={fileList}
             headSha={headSha}
             viewedKey={vk}
             onSelectFile={setActiveFile}
+            onOpenGuided={() => setView("guided")}
           />
         )}
 
@@ -1598,7 +1613,7 @@ export function PRDetailPage() {
             <div className="min-h-0 flex-1 px-3 py-3">
               <AiReview
                 prKey={`${owner}/${repo}#${number}`}
-                context={reviewContext}
+                context={reviewContext.text}
                 executeAction={executeAiAction}
                 files={fileList}
               />

@@ -43,7 +43,7 @@ export function ChatWindowPage() {
   const context = useMemo(
     () =>
       detail.data
-        ? buildReviewContext(detail.data, files.data ?? [], `${owner}/${repo}`, number)
+        ? buildReviewContext(detail.data, files.data ?? [], `${owner}/${repo}`, number).text
         : "",
     [detail.data, files.data, owner, repo, number],
   );

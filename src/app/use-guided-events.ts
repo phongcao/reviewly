@@ -1,4 +1,4 @@
-import { parseGuided } from "@/lib/guided";
+import { TOUR_KEY_PREFIX, parseGuided } from "@/lib/guided";
 import { LAYERS_KEY_PREFIX } from "@/lib/layers";
 import { subscribe } from "@/lib/tauri";
 import { useGuided } from "@/stores/guided";
@@ -29,9 +29,10 @@ export function useGuidedEvents() {
       unsub = await subscribe<AiDone>("ai:done", (e) => {
         const { key, ok, output, error, provider, headSha, canceled } = e.payload;
         // `ai:done` is broadcast for every AI background task. A layered-review
-        // plan is another surface's reply — parsing it here would fail and
-        // report a phantom "tour failed" for a tour nobody asked for.
-        if (key.startsWith(LAYERS_KEY_PREFIX)) return;
+        // plan or one layer of a deep tour is another surface's reply — parsing
+        // it here would fail and report a phantom "tour failed" for a tour
+        // nobody asked for. A classic whole-PR tour uses the bare `prKey`.
+        if (key.startsWith(LAYERS_KEY_PREFIX) || key.startsWith(TOUR_KEY_PREFIX)) return;
         const gen = useGuidedGen.getState();
         gen.done(key);
         // Canceled by the user — just clear the pending state, no error/toast.
