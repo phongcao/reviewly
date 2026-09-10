@@ -5,6 +5,7 @@ import { PatchView } from "@/components/patch-view";
 import { PopoverPanel } from "@/components/popover";
 import { RepoQuickOpen } from "@/components/repo-quick-open";
 import { Segmented } from "@/components/segmented";
+import { SourceView } from "@/components/source-view";
 import { TooltipFor } from "@/components/tooltip-for";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -16,7 +17,7 @@ import { type CodeownersRule, ownersFor, parseCodeowners } from "@/lib/codeowner
 import { parsePatch } from "@/lib/diff";
 import { fileIcon } from "@/lib/file-icons";
 import { relativeTime } from "@/lib/format";
-import { detectLanguage, highlightLine } from "@/lib/lang";
+import { detectLanguage } from "@/lib/lang";
 import { invoke } from "@/lib/tauri";
 import { safeOpenUrl } from "@/lib/ui";
 import { cn } from "@/lib/utils";
@@ -531,24 +532,9 @@ function CodeView({ path }: { path: string | null }) {
     );
   }
 
-  const lang = detectLanguage(path);
-  const lines = (file.data ?? "").split("\n");
   return (
     <ScrollArea className="h-full">
-      <div className="overflow-x-auto py-2 font-mono text-xs leading-[1.5]">
-        {lines.map((l, i) => (
-          <div key={i} className="flex">
-            <span className="w-12 shrink-0 select-none bg-foreground/[0.02] px-2 text-right text-muted-foreground/75 tabular-nums">
-              {i + 1}
-            </span>
-            <pre
-              className="min-w-0 flex-1 whitespace-pre-wrap break-words pr-4 text-foreground/90"
-              // biome-ignore lint/security/noDangerouslySetInnerHtml: Prism-highlighted
-              dangerouslySetInnerHTML={{ __html: highlightLine(l, lang) || "&nbsp;" }}
-            />
-          </div>
-        ))}
-      </div>
+      <SourceView path={path} content={file.data ?? ""} />
     </ScrollArea>
   );
 }

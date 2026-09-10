@@ -12,6 +12,7 @@ import { LayerBar, useLayerScope } from "@/components/layered-review";
 import { MarkdownBody } from "@/components/markdown-body";
 import { PrActions } from "@/components/pr-actions";
 import { ReactionsBar } from "@/components/reactions-bar";
+import { ReviewContextPane } from "@/components/review-context-pane";
 import { ReviewSubmitPopover, reviewStateToEvent } from "@/components/review-submit-dialog";
 import { ReviewThreadGroup } from "@/components/review-thread";
 import { Segmented } from "@/components/segmented";
@@ -68,6 +69,7 @@ import { useEditorPrefs } from "@/stores/editor-prefs";
 import { useLocalRepos } from "@/stores/local-repos";
 import { usePinboard } from "@/stores/pinboard";
 import { usePrView } from "@/stores/pr-view";
+import { useReviewContext } from "@/stores/review-context";
 import { useReviewDraft } from "@/stores/review-draft";
 import { useReviewPrefs } from "@/stores/review-prefs";
 import { useUi } from "@/stores/ui";
@@ -93,6 +95,7 @@ import {
   Layers,
   MessageSquare,
   OctagonX,
+  PanelRight,
   Pencil,
   Pin,
   PinOff,
@@ -483,6 +486,11 @@ export function PRDetailPage() {
       : (scopedFiles[0]?.filename ?? null)
     : (activeFile ?? fileList[0]?.filename ?? null);
   const currentFile = fileList.find((f) => f.filename === current) ?? null;
+  // Review context pane — surrounding code beside the diff. Never feeds the
+  // viewed-files store: reading a dependency isn't reviewing a change.
+  const contextOpen = useReviewContext((s) => s.open);
+  const toggleContext = useReviewContext((s) => s.toggle);
+  const changedPaths = useMemo(() => fileList.map((f) => f.filename), [fileList]);
   // Cmd+P filter — narrows the file tree by filename (case-insensitive).
   const visibleFiles = fileFilter.trim()
     ? scopedFiles.filter((f) => f.filename.toLowerCase().includes(fileFilter.trim().toLowerCase()))
@@ -603,6 +611,11 @@ export function PRDetailPage() {
         // Toggle "viewed" for the current file (item 37).
         e.preventDefault();
         if (vk && cur) setViewedFile(vk, cur, !viewedMap?.[cur]);
+      } else if (e.key === "\\") {
+        // Show/hide the review context pane. `\` is unclaimed, sits next to the
+        // bracket keys that already move between files, and needs no chord.
+        e.preventDefault();
+        useReviewContext.getState().toggle();
       }
     }
     window.addEventListener("keydown", onKey);
@@ -1288,6 +1301,24 @@ export function PRDetailPage() {
                   </button>
                 </TooltipFor>
               </div>
+              {view !== "guided" && (
+                <TooltipFor label="Review context — read a file beside the diff" shortcut="\\">
+                  <button
+                    type="button"
+                    onClick={toggleContext}
+                    aria-label="Toggle review context"
+                    aria-pressed={contextOpen}
+                    className={cn(
+                      "flex size-6 items-center justify-center rounded transition-colors",
+                      contextOpen
+                        ? "bg-foreground/[0.08] text-foreground"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    <PanelRight className="size-3.5" />
+                  </button>
+                </TooltipFor>
+              )}
             </div>
           )}
         </div>
@@ -1342,8 +1373,12 @@ export function PRDetailPage() {
         )}
 
         {tab === "files" && view !== "guided" && (
-          <ResizablePanelGroup direction="horizontal" className="flex-1 min-h-0">
-            <ResizablePanel defaultSize={22} minSize={15}>
+          <ResizablePanelGroup
+            direction="horizontal"
+            className="flex-1 min-h-0"
+            autoSaveId="pr-files-panes"
+          >
+            <ResizablePanel id="tree" order={1} defaultSize={22} minSize={15}>
               <div className="flex h-full flex-col">
                 <div className="border-b border-hairline p-1.5">
                   <input
@@ -1376,7 +1411,7 @@ export function PRDetailPage() {
               </div>
             </ResizablePanel>
             <ResizableHandle />
-            <ResizablePanel>
+            <ResizablePanel id="diff" order={2} minSize={30}>
               <div className="relative h-full">
                 {findOpen && <DiffFindBar onClose={() => setFindOpen(false)} />}
                 <ScrollArea className="h-full">
@@ -1428,6 +1463,20 @@ export function PRDetailPage() {
                 </ScrollArea>
               </div>
             </ResizablePanel>
+            {contextOpen && (
+              <>
+                <ResizableHandle />
+                <ResizablePanel id="context" order={3} defaultSize={30} minSize={20}>
+                  <ReviewContextPane
+                    owner={owner}
+                    repo={repo}
+                    prKey={prViewKey}
+                    headSha={headSha ?? null}
+                    changedPaths={changedPaths}
+                  />
+                </ResizablePanel>
+              </>
+            )}
           </ResizablePanelGroup>
         )}
 
