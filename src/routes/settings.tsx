@@ -177,7 +177,7 @@ export function SettingsPage() {
                 </p>
               </div>
 
-              <p className="mt-3 mb-2 text-[11px] font-medium text-muted-foreground">Backend</p>
+              <p className="mt-3 mb-2 text-2xs font-medium text-muted-foreground">Backend</p>
               <div className="grid gap-2 sm:grid-cols-2">
                 {PROVIDERS.map((p) => (
                   <ProviderCard
@@ -262,7 +262,7 @@ function AiInstructions() {
     <div className="mt-4 border-t border-hairline pt-4">
       <div className="flex items-center justify-between gap-2">
         <p className="text-xs font-medium text-foreground">Review instructions</p>
-        <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
+        <span className="inline-flex items-center gap-1 text-2xs text-muted-foreground">
           {status === "saving" ? (
             "Saving…"
           ) : status === "saved" ? (
@@ -287,7 +287,7 @@ function AiInstructions() {
         className="mt-2 w-full resize-none font-sans text-xs"
       />
       <div className="mt-1.5 flex items-center justify-between gap-2">
-        <span className="text-[11px] tabular-nums text-muted-foreground/70">
+        <span className="text-2xs tabular-nums text-muted-foreground/70">
           {value.length} / {AI_INSTRUCTIONS_MAX}
         </span>
         {value.length > 0 && (
@@ -783,9 +783,7 @@ function ProviderCard({
             <Lock className="size-3 shrink-0 text-muted-foreground/45" aria-label="Runs locally" />
           )}
         </span>
-        <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">
-          {meta.blurb}
-        </span>
+        <span className="mt-0.5 block truncate text-2xs text-muted-foreground">{meta.blurb}</span>
         <ProviderStatus status={status} install={meta.install} />
       </span>
       <span
@@ -802,22 +800,20 @@ function ProviderCard({
 
 function ProviderStatus({ status, install }: { status: CardStatus; install?: string }) {
   if (status === null)
-    return <span className="mt-1 block text-[11px] text-muted-foreground/60">checking…</span>;
+    return <span className="mt-1 block text-2xs text-muted-foreground/60">checking…</span>;
   if (status === true || status === "configured")
     return (
-      <span className="mt-1 inline-flex items-center gap-1.5 text-[11px] text-success">
+      <span className="mt-1 inline-flex items-center gap-1.5 text-2xs text-success">
         <span className="size-1.5 rounded-full bg-success" />
         {status === "configured" ? "configured" : "available"}
       </span>
     );
   if (status === "config")
-    return (
-      <span className="mt-1 block text-[11px] text-muted-foreground/70">needs a base URL</span>
-    );
+    return <span className="mt-1 block text-2xs text-muted-foreground/70">needs a base URL</span>;
   return (
-    <span className="mt-1 block text-[11px] text-warning">
+    <span className="mt-1 block text-2xs text-warning">
       not installed ·{" "}
-      <code className="rounded bg-foreground/[0.08] px-1 font-mono text-[10px] text-muted-foreground">
+      <code className="rounded bg-foreground/[0.08] px-1 font-mono text-3xs text-muted-foreground">
         {install}
       </code>
     </span>
@@ -845,13 +841,13 @@ function OpenAiConfig() {
   return (
     <div className="mt-2 space-y-2 rounded-xl border border-hairline bg-foreground/[0.02] p-3">
       <div className="flex flex-wrap items-center gap-1.5">
-        <span className="mr-0.5 text-[11px] text-muted-foreground/70">Quick setup:</span>
+        <span className="mr-0.5 text-2xs text-muted-foreground/70">Quick setup:</span>
         {presets.map((p) => (
           <button
             key={p.label}
             type="button"
             onClick={() => setOpenai({ baseUrl: p.baseUrl, model: model.trim() || p.model })}
-            className="rounded-md border border-border/50 bg-card/40 px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:border-border hover:text-foreground"
+            className="rounded-md border border-border/50 bg-card/40 px-2 py-1 text-2xs text-muted-foreground transition-colors hover:border-border hover:text-foreground"
           >
             {p.label}
           </button>
@@ -876,7 +872,7 @@ function OpenAiConfig() {
         type="password"
         onChange={(v) => setOpenai({ apiKey: v })}
       />
-      <p className="text-[11px] text-muted-foreground/80">
+      <p className="text-2xs text-muted-foreground/80">
         Stored locally on this machine. The PR diff is sent to this endpoint over HTTP. Tip: Ollama
         is free &amp; offline; DeepSeek / OpenRouter cost roughly 10× less than Claude.
       </p>
@@ -900,7 +896,7 @@ function OpenAiField({
   return (
     // biome-ignore lint/a11y/noLabelWithoutControl: Input renders the native control
     <label className="block">
-      <span className="mb-1 block text-[11px] font-medium text-muted-foreground">{label}</span>
+      <span className="mb-1 block text-2xs font-medium text-muted-foreground">{label}</span>
       <Input
         value={value}
         onChange={(e) => onChange(e.target.value)}
@@ -970,7 +966,7 @@ function CliModelConfig({ provider }: { provider: AiProvider }) {
     <div className="mt-2 space-y-1.5 rounded-xl border border-hairline bg-foreground/[0.02] p-3">
       {/* biome-ignore lint/a11y/noLabelWithoutControl: Input renders the native control */}
       <label className="block">
-        <span className="mb-1 block text-[11px] font-medium text-muted-foreground">Model</span>
+        <span className="mb-1 block text-2xs font-medium text-muted-foreground">Model</span>
         <Input
           value={value}
           onChange={(e) => setCliModel(provider, e.target.value)}
@@ -987,9 +983,9 @@ function CliModelConfig({ provider }: { provider: AiProvider }) {
           <option key={m} value={m} />
         ))}
       </datalist>
-      <p className="text-[11px] text-muted-foreground/80">
+      <p className="text-2xs text-muted-foreground/80">
         Any model id the {PROVIDER_LABEL[provider]} CLI accepts, passed as{" "}
-        <code className="font-mono text-[10px]">--model</code>. Leave blank for its default.
+        <code className="font-mono text-3xs">--model</code>. Leave blank for its default.
       </p>
     </div>
   );

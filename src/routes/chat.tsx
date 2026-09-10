@@ -115,7 +115,7 @@ export function ChatWindowPage() {
     <div className="flex h-full min-h-0 flex-col">
       <header
         data-tauri-drag-region
-        className="flex items-center gap-1.5 border-b border-hairline px-3 py-2.5 text-[13px] font-medium text-muted-foreground"
+        className="flex items-center gap-1.5 border-b border-hairline px-3 py-2.5 text-sm font-medium text-muted-foreground"
       >
         <Sparkles className="size-3.5 shrink-0 text-primary" />
         <span className="truncate">

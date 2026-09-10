@@ -288,6 +288,26 @@ export function GuidedReview({
     }
   }, [prKey, autoStartTour, entry, pending, available, start, deepEntry, deepBusy]);
 
+  // Discarding a deep tour throws away real AI spend, so it follows the house
+  // rule for destructive-but-recoverable actions (see the AI chat's clear):
+  // act immediately, and offer an undo that puts the batches back.
+  const startOver = useCallback(() => {
+    const snapshot = useDeepTour.getState().byPr[prKey];
+    useDeepTourGen.getState().cancelAll(prKey);
+    useDeepTour.getState().reset(prKey);
+    // With auto-start on, discarding would otherwise fall straight back into
+    // the effect above and spend a fresh fan-out on the way out of the click.
+    autoStartedFor.current = prKey;
+    if (!snapshot) return;
+    const layers = Object.keys(snapshot.byLayer).length;
+    toast(`Tour discarded — ${layers} layer${layers === 1 ? "" : "s"}`, {
+      action: {
+        label: "Undo",
+        onClick: () => useDeepTour.getState().restore(prKey, snapshot),
+      },
+    });
+  }, [prKey]);
+
   // Stop a running generation (kills the AI CLI on the backend).
   const cancel = useCallback(() => {
     invoke("ai_cancel", { key: prKey }).catch(() => {});
@@ -327,6 +347,7 @@ export function GuidedReview({
         headSha={headSha}
         aiName={aiName}
         onRun={startDeep}
+        onStartOver={startOver}
         onSinglePass={() => {
           useDeepTourGen.getState().cancelAll(prKey);
           useDeepTour.getState().reset(prKey);
@@ -404,6 +425,7 @@ function DeepTour({
   aiName,
   onRun,
   onSinglePass,
+  onStartOver,
   onAddComment,
   onPostComment,
   onOpenFile,
@@ -419,6 +441,8 @@ function DeepTour({
   onRun: (only?: string[], opts?: { force?: boolean }) => void;
   /** Abandon the fan-out and fall back to a single whole-PR call. */
   onSinglePass: () => void;
+  /** Throw the tour away and go back to the start (undoable). */
+  onStartOver: () => void;
   onAddComment: (c: DraftComment) => void;
   onPostComment?: (c: { path: string; line: number; body: string }) => Promise<void>;
   onOpenFile: (path: string, line?: number) => void;
@@ -535,6 +559,7 @@ function DeepTour({
       onRetry={(id) => onRun([id])}
       onContinue={() => onRun(info.missing)}
       onSinglePass={onSinglePass}
+      onStartOver={onStartOver}
     />
   );
 
@@ -598,6 +623,7 @@ function DeepTourStrip({
   onRetry,
   onContinue,
   onSinglePass,
+  onStartOver,
 }: {
   done: number;
   total: number;
@@ -610,6 +636,7 @@ function DeepTourStrip({
   onRetry: (layerId: string) => void;
   onContinue: () => void;
   onSinglePass: () => void;
+  onStartOver: () => void;
 }) {
   const busy = running.length > 0 || queued > 0;
   return (
@@ -655,6 +682,14 @@ function DeepTourStrip({
             )}
             <Button size="xs" variant="ghost" onClick={onSinglePass}>
               Single pass instead
+            </Button>
+            <Button
+              size="xs"
+              variant="ghost"
+              className="text-muted-foreground hover:text-destructive"
+              onClick={onStartOver}
+            >
+              Start over
             </Button>
           </>
         )}
@@ -886,7 +921,7 @@ function Intro({
               )}
             </div>
             {deep?.nudge && (
-              <p className="max-w-sm text-center text-[11px] text-muted-foreground">
+              <p className="max-w-sm text-center text-2xs text-muted-foreground">
                 This PR is large enough that a single pass will cap out — a deep tour covers it
                 layer by layer, with no limit on stops.
               </p>
@@ -903,7 +938,7 @@ function Intro({
       )}
       {error && !pending && <p className="z-10 max-w-sm text-xs text-destructive">{error}</p>}
       {hasInstructions && (
-        <p className="z-10 inline-flex items-center gap-1 text-[11px] text-muted-foreground/60">
+        <p className="z-10 inline-flex items-center gap-1 text-2xs text-muted-foreground/60">
           <Sparkles className="size-3" />
           Using your custom review instructions
         </p>
@@ -1376,7 +1411,7 @@ function Tour({
                 {verdict && (
                   <span
                     className={cn(
-                      "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium",
+                      "inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-2xs font-medium",
                       verdict.chip,
                     )}
                   >
@@ -1406,7 +1441,7 @@ function Tour({
       {/* focus chips — narrow the tour to one kind for a fast risk pass */}
       {kindsPresent.length > 1 && (
         <div className="flex flex-wrap items-center gap-1.5 px-5 pt-2.5">
-          <span className="text-[11px] text-muted-foreground/60">Focus</span>
+          <span className="text-2xs text-muted-foreground/60">Focus</span>
           {kindsPresent.map((k) => {
             const K = KIND[k] ?? KIND.orient;
             const on = filter === k;
@@ -1416,7 +1451,7 @@ function Tour({
                 type="button"
                 onClick={() => setFilter(on ? null : k)}
                 className={cn(
-                  "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium transition-colors",
+                  "inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-2xs font-medium transition-colors",
                   on
                     ? cn(K.dot, "text-background")
                     : cn("bg-foreground/5 hover:bg-foreground/10", K.text),
@@ -1432,7 +1467,7 @@ function Tour({
             <button
               type="button"
               onClick={() => setFilter(null)}
-              className="text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+              className="text-2xs text-muted-foreground transition-colors hover:text-foreground"
             >
               Clear
             </button>
@@ -1447,7 +1482,7 @@ function Tour({
       <div className="mt-2 flex min-h-0 flex-1">
         {!noSteps && (
           <aside className="hidden w-60 shrink-0 overflow-y-auto border-r border-hairline px-3 py-4 lg:block">
-            <p className="mb-2 px-2 text-[10px] font-medium uppercase tracking-wide text-muted-foreground/50">
+            <p className="mb-2 px-2 text-3xs font-medium uppercase tracking-wide text-muted-foreground/50">
               The tour
             </p>
             <div className="flex flex-col">
@@ -1521,7 +1556,7 @@ function Tour({
                     <span className="min-w-0 flex-1 py-2.5">
                       <span
                         className={cn(
-                          "mb-1 block text-[10px] font-medium uppercase leading-none tracking-wide",
+                          "mb-1 block text-3xs font-medium uppercase leading-none tracking-wide",
                           K.text,
                           !isActive && "opacity-55",
                         )}
@@ -1547,10 +1582,10 @@ function Tour({
                 return (
                   <Fragment key={`g${i}`}>
                     <p className="mb-1 mt-3 flex items-baseline gap-1.5 px-2 first:mt-0">
-                      <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground/50">
+                      <span className="text-3xs font-medium uppercase tracking-wide text-muted-foreground/50">
                         Layer {head.index}/{head.total}
                       </span>
-                      <span className="min-w-0 flex-1 truncate text-[11px] font-medium text-foreground/70">
+                      <span className="min-w-0 flex-1 truncate text-2xs font-medium text-foreground/70">
                         {head.title}
                       </span>
                     </p>
@@ -1568,11 +1603,11 @@ function Tour({
           <div aria-hidden className="h-4" />
           {plan.tour && (
             <div className="mb-5 rounded-lg bg-card/40 px-3.5 py-3">
-              <p className="mb-1 flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
-                <Compass className="size-3.5 text-muted-foreground" />
+              <p className="mb-1.5 flex items-center gap-1.5 text-sm font-medium text-muted-foreground">
+                <Compass className="size-4 text-muted-foreground" />
                 How to read this PR
               </p>
-              <MarkdownBody className="text-xs">{plan.tour}</MarkdownBody>
+              <MarkdownBody>{plan.tour}</MarkdownBody>
             </div>
           )}
 
@@ -1609,13 +1644,13 @@ function Tour({
             return (
               <Fragment key={`g${i}`}>
                 <div className="mb-3 mt-7 flex items-center gap-2.5">
-                  <span className="shrink-0 rounded-full bg-foreground/[0.06] px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+                  <span className="shrink-0 rounded-full bg-foreground/[0.06] px-2 py-0.5 text-3xs font-medium uppercase tracking-wide text-muted-foreground">
                     Layer {head.index} of {head.total}
                   </span>
                   <span className="min-w-0 truncate text-xs font-medium text-foreground/80">
                     {head.title}
                   </span>
-                  <span className="shrink-0 text-[11px] tabular-nums text-muted-foreground/60">
+                  <span className="shrink-0 text-2xs tabular-nums text-muted-foreground/60">
                     {n} stop{n === 1 ? "" : "s"}
                   </span>
                   <span className="h-px min-w-4 flex-1 bg-hairline" />
@@ -1770,7 +1805,7 @@ const Step = ({
           pinning itself marks "where you are", so the row stays neutral. */}
       <div className="sticky top-0 z-20 -mx-5 flex items-center gap-2 border-b border-b-hairline bg-background px-5 py-2 shadow-sm">
         <span aria-hidden className={cn("absolute inset-y-0 left-0 w-0.5", kind.dot)} />
-        <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-foreground/10 text-[11px] font-medium tabular-nums text-muted-foreground">
+        <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-foreground/10 text-2xs font-medium tabular-nums text-muted-foreground">
           {index + 1}
         </span>
         <span
@@ -1810,7 +1845,7 @@ const Step = ({
         </div>
 
         {step.detail && (
-          <MarkdownBody className="mt-3 text-xs text-foreground/90">{step.detail}</MarkdownBody>
+          <MarkdownBody className="mt-3 text-foreground/90">{step.detail}</MarkdownBody>
         )}
 
         {checkable && !result && (
@@ -1889,11 +1924,11 @@ const Step = ({
             onSecondary={canPost ? (primaryPost ? (b) => onAdd(b) : (b) => post(b)) : undefined}
             footerStatus={
               postedGh ? (
-                <span className="inline-flex items-center gap-1 pl-0.5 text-[11px] text-success">
+                <span className="inline-flex items-center gap-1 pl-0.5 text-2xs text-success">
                   <Check className="size-3" /> Posted to GitHub
                 </span>
               ) : posted ? (
-                <span className="inline-flex items-center gap-1 pl-0.5 text-[11px] text-success">
+                <span className="inline-flex items-center gap-1 pl-0.5 text-2xs text-success">
                   <Check className="size-3" /> Added to review
                 </span>
               ) : undefined

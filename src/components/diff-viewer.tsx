@@ -1114,7 +1114,7 @@ function RowUnified({
           dangerouslySetInnerHTML={{ __html: line.html || "&nbsp;" }}
         />
         {line.whitespaceOnly && (
-          <span className="shrink-0 self-center pr-1 text-[10px] text-muted-foreground/50">
+          <span className="shrink-0 self-center pr-1 text-3xs text-muted-foreground/50">
             whitespace
           </span>
         )}
@@ -1410,14 +1410,14 @@ function CommentPopover({
         onSubmit={(b) => onSubmit(buildComment(path, r, b))}
         header={
           <>
-            <span className="rounded-md bg-primary/15 px-1.5 py-0.5 font-mono text-[11px] font-medium text-primary">
+            <span className="rounded-md bg-primary/15 px-1.5 py-0.5 font-mono text-2xs font-medium text-primary">
               {multi ? `Lines ${r.from}–${r.to}` : `Line ${r.from}`}
             </span>
             {meta?.onAskAi && (
               <button
                 type="button"
                 onClick={() => askAi(r)}
-                className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[11px] font-medium text-muted-foreground/70 transition-colors hover:bg-primary/10 hover:text-primary"
+                className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-2xs font-medium text-muted-foreground/70 transition-colors hover:bg-primary/10 hover:text-primary"
               >
                 <Sparkles className="size-3" />
                 Ask AI
@@ -1497,7 +1497,7 @@ function ThreadsBlock({ threads }: { threads: ReviewThread[] }) {
                 timestamp={t.created_at}
                 avatarClassName="size-4"
               />
-              <MarkdownBody className="text-xs">{t.body}</MarkdownBody>
+              <MarkdownBody>{t.body}</MarkdownBody>
               {meta && (
                 <div className="mt-1.5">
                   <ReactionsBar

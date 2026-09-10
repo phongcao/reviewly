@@ -60,7 +60,7 @@ export function StackRail({
         <span className="inline-flex shrink-0 cursor-default items-center gap-1.5 text-xs font-medium text-muted-foreground">
           <Layers className="size-3.5" strokeWidth={1.5} />
           Stack
-          <span className="rounded-full bg-foreground/[0.06] px-1.5 py-px text-[10px] tabular-nums text-muted-foreground/80">
+          <span className="rounded-full bg-foreground/[0.06] px-1.5 py-px text-3xs tabular-nums text-muted-foreground/80">
             {pos}/{chain.length}
           </span>
         </span>

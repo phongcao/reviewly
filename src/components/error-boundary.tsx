@@ -30,7 +30,7 @@ export function CrashFallback({
           The app hit an unexpected error and couldn't render this view.
         </p>
         {message && (
-          <pre className="mx-auto mt-3 max-w-md overflow-x-auto rounded-md bg-foreground/[0.04] px-3 py-2 text-left font-mono text-[11px] text-muted-foreground/80">
+          <pre className="mx-auto mt-3 max-w-md overflow-x-auto rounded-md bg-foreground/[0.04] px-3 py-2 text-left font-mono text-2xs text-muted-foreground/80">
             {message}
           </pre>
         )}

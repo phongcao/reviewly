@@ -254,7 +254,7 @@ const Textarea = React.forwardRef<HTMLTextAreaElement, TextareaProps>(
                       {(item as MentionItem).hint && (
                         <span
                           dir="rtl"
-                          className="min-w-0 flex-1 truncate text-right font-mono text-[11px] text-muted-foreground/60"
+                          className="min-w-0 flex-1 truncate text-right font-mono text-2xs text-muted-foreground/60"
                         >
                           {(item as MentionItem).hint}
                         </span>

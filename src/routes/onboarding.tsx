@@ -78,7 +78,7 @@ function StepRail({ current }: { current: Step }) {
         <div key={s.id} className="flex flex-1 items-center gap-2">
           <span
             className={cn(
-              "flex size-5 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold transition-colors",
+              "flex size-5 shrink-0 items-center justify-center rounded-full text-3xs font-semibold transition-colors",
               i < idx
                 ? "bg-primary text-primary-foreground"
                 : i === idx
@@ -90,7 +90,7 @@ function StepRail({ current }: { current: Step }) {
           </span>
           <span
             className={cn(
-              "text-[11px] font-medium",
+              "text-2xs font-medium",
               i <= idx ? "text-foreground" : "text-muted-foreground/50",
             )}
           >
@@ -347,7 +347,7 @@ function ReposStep({ onContinue }: { onContinue: () => void }) {
       </div>
 
       <div className="flex items-center justify-between pt-1">
-        <span className="text-[11px] text-muted-foreground/70">
+        <span className="text-2xs text-muted-foreground/70">
           {watched.length > 0 ? `${watched.length} selected` : "Watching everything"}
         </span>
         <Button size="sm" onClick={onContinue}>
@@ -473,7 +473,7 @@ function AuthError({ raw }: { raw: string }) {
         <summary className="cursor-pointer text-muted-foreground/60 transition-colors hover:text-muted-foreground">
           Technical details
         </summary>
-        <pre className="mt-1.5 overflow-auto rounded-md border border-hairline bg-background/50 p-2 text-[11px] text-muted-foreground">
+        <pre className="mt-1.5 overflow-auto rounded-md border border-hairline bg-background/50 p-2 text-2xs text-muted-foreground">
           {raw}
         </pre>
       </details>

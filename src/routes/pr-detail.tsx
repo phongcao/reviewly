@@ -1584,7 +1584,7 @@ export function PRDetailPage() {
             }}
             className="mb-2 flex h-[30rem] w-[26rem] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-hairline bg-popover/95 shadow-2xl backdrop-blur-md"
           >
-            <div className="flex items-center gap-1.5 border-b border-hairline px-3 py-2.5 text-[13px] font-medium text-muted-foreground">
+            <div className="flex items-center gap-1.5 border-b border-hairline px-3 py-2.5 text-sm font-medium text-muted-foreground">
               <Sparkles className="size-3.5 text-primary" />
               Ask about this PR
               <div className="ml-auto flex items-center gap-0.5">
@@ -1863,7 +1863,7 @@ function ChecksPlaceholder() {
 
   return (
     <div className="px-2 py-1.5">
-      <div className="px-2 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground/50">
+      <div className="px-2 py-1.5 text-2xs font-medium uppercase tracking-wide text-muted-foreground/50">
         Required
       </div>
       {rows.map((width, i) => (
@@ -1994,7 +1994,7 @@ function Conversation({
             />
           ) : (
             <>
-              <MarkdownBody className="text-xs">{description ?? ""}</MarkdownBody>
+              <MarkdownBody>{description ?? ""}</MarkdownBody>
               <div className="mt-2.5">
                 <ReactionsBar
                   target="issue"
@@ -2048,7 +2048,7 @@ function Conversation({
                   </span>
                 }
               />
-              {r.body && <MarkdownBody className="text-xs">{r.body}</MarkdownBody>}
+              {r.body && <MarkdownBody>{r.body}</MarkdownBody>}
               <div className="mt-2.5">
                 <ReactionsBar
                   target="review"
@@ -2065,7 +2065,7 @@ function Conversation({
           {visibleComments.map((c) => (
             <article key={c.id} className="rounded-xl border border-hairline bg-card/50 p-4">
               <CommentByline className="mb-2" user={c.user} timestamp={c.created_at} />
-              <MarkdownBody className="text-xs">{c.body}</MarkdownBody>
+              <MarkdownBody>{c.body}</MarkdownBody>
               <div className="mt-2.5">
                 <ReactionsBar
                   target="issue_comment"
@@ -2080,7 +2080,7 @@ function Conversation({
 
           {gqlThreads.length > 0 && (
             <section>
-              <h2 className="mb-2.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+              <h2 className="mb-2.5 text-2xs font-medium uppercase tracking-wide text-muted-foreground">
                 Inline comments
               </h2>
               <div className="space-y-2.5">
@@ -2255,10 +2255,10 @@ function CheckGroup({
   return (
     <section className="mb-1">
       <div className="flex items-baseline gap-2 px-2 pt-2 pb-1">
-        <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+        <span className="text-2xs font-medium uppercase tracking-wide text-muted-foreground">
           {title}
         </span>
-        {hint && <span className="text-[11px] text-muted-foreground/50">{hint}</span>}
+        {hint && <span className="text-2xs text-muted-foreground/50">{hint}</span>}
       </div>
       <ul>{children}</ul>
     </section>
@@ -2337,7 +2337,7 @@ function CheckRow({ run, owner, repo }: { run: CheckRun; owner: string; repo: st
           <span className="truncate text-xs text-foreground">{run.name}</span>
           {status && <span className={cn("shrink-0 text-xs", status.tone)}>{status.text}</span>}
         </button>
-        <span className="hidden shrink-0 text-[11px] text-muted-foreground/55 opacity-0 transition-opacity group-hover:opacity-100 sm:inline">
+        <span className="hidden shrink-0 text-2xs text-muted-foreground/55 opacity-0 transition-opacity group-hover:opacity-100 sm:inline">
           {run.app?.name ?? "Unknown"}
           {duration && ` · ${duration}`}
         </span>
@@ -2413,15 +2413,15 @@ function CheckDetail({ run, owner, repo }: { run: CheckRun; owner: string; repo:
       {run.output?.title && (
         <p className="text-xs font-medium text-foreground">{run.output.title}</p>
       )}
-      {summary && <MarkdownBody className="text-xs">{summary}</MarkdownBody>}
-      {text && text !== summary && <MarkdownBody className="text-xs">{text}</MarkdownBody>}
+      {summary && <MarkdownBody>{summary}</MarkdownBody>}
+      {text && text !== summary && <MarkdownBody>{text}</MarkdownBody>}
 
       {jobId != null &&
         (job.isLoading ? (
           <Skeleton className="h-16 w-full rounded-md" />
         ) : steps.length > 0 ? (
           <div>
-            <p className="mb-1 text-[11px] font-medium text-muted-foreground">
+            <p className="mb-1 text-2xs font-medium text-muted-foreground">
               Steps · {steps.length}
             </p>
             <ul className="space-y-0.5">

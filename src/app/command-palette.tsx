@@ -301,7 +301,7 @@ function Heading({ children }: { children: React.ReactNode }) {
   return (
     <div
       cmdk-group-heading=""
-      className="px-3 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground"
+      className="px-3 py-1.5 text-2xs font-medium uppercase tracking-wide text-muted-foreground"
     >
       {children}
     </div>

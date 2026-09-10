@@ -452,7 +452,7 @@ function InboxHero({
       />
       <div className="relative flex items-end justify-between gap-8">
         <div className="min-w-0">
-          <p className="text-[11px] font-medium uppercase tracking-[0.22em] text-muted-foreground/60">
+          <p className="text-2xs font-medium uppercase tracking-[0.22em] text-muted-foreground/60">
             Waiting on your review
           </p>
           <div className="mt-3 flex items-baseline gap-3">
@@ -511,7 +511,7 @@ function AgeChart({ buckets }: { buckets: number[] }) {
     >
       {buckets.map((v, i) => (
         <div key={labels[i]} className="flex w-9 flex-col items-center gap-1.5">
-          <span className="h-3 text-[11px] tabular-nums text-muted-foreground/70">{v || ""}</span>
+          <span className="h-3 text-2xs tabular-nums text-muted-foreground/70">{v || ""}</span>
           <div className="relative flex h-20 w-full items-end overflow-hidden rounded-md bg-foreground/[0.05]">
             <div
               className={cn(
@@ -521,7 +521,7 @@ function AgeChart({ buckets }: { buckets: number[] }) {
               style={{ height: mounted ? `${Math.max(v ? 10 : 0, (v / max) * 100)}%` : "0%" }}
             />
           </div>
-          <span className="text-[10px] tabular-nums text-muted-foreground/55">{labels[i]}</span>
+          <span className="text-3xs tabular-nums text-muted-foreground/55">{labels[i]}</span>
         </div>
       ))}
     </div>
@@ -589,7 +589,7 @@ function Section({
         </span>
         <span className="text-sm tabular-nums text-muted-foreground/70">{count}</span>
         {badge && (
-          <span className="rounded-full bg-destructive/15 px-2 py-0.5 text-[10px] font-medium text-destructive">
+          <span className="rounded-full bg-destructive/15 px-2 py-0.5 text-3xs font-medium text-destructive">
             {badge}
           </span>
         )}
@@ -696,7 +696,7 @@ function PriorityPill({ priority }: { priority: Priority }) {
   return (
     <span
       className={cn(
-        "shrink-0 rounded-full px-1.5 py-0.5 text-[10px] font-medium capitalize",
+        "shrink-0 rounded-full px-1.5 py-0.5 text-3xs font-medium capitalize",
         priority === "critical"
           ? "bg-destructive/15 text-destructive"
           : "bg-warning/15 text-warning",
@@ -743,7 +743,7 @@ function RowSignals({ item }: { item: InboxItem }) {
             }
           >
             <MessageSquare className="size-3.5" />
-            <span className="text-[10px] tabular-nums">{commentCount}</span>
+            <span className="text-3xs tabular-nums">{commentCount}</span>
           </span>
         </SignalTooltip>
       )}

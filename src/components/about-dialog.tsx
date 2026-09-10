@@ -120,7 +120,7 @@ export function AboutDialog() {
           </Button>
         </div>
 
-        <div className="flex items-center justify-center gap-1.5 border-t border-hairline px-4 py-2.5 text-[11px] text-muted-foreground/60">
+        <div className="flex items-center justify-center gap-1.5 border-t border-hairline px-4 py-2.5 text-2xs text-muted-foreground/60">
           <ShieldCheck className="size-3 text-success" />
           Runs on your machine · © {new Date().getFullYear()} Volnei Munhoz
         </div>

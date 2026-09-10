@@ -325,9 +325,9 @@ function RepoCard({
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-medium text-foreground">{slug}</p>
           {local ? (
-            <p className="truncate font-mono text-[11px] text-muted-foreground">{local.path}</p>
+            <p className="truncate font-mono text-2xs text-muted-foreground">{local.path}</p>
           ) : (
-            <p className="text-[11px] text-muted-foreground/70">Not cloned</p>
+            <p className="text-2xs text-muted-foreground/70">Not cloned</p>
           )}
         </div>
         {/* Watch switch — always visible; the name keeps the full row width. */}
@@ -349,11 +349,11 @@ function RepoCard({
         {/* Left: branch chip when cloned, otherwise a Clone call-to-action. */}
         {local ? (
           info.isError ? (
-            <span className="inline-flex items-center gap-1 rounded-md bg-destructive/10 px-1.5 py-0.5 text-[11px] text-destructive">
+            <span className="inline-flex items-center gap-1 rounded-md bg-destructive/10 px-1.5 py-0.5 text-2xs text-destructive">
               folder missing
             </span>
           ) : (
-            <span className="inline-flex min-w-0 items-center gap-1 rounded-md bg-foreground/[0.06] px-1.5 py-0.5 text-[11px] text-muted-foreground">
+            <span className="inline-flex min-w-0 items-center gap-1 rounded-md bg-foreground/[0.06] px-1.5 py-0.5 text-2xs text-muted-foreground">
               <GitBranch className="size-3 shrink-0" />
               <span className="truncate">{info.data?.currentBranch || "—"}</span>
               {info.data?.dirty && (
@@ -371,7 +371,7 @@ function RepoCard({
               variant="outline"
               loading={cloning}
               onClick={onClone}
-              className="h-6 px-2 text-[11px]"
+              className="h-6 px-2 text-2xs"
             >
               <DownloadCloud className="size-3.5" />
               Clone
@@ -383,7 +383,7 @@ function RepoCard({
                 size="sm"
                 variant="ghost"
                 onClick={onLocate}
-                className="h-6 px-2 text-[11px] text-muted-foreground"
+                className="h-6 px-2 text-2xs text-muted-foreground"
               >
                 <FolderSearch className="size-3.5" />
                 Locate…

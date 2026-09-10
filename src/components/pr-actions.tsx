@@ -440,7 +440,7 @@ export function PrActions({ owner, repo, number, pr, nodeId }: Props) {
               conflict, runs your build &amp; tests, commits the merge, and pushes to the PR branch.
             </AlertDialogDescription>
             {localRepo && (
-              <code className="mt-1 block truncate rounded-md bg-foreground/[0.04] px-2 py-1.5 font-mono text-[11px] text-muted-foreground">
+              <code className="mt-1 block truncate rounded-md bg-foreground/[0.04] px-2 py-1.5 font-mono text-2xs text-muted-foreground">
                 {localRepo.path}
               </code>
             )}

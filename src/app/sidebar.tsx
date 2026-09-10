@@ -165,7 +165,7 @@ function RailItem({
         badge > 0 && (
           <span
             className={cn(
-              "pointer-events-none absolute -right-1 -top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full px-1 text-[9px] font-medium leading-none tabular-nums ring-2 ring-background",
+              "pointer-events-none absolute -right-1 -top-1 flex h-3.5 min-w-3.5 items-center justify-center rounded-full px-1 text-4xs font-medium leading-none tabular-nums ring-2 ring-background",
               badgeTone === "warning"
                 ? "bg-warning text-white"
                 : "bg-primary text-primary-foreground",

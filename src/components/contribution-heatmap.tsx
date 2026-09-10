@@ -81,7 +81,7 @@ export function ContributionHeatmap({
           horizontal scroll, at any card width. */}
       <div className="flex flex-col gap-1">
         {/* month labels */}
-        <div className="flex gap-[2px] text-[10px] text-muted-foreground/80">
+        <div className="flex gap-[2px] text-3xs text-muted-foreground/80">
           {weeks.map((week, i) => {
             const m = week[0].month;
             const show = m !== (i > 0 ? weeks[i - 1][0].month : -1);
@@ -114,7 +114,7 @@ export function ContributionHeatmap({
       </div>
 
       {/* legend */}
-      <div className="mt-2 flex items-center justify-end gap-1.5 text-[10px] text-muted-foreground">
+      <div className="mt-2 flex items-center justify-end gap-1.5 text-3xs text-muted-foreground">
         Less
         {FILL.map((f) => (
           <span

@@ -90,7 +90,7 @@ function Keys({ keys }: { keys: string[] }) {
       {keys.map((k, i) => (
         <kbd
           key={`${k}-${i}`}
-          className="inline-flex min-w-5 items-center justify-center rounded bg-foreground/[0.08] px-1.5 py-0.5 font-mono text-[11px] leading-none text-foreground/90"
+          className="inline-flex min-w-5 items-center justify-center rounded bg-foreground/[0.08] px-1.5 py-0.5 font-mono text-2xs leading-none text-foreground/90"
         >
           {k}
         </kbd>
@@ -118,7 +118,7 @@ export function ShortcutsCheatsheet() {
           <div className="grid grid-cols-1 gap-x-8 gap-y-5 sm:grid-cols-2">
             {GROUPS.map((group) => (
               <section key={group.title} className="space-y-1.5">
-                <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/60">
+                <p className="text-2xs font-medium uppercase tracking-wide text-muted-foreground/60">
                   {group.title}
                 </p>
                 <ul className="space-y-1">

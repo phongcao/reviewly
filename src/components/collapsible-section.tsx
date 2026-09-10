@@ -35,7 +35,7 @@ export function CollapsibleSection({
           type="button"
           onClick={() => toggle(id)}
           aria-expanded={open}
-          className="-mx-2 flex flex-1 items-center gap-1.5 rounded-md px-2 py-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground transition-colors hover:text-foreground"
+          className="-mx-2 flex flex-1 items-center gap-1.5 rounded-md px-2 py-1 text-2xs font-medium uppercase tracking-wide text-muted-foreground transition-colors hover:text-foreground"
         >
           <ChevronRight
             className={cn(

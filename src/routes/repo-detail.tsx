@@ -250,7 +250,7 @@ export function RepoDetailPage() {
           >
             <Search className="size-3.5" />
             Go to file
-            <kbd className="rounded bg-foreground/[0.08] px-1 py-px font-mono text-[11px] text-muted-foreground">
+            <kbd className="rounded bg-foreground/[0.08] px-1 py-px font-mono text-2xs text-muted-foreground">
               ⌘P
             </kbd>
           </button>
@@ -417,12 +417,12 @@ function Tree({
               </span>
               <span className="ml-auto flex shrink-0 items-center gap-1.5 pl-1">
                 {owns.length > 0 && (
-                  <span className="hidden max-w-24 truncate text-[10px] text-muted-foreground/55 group-hover/row:inline">
+                  <span className="hidden max-w-24 truncate text-3xs text-muted-foreground/55 group-hover/row:inline">
                     {owns[0]}
                   </span>
                 )}
                 {chg && (chg.additions > 0 || chg.deletions > 0) && (
-                  <span className="text-[10px] tabular-nums">
+                  <span className="text-3xs tabular-nums">
                     {chg.additions > 0 && <span className="text-success">+{chg.additions}</span>}
                     {chg.deletions > 0 && (
                       <span className="ml-0.5 text-destructive">−{chg.deletions}</span>
@@ -430,7 +430,7 @@ function Tree({
                   </span>
                 )}
                 {stt && (
-                  <span className={cn("text-[10px] font-semibold leading-none", statusColor(stt))}>
+                  <span className={cn("text-3xs font-semibold leading-none", statusColor(stt))}>
                     {stt}
                   </span>
                 )}

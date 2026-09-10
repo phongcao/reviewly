@@ -713,7 +713,7 @@ function FileRow({
       >
         <span
           className={cn(
-            "flex size-3.5 shrink-0 items-center justify-center rounded-sm text-[9px] font-semibold leading-none ring-1 ring-inset ring-border/50",
+            "flex size-3.5 shrink-0 items-center justify-center rounded-sm text-4xs font-semibold leading-none ring-1 ring-inset ring-border/50",
             statusTextColor(file.status),
           )}
           aria-hidden

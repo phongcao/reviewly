@@ -126,7 +126,7 @@ export function WhatsNewDialog() {
           {entries.map((entry) => (
             <div key={entry.version} className="space-y-2.5">
               {entries.length > 1 && (
-                <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground/55">
+                <p className="text-2xs font-medium uppercase tracking-wide text-muted-foreground/55">
                   v{entry.version}
                 </p>
               )}

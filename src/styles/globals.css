@@ -15,6 +15,17 @@
 @theme {
   --font-weight-semibold: 550;
   --font-weight-bold: 600;
+
+  /* Steps below `text-xs`, for chips, badges and eyebrow labels. These exist so
+     that small text is written in REM like everything else: zoom works by
+     scaling the root font-size (see `use-global-shortcuts`), so a literal px
+     font-size silently opts out of it and gets relatively smaller the more the
+     reviewer zooms in. No line-height is paired with them on purpose —
+     these sizes are used inside rows that set their own leading, and inheriting
+     it is what the px literals they replaced already did. */
+  --text-2xs: 0.6875rem; /* 11px at the default root */
+  --text-3xs: 0.625rem; /* 10px */
+  --text-4xs: 0.5625rem; /* 9px — count bubbles inside a size-3.5 dot */
 }
 
 :root {
@@ -469,7 +480,7 @@
 
 /* Markdown rendering styles for AI responses (react-markdown). */
 .prose-reviewly {
-  font-size: 13.5px;
+  font-size: 0.875rem;
   line-height: 1.65;
   color: var(--color-foreground);
   letter-spacing: -0.003em;
@@ -584,7 +595,7 @@
 }
 .prose-code-block-lang {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 0.6875rem;
   color: var(--color-muted-foreground);
   text-transform: lowercase;
 }
@@ -593,7 +604,7 @@
   display: inline-flex;
   align-items: center;
   gap: 0.25rem;
-  font-size: 11px;
+  font-size: 0.6875rem;
   color: var(--color-muted-foreground);
   background: transparent;
   border: 0;
@@ -614,7 +625,7 @@
   padding: 0.85rem 0.95rem;
   overflow-x: auto;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 0.75rem;
   line-height: 1.55;
 }
 .prose-code-block pre code {
@@ -634,7 +645,7 @@
   padding: 0.85rem 0.95rem;
   overflow-x: auto;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 0.75rem;
   line-height: 1.55;
 }
 .prose-reviewly pre:not(.prose-code-block pre) code {
@@ -692,7 +703,7 @@
   width: 100%;
   border-collapse: separate;
   border-spacing: 0;
-  font-size: 12px;
+  font-size: 0.75rem;
   border: 1px solid var(--color-border);
   border-radius: 8px;
   overflow: hidden;
@@ -705,7 +716,7 @@
   padding: 0.5rem 0.7rem;
   text-align: left;
   font-weight: 500;
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--color-muted-foreground);
 }
 .prose-reviewly td {
@@ -735,7 +746,7 @@
   cursor: pointer;
   list-style: none;
   font-weight: 500;
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--color-muted-foreground);
   padding-left: 1.1rem;
   position: relative;

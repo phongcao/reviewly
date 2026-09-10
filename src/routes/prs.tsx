@@ -482,7 +482,7 @@ function ActiveFilters({
 }) {
   return (
     <div className="flex flex-wrap items-center gap-1.5 border-b border-hairline/70 bg-foreground/[0.018] px-6 py-1.5">
-      <span className="inline-flex h-6 shrink-0 items-center gap-1.5 pr-1 text-[11px] font-medium text-muted-foreground/80">
+      <span className="inline-flex h-6 shrink-0 items-center gap-1.5 pr-1 text-2xs font-medium text-muted-foreground/80">
         <Filter className="size-3.5" strokeWidth={1.75} />
         Filters
       </span>
@@ -541,7 +541,7 @@ function ActiveFilterToken({ chip }: { chip: ActiveFilterChip }) {
             ))}
             {chip.valueAvatarOverflow ? (
               <TooltipFor label={`${chip.valueAvatarOverflow} more`}>
-                <span className="flex size-4 items-center justify-center rounded-full bg-foreground/[0.08] text-[9px] font-medium text-muted-foreground ring-1 ring-background">
+                <span className="flex size-4 items-center justify-center rounded-full bg-foreground/[0.08] text-4xs font-medium text-muted-foreground ring-1 ring-background">
                   +{chip.valueAvatarOverflow}
                 </span>
               </TooltipFor>
@@ -984,7 +984,7 @@ function PrListCommandBar({
     <div
       aria-label={`Keyboard shortcuts for ${repo.owner}/${repo.repo} pull request ${pr.number}`}
       className={cn(
-        "pointer-events-none absolute bottom-4 left-1/2 z-10 hidden max-w-[calc(100%-3rem)] -translate-x-1/2 items-center gap-2 rounded-lg border border-hairline bg-popover/95 px-2.5 py-2 text-[11px] text-muted-foreground shadow-2xl backdrop-blur-md lg:flex",
+        "pointer-events-none absolute bottom-4 left-1/2 z-10 hidden max-w-[calc(100%-3rem)] -translate-x-1/2 items-center gap-2 rounded-lg border border-hairline bg-popover/95 px-2.5 py-2 text-2xs text-muted-foreground shadow-2xl backdrop-blur-md lg:flex",
       )}
     >
       <span className="max-w-64 truncate border-r border-hairline pr-2 font-medium text-foreground/80">
@@ -1015,7 +1015,7 @@ function KeyHint({
     <span
       className={cn("inline-flex items-center gap-1 whitespace-nowrap", disabled && "opacity-45")}
     >
-      <kbd className="flex h-4 min-w-4 items-center justify-center rounded bg-foreground/[0.1] px-1 font-mono text-[11px] text-foreground">
+      <kbd className="flex h-4 min-w-4 items-center justify-center rounded bg-foreground/[0.1] px-1 font-mono text-2xs text-foreground">
         {keys}
       </kbd>
       <span>{label}</span>
@@ -1304,7 +1304,7 @@ function SavedViewRow({
           </span>
           <Check className={cn("size-3 shrink-0", active ? "text-primary" : "opacity-0")} />
         </span>
-        <span className="mt-0.5 block truncate pl-5 text-[11px] text-muted-foreground/75">
+        <span className="mt-0.5 block truncate pl-5 text-2xs text-muted-foreground/75">
           {summarizeSnapshot(group.filters)}
         </span>
       </button>
@@ -1472,7 +1472,7 @@ function FilterMenu({
         <ListFilter className="size-3.5" />
         Add Filter
         {activeCount > 0 && (
-          <span className="rounded-full bg-primary/20 px-1 text-[10px] font-medium tabular-nums text-primary">
+          <span className="rounded-full bg-primary/20 px-1 text-3xs font-medium tabular-nums text-primary">
             {activeCount}
           </span>
         )}
@@ -1490,7 +1490,7 @@ function FilterMenu({
                   placeholder="Filter..."
                   className="h-7 w-full rounded-md bg-transparent pl-7 pr-8 text-xs text-foreground outline-none placeholder:text-muted-foreground/60 focus:bg-foreground/[0.04]"
                 />
-                <span className="absolute right-1.5 top-1/2 flex size-5 -translate-y-1/2 items-center justify-center rounded-md bg-background/80 text-[10px] font-medium text-muted-foreground/80">
+                <span className="absolute right-1.5 top-1/2 flex size-5 -translate-y-1/2 items-center justify-center rounded-md bg-background/80 text-3xs font-medium text-muted-foreground/80">
                   F
                 </span>
               </div>
@@ -1758,7 +1758,7 @@ function FilterValueFlyout({
           ))}
       </div>
       {config.count > 5 && (
-        <p className="mt-1 border-t border-hairline px-1 py-1.5 text-[11px] text-muted-foreground/70">
+        <p className="mt-1 border-t border-hairline px-1 py-1.5 text-2xs text-muted-foreground/70">
           {config.count} {config.label}
           {config.count === 1 ? "" : "s"}
         </p>

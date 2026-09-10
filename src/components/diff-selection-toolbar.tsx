@@ -140,7 +140,7 @@ export function DiffSelectionToolbar({
         onAskAi?.();
       }}
       style={{ left, top }}
-      className="fixed z-[60] flex items-center gap-1.5 rounded-lg border border-border/60 bg-popover/95 px-2 py-1 font-sans text-[11px] font-medium text-foreground shadow-xl backdrop-blur-xl transition-colors hover:bg-primary/15"
+      className="fixed z-[60] flex items-center gap-1.5 rounded-lg border border-border/60 bg-popover/95 px-2 py-1 font-sans text-2xs font-medium text-foreground shadow-xl backdrop-blur-xl transition-colors hover:bg-primary/15"
     >
       <Sparkles className="size-3 text-primary" />
       Ask AI

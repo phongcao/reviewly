@@ -409,7 +409,7 @@ export function LayerBar(props: BarProps) {
             >
               <span
                 className={cn(
-                  "flex size-4 shrink-0 items-center justify-center rounded-full text-[10px] tabular-nums",
+                  "flex size-4 shrink-0 items-center justify-center rounded-full text-3xs tabular-nums",
                   s.done
                     ? "bg-success/15 text-success"
                     : isActive
@@ -435,14 +435,11 @@ export function LayerBar(props: BarProps) {
             <div className="flex flex-wrap items-center gap-2">
               <h3 className="truncate text-xs font-medium text-foreground">{active.title}</h3>
               <span
-                className={cn(
-                  "rounded px-1.5 py-px text-[10px] font-medium",
-                  RISK_CHIP[active.risk],
-                )}
+                className={cn("rounded px-1.5 py-px text-3xs font-medium", RISK_CHIP[active.risk])}
               >
                 {RISK_LABEL[active.risk]}
               </span>
-              <span className="text-[11px] tabular-nums text-muted-foreground">
+              <span className="text-2xs tabular-nums text-muted-foreground">
                 {activeStats.files} file{activeStats.files === 1 ? "" : "s"}
                 {" · "}
                 <span className="text-success">+{activeStats.additions}</span>{" "}
@@ -450,7 +447,7 @@ export function LayerBar(props: BarProps) {
               </span>
             </div>
             {active.intent && (
-              <p className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground">
+              <p className="mt-1 line-clamp-2 text-sm leading-6 text-muted-foreground">
                 {active.intent}
               </p>
             )}
@@ -459,7 +456,7 @@ export function LayerBar(props: BarProps) {
                 {active.focus.map((f) => (
                   <li
                     key={f}
-                    className="flex items-center gap-1.5 text-[11px] leading-4 text-muted-foreground"
+                    className="flex items-center gap-1.5 text-xs leading-5 text-muted-foreground"
                   >
                     <span className="size-1 shrink-0 rounded-full bg-muted-foreground/50" />
                     {f}

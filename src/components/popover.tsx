@@ -150,7 +150,7 @@ export function PopoverPanel({
 export function PopoverSection({ title, children }: { title: string; children: ReactNode }) {
   return (
     <div className="py-1">
-      <p className="px-2 pb-0.5 text-[11px] font-medium text-muted-foreground/60">{title}</p>
+      <p className="px-2 pb-0.5 text-2xs font-medium text-muted-foreground/60">{title}</p>
       {children}
     </div>
   );
@@ -231,7 +231,7 @@ export function Menu({
         <Icon className="size-3.5" />
         {label}
         {count > 0 && (
-          <span className="rounded-full bg-primary/20 px-1 text-[10px] font-medium tabular-nums text-primary">
+          <span className="rounded-full bg-primary/20 px-1 text-3xs font-medium tabular-nums text-primary">
             {count}
           </span>
         )}

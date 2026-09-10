@@ -270,7 +270,7 @@ export function AiReview({ prKey, context, executeAction, files }: Props) {
               <button
                 type="button"
                 onClick={stop}
-                className="pl-1 text-[11px] font-medium text-muted-foreground/55 transition-colors hover:text-destructive"
+                className="pl-1 text-2xs font-medium text-muted-foreground/55 transition-colors hover:text-destructive"
               >
                 Stop generating
               </button>
@@ -284,7 +284,7 @@ export function AiReview({ prKey, context, executeAction, files }: Props) {
               <button
                 type="button"
                 onClick={stop}
-                className="ml-auto text-[11px] font-medium text-muted-foreground/55 transition-colors hover:text-destructive"
+                className="ml-auto text-2xs font-medium text-muted-foreground/55 transition-colors hover:text-destructive"
               >
                 Stop
               </button>
@@ -361,14 +361,14 @@ export function AiReview({ prKey, context, executeAction, files }: Props) {
             }}
             placeholder="Talk about this PR… (@ to attach a file)"
             rows={2}
-            className="min-h-0 flex-1 resize-none font-sans text-xs"
+            className="min-h-0 flex-1 resize-none font-sans text-sm"
           />
           <Button type="submit" size="icon-sm" disabled={streaming || !input.trim()}>
             <SendHorizonal className="size-4" />
           </Button>
         </form>
         {/* 71: keyboard hint */}
-        <p className="flex items-center gap-1.5 pl-0.5 text-[11px] text-muted-foreground/45">
+        <p className="flex items-center gap-1.5 pl-0.5 text-2xs text-muted-foreground/45">
           <span className="inline-flex items-center gap-1">
             <KbdEnter /> send
           </span>
@@ -397,7 +397,7 @@ function ContextChip({ refItem, onRemove }: { refItem: PrContextRef; onRemove: (
   return (
     <span
       title={refItem.path}
-      className="inline-flex items-center gap-1 rounded-md bg-primary/15 px-1.5 py-0.5 font-mono text-[11px] font-medium text-primary"
+      className="inline-flex items-center gap-1 rounded-md bg-primary/15 px-1.5 py-0.5 font-mono text-2xs font-medium text-primary"
     >
       <Icon className="size-3 shrink-0" />
       <span className="max-w-[14rem] truncate">{label}</span>

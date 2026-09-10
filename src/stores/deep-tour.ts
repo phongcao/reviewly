@@ -70,6 +70,10 @@ interface State {
   /** Forget one layer's batch, so it can be regenerated. */
   dropLayer: (key: string, layerId: string) => void;
   reset: (key: string) => void;
+  /** Put a whole entry back — the Undo side of `reset`. Batches that were in
+   * flight when the tour was discarded are gone for good (their AI runs were
+   * canceled); this restores what had already landed. */
+  restore: (key: string, entry: DeepTourEntry) => void;
   dismiss: (key: string, stepId: string) => void;
   restoreDismissed: (key: string) => void;
   markSeen: (key: string, stepId: string) => void;
@@ -150,6 +154,10 @@ export const useDeepTour = create<State>()(
         const next = { ...get().byPr };
         delete next[key];
         set({ byPr: next });
+      },
+
+      restore: (key, entry) => {
+        set({ byPr: evict({ ...get().byPr, [key]: entry }) });
       },
 
       dismiss: (key, stepId) => {
