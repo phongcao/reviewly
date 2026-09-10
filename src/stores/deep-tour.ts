@@ -46,6 +46,12 @@ export interface DeepTourEntry {
   seen?: string[];
   /** Step id to resume on. */
   lastActiveId?: string;
+  /** Layer ids folded away in the tour rail. View state, but persisted here
+   * because it is per PR exactly like the layers it names — a reviewer who
+   * shrank the rail down to the layer they're working in should find it that
+   * way on the way back. Optional so tours persisted before this existed load
+   * as "all expanded", which is also the default. Same reasoning as `seen`. */
+  collapsedLayers?: string[];
   /** A layer the reviewer explicitly asked to read ("Tour this layer" / "Read
    * tour" in the layered view). The tour jumps to its first stop as soon as the
    * batch is in, then clears this — it's a one-shot intent, not a selection. */
@@ -78,6 +84,10 @@ interface State {
   restoreDismissed: (key: string) => void;
   markSeen: (key: string, stepId: string) => void;
   setLastActive: (key: string, stepId: string) => void;
+  /** Fold / unfold one layer's stops in the tour rail. */
+  toggleLayerCollapsed: (key: string, layerId: string) => void;
+  /** Fold / unfold the given layers at once — collapse-all / expand-all. */
+  setLayersCollapsed: (key: string, layerIds: string[], collapsed: boolean) => void;
   /** Ask the tour to jump to this layer once it has landed. */
   focusLayer: (key: string, layerId: string) => void;
   /** The jump happened (or the layer went away) — drop the request. */
@@ -116,7 +126,15 @@ export const useDeepTour = create<State>()(
         set({
           byPr: evict({
             ...get().byPr,
-            [key]: { plan, byLayer: {}, headSha, generatedAt: Date.now(), dismissed: [], seen: [] },
+            [key]: {
+              plan,
+              byLayer: {},
+              headSha,
+              generatedAt: Date.now(),
+              dismissed: [],
+              seen: [],
+              collapsedLayers: [],
+            },
           }),
         });
       },
@@ -176,6 +194,28 @@ export const useDeepTour = create<State>()(
         const cur = get().byPr[key];
         if (!cur || (cur.seen ?? []).includes(stepId)) return;
         set({ byPr: { ...get().byPr, [key]: { ...cur, seen: [...(cur.seen ?? []), stepId] } } });
+      },
+
+      toggleLayerCollapsed: (key, layerId) => {
+        const cur = get().byPr[key];
+        if (!cur) return;
+        const now = cur.collapsedLayers ?? [];
+        const next = now.includes(layerId) ? now.filter((id) => id !== layerId) : [...now, layerId];
+        set({ byPr: { ...get().byPr, [key]: { ...cur, collapsedLayers: next } } });
+      },
+
+      setLayersCollapsed: (key, layerIds, collapsed) => {
+        const cur = get().byPr[key];
+        if (!cur) return;
+        const now = cur.collapsedLayers ?? [];
+        const next = collapsed
+          ? [...new Set([...now, ...layerIds])]
+          : now.filter((id) => !layerIds.includes(id));
+        // Collapse-all with everything already folded (or expand-all with
+        // nothing folded) is a no-op — don't rewrite the persisted row, and
+        // don't hand the tour a fresh progress object for nothing.
+        if (next.length === now.length && next.every((id, i) => id === now[i])) return;
+        set({ byPr: { ...get().byPr, [key]: { ...cur, collapsedLayers: next } } });
       },
 
       focusLayer: (key, layerId) => {

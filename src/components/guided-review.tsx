@@ -18,6 +18,7 @@ import {
   type GuidedVerdict,
   type StepKind,
   type TourLayer,
+  groupTourStops,
   parseTourKey,
   verdictDisplay,
 } from "@/lib/guided";
@@ -41,6 +42,8 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
+  ChevronsDownUp,
+  ChevronsUpDown,
   Compass,
   FileCode,
   HelpCircle,
@@ -113,6 +116,10 @@ const KIND: Record<
   praise: { icon: ThumbsUp, text: "text-success", dot: "bg-success", label: "Nice" },
 };
 
+/** Stable empty set, so a tour with no collapse support doesn't hand the rail a
+ * fresh `Set` identity on every render. */
+const NO_COLLAPSE: ReadonlySet<string> = new Set();
+
 /** The tour's suggested verdict → its chip + the review event it seeds. */
 const VERDICT_META: Record<
   GuidedVerdict,
@@ -162,6 +169,16 @@ export interface TourProgress {
   setLastActive: (index: number) => void;
   dismiss: (index: number) => void;
   restoreDismissed: () => void;
+  /** Which layers are folded away in the tour rail. Rail-only view state, but
+   * persisted per PR alongside the rest of the reviewer's tour state — shrinking
+   * the rail should survive navigating away. Absent on the classic whole-PR
+   * tour, which has no layers to fold: its absence is what hides the controls. */
+  collapse?: {
+    collapsed: Set<string>;
+    toggle: (layerId: string) => void;
+    /** Bulk set, for collapse-all / expand-all. */
+    setAll: (layerIds: string[], collapsed: boolean) => void;
+  };
 }
 
 /** Seconds elapsed while `running` is true; resets to 0 when it flips off. */
@@ -455,6 +472,8 @@ function DeepTour({
   const markSeenStep = useDeepTour((s) => s.markSeen);
   const setLastActive = useDeepTour((s) => s.setLastActive);
   const clearFocus = useDeepTour((s) => s.clearFocus);
+  const toggleLayerCollapsed = useDeepTour((s) => s.toggleLayerCollapsed);
+  const setLayersCollapsed = useDeepTour((s) => s.setLayersCollapsed);
 
   const running = gen?.running ?? [];
   const queued = gen?.queued ?? [];
@@ -483,6 +502,7 @@ function DeepTour({
   const dismissedIds = entry?.dismissed;
   const seenIds = entry?.seen;
   const lastActiveId = entry?.lastActiveId;
+  const collapsedLayerIds = entry?.collapsedLayers;
   const progress = useMemo<TourProgress>(() => {
     const hidden = new Set(dismissedIds ?? []);
     const read = new Set(seenIds ?? []);
@@ -513,17 +533,25 @@ function DeepTour({
         if (id) dismissStep(prKey, id);
       },
       restoreDismissed: () => restoreDismissed(prKey),
+      collapse: {
+        collapsed: new Set(collapsedLayerIds ?? []),
+        toggle: (id) => toggleLayerCollapsed(prKey, id),
+        setAll: (ids, c) => setLayersCollapsed(prKey, ids, c),
+      },
     };
   }, [
     ids,
     dismissedIds,
     seenIds,
     lastActiveId,
+    collapsedLayerIds,
     prKey,
     markSeenStep,
     setLastActive,
     dismissStep,
     restoreDismissed,
+    toggleLayerCollapsed,
+    setLayersCollapsed,
   ]);
 
   // A layer the reviewer explicitly opened from the layered view: jump to its
@@ -1125,6 +1153,31 @@ function Tour({
     return counts;
   }, [visible, plan.steps]);
 
+  // The rail draws layer by layer so one layer's stops can fold away without
+  // breaking the spine that runs through the others. The reading pane still
+  // renders every visible stop — `layerHeads` above stays its heading source.
+  const groups = useMemo(
+    () => groupTourStops(visible, plan.steps, plan.layers),
+    [visible, plan.steps, plan.layers],
+  );
+  // Read stops per layer — what a folded heading reports in place of its rows.
+  const layerDone = useMemo(() => {
+    const done = new Map<string, number>();
+    for (const i of visible) {
+      const id = plan.steps[i].layerId;
+      if (id && progress.seen.has(i)) done.set(id, (done.get(id) ?? 0) + 1);
+    }
+    return done;
+  }, [visible, plan.steps, progress.seen]);
+  const collapse = progress.collapse;
+  const collapsedIds = collapse?.collapsed ?? NO_COLLAPSE;
+  // Only layers with stops ON SCREEN: collapse-all must not fold ids the rail
+  // can't show, and a layer the kind filter emptied has nothing to fold.
+  const collapsibleIds = useMemo(
+    () => [...new Set(groups.map((g) => g.layer?.id).filter((id): id is string => !!id))],
+    [groups],
+  );
+
   // Move ±1 through the *visible* set (respects an active kind filter).
   const move = useCallback(
     (delta: number) => {
@@ -1338,8 +1391,6 @@ function Tour({
     );
   }
 
-  const lastPos = visible.length - 1;
-
   return (
     <div className="flex h-full flex-col">
       {/* tour controller */}
@@ -1526,115 +1577,143 @@ function Tour({
       <div className="mt-2 flex min-h-0 flex-1">
         {!noSteps && (
           <aside className="hidden w-60 shrink-0 overflow-y-auto border-r border-hairline px-3 py-4 lg:block">
-            <p className="mb-2 px-2 text-3xs font-medium uppercase tracking-wide text-muted-foreground/50">
-              The tour
-            </p>
-            <div className="flex flex-col">
-              {visible.map((i, p) => {
-                const step = plan.steps[i];
-                const K = KIND[step.kind] ?? KIND.orient;
-                const isActive = p === pos;
-                // Read state, not position: a layer that lands ahead of the
-                // cursor must not inherit the checkmarks of the stops it was
-                // inserted behind.
-                const done = progress.seen.has(i) && !isActive;
-                const head = layerHeads.get(i);
-                // The spine should break where a layer does, rather than run
-                // through the heading that separates them.
-                const groupEnd = p < lastPos && layerHeads.has(visible[p + 1]);
-                const node = (
+            <div className="mb-2 flex items-center gap-1 px-2">
+              <p className="min-w-0 flex-1 text-3xs font-medium uppercase tracking-wide text-muted-foreground/50">
+                The tour
+              </p>
+              {/* With a single layer the per-heading chevron is enough, and the
+                  pair would just be noise. Two buttons rather than one toggle:
+                  a toggle has to invent a meaning for "3 of 7 folded". */}
+              {collapse && collapsibleIds.length > 1 && (
+                <div className="-mr-1 flex shrink-0 items-center">
                   <button
-                    key={i}
                     type="button"
-                    onClick={() => jumpTo(i)}
-                    className={cn(
-                      "group flex w-full gap-2.5 rounded-lg px-2 text-left transition-colors hover:bg-foreground/[0.04]",
-                      isActive && "bg-foreground/[0.05]",
-                    )}
+                    onClick={() => collapse.setAll(collapsibleIds, true)}
+                    aria-label="Collapse all layers"
+                    title="Collapse all"
+                    className="flex size-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-foreground/[0.05] hover:text-foreground"
                   >
-                    <span className="relative flex w-4 shrink-0 flex-col items-center self-stretch">
-                      <span
-                        className={cn(
-                          "w-px flex-1",
-                          p === 0 || head
-                            ? "bg-transparent"
-                            : p <= pos
-                              ? "bg-foreground/35"
-                              : "bg-foreground/12",
-                        )}
-                      />
-                      <span className="relative flex size-3.5 items-center justify-center">
-                        {isActive && (
-                          <span
-                            aria-hidden
-                            className="absolute inline-flex size-full rounded-full bg-foreground opacity-20 motion-safe:animate-ping"
-                          />
-                        )}
-                        {/* Fill encodes STATE (done/current = accent, ahead = hollow).
-                          The kind shows in the row heading, not on the node. */}
-                        <span
-                          className={cn(
-                            "relative flex size-3.5 items-center justify-center rounded-full",
-                            done && "bg-foreground/55 text-background",
-                            isActive &&
-                              "bg-foreground/75 text-background ring-4 ring-foreground/10",
-                            !done &&
-                              !isActive &&
-                              "border-[1.5px] border-foreground/25 bg-background",
-                          )}
-                        >
-                          {done && <Check className="size-2.5" strokeWidth={3} />}
-                        </span>
-                      </span>
-                      <span
-                        className={cn(
-                          "w-px flex-1",
-                          p === lastPos || groupEnd
-                            ? "bg-transparent"
-                            : p < pos
-                              ? "bg-foreground/35"
-                              : "bg-foreground/12",
-                        )}
-                      />
-                    </span>
-                    <span className="min-w-0 flex-1 py-2.5">
-                      <span
-                        className={cn(
-                          "mb-1 block text-3xs font-medium uppercase leading-none tracking-wide",
-                          K.text,
-                          !isActive && "opacity-55",
-                        )}
-                      >
-                        {K.label}
-                      </span>
-                      <span
-                        className={cn(
-                          "block truncate text-xs leading-snug",
-                          isActive
-                            ? "font-medium text-foreground"
-                            : done
-                              ? "text-muted-foreground"
-                              : "text-muted-foreground/55",
-                        )}
-                      >
-                        {step.title}
-                      </span>
-                    </span>
+                    <ChevronsDownUp className="size-3.5" strokeWidth={2} />
                   </button>
+                  <button
+                    type="button"
+                    onClick={() => collapse.setAll(collapsibleIds, false)}
+                    aria-label="Expand all layers"
+                    title="Expand all"
+                    className="flex size-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-foreground/[0.05] hover:text-foreground"
+                  >
+                    <ChevronsUpDown className="size-3.5" strokeWidth={2} />
+                  </button>
+                </div>
+              )}
+            </div>
+            <div className="flex flex-col">
+              {groups.map((g, gi) => {
+                const layer = g.layer;
+                const folded = !!layer && !!collapse && collapsedIds.has(layer.id);
+                // Only the run the cursor is actually in takes the accent, even
+                // though the fold belongs to the layer as a whole.
+                const hasCursor =
+                  !!layer && layer.id === activeLayer?.id && g.items.includes(active);
+                const n = layer ? (layerCounts.get(layer.id) ?? g.items.length) : g.items.length;
+                const readN = layer ? (layerDone.get(layer.id) ?? 0) : 0;
+
+                // Kept mounted (display:none) so `aria-controls` points at a
+                // real node. Must be the `hidden` CLASS, not the attribute: the
+                // author-level `display:flex` below would outrank the UA
+                // sheet's `[hidden] { display: none }` and still render.
+                const rows = (
+                  <div
+                    id={layer ? `tour-layer-${layer.id}` : undefined}
+                    className={folded ? "hidden" : "flex flex-col"}
+                  >
+                    {g.items.map((i, q) => {
+                      const p = g.start + q;
+                      return (
+                        <RailStop
+                          key={i}
+                          step={plan.steps[i]}
+                          active={p === pos}
+                          // Read state, not position: a layer that lands ahead
+                          // of the cursor must not inherit the checkmarks of the
+                          // stops it was inserted behind.
+                          done={progress.seen.has(i) && p !== pos}
+                          first={q === 0}
+                          last={q === g.items.length - 1}
+                          aboveFilled={p <= pos}
+                          belowFilled={p < pos}
+                          onClick={() => jumpTo(i)}
+                        />
+                      );
+                    })}
+                  </div>
                 );
-                if (!head) return node;
+
+                if (!layer) return <Fragment key="ungrouped">{rows}</Fragment>;
                 return (
-                  <Fragment key={`g${i}`}>
-                    <p className="mb-1 mt-3 flex items-baseline gap-1.5 px-2 first:mt-0">
-                      <span className="text-3xs font-medium uppercase tracking-wide text-muted-foreground/50">
-                        Layer {head.index}/{head.total}
+                  <div key={`${layer.id}@${g.start}`} className={cn(gi > 0 && "mt-3")}>
+                    <button
+                      type="button"
+                      onClick={() => collapse?.toggle(layer.id)}
+                      disabled={!collapse}
+                      aria-expanded={!folded}
+                      aria-controls={`tour-layer-${layer.id}`}
+                      title={`Layer ${layer.index} of ${layer.total} — ${layer.title} · ${readN} of ${n} read${
+                        hasCursor ? ` · you're on stop ${Math.max(1, layerPos)}` : ""
+                      }`}
+                      className={cn(
+                        "mb-1 flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left transition-colors",
+                        collapse && "hover:bg-foreground/[0.04]",
+                        folded && hasCursor && "bg-foreground/[0.05]",
+                      )}
+                    >
+                      {collapse && (
+                        <ChevronRight
+                          aria-hidden
+                          strokeWidth={2}
+                          className={cn(
+                            "size-3 shrink-0 text-muted-foreground/50 transition-transform duration-200 motion-reduce:transition-none",
+                            !folded && "rotate-90",
+                          )}
+                        />
+                      )}
+                      {/* Abbreviated because the chevron and the state chunk now
+                          share this row — the full text is in the title. */}
+                      <span className="shrink-0 text-3xs font-medium uppercase tracking-wide text-muted-foreground/50">
+                        L{layer.index}/{layer.total}
                       </span>
-                      <span className="min-w-0 flex-1 truncate text-2xs font-medium text-foreground/70">
-                        {head.title}
+                      <span
+                        className={cn(
+                          "min-w-0 flex-1 truncate text-2xs font-medium",
+                          folded && hasCursor ? "text-foreground" : "text-foreground/70",
+                        )}
+                      >
+                        {layer.title}
                       </span>
-                    </p>
-                    {node}
-                  </Fragment>
+                      {/* A folded layer has to report itself — how much of it is
+                          read, and whether the cursor is inside it, since the
+                          active row it would show is hidden. Rendered in all
+                          three states so the heading doesn't reflow on toggle. */}
+                      <span
+                        className={cn(
+                          "flex shrink-0 items-center gap-1 text-2xs tabular-nums",
+                          hasCursor ? "text-foreground/75" : "text-muted-foreground/50",
+                        )}
+                      >
+                        {hasCursor ? (
+                          <>
+                            <span aria-hidden className="size-1.5 rounded-full bg-foreground/70" />
+                            {Math.max(1, layerPos)}/{n}
+                          </>
+                        ) : readN >= n ? (
+                          <Check className="size-3" strokeWidth={3} />
+                        ) : (
+                          `${readN}/${n}`
+                        )}
+                      </span>
+                    </button>
+                    {rows}
+                  </div>
                 );
               })}
             </div>
@@ -1729,6 +1808,104 @@ function Tour({
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * One stop on the tour rail.
+ *
+ * `first`/`last` are GROUP-local, so the spine breaks where a layer does — and
+ * so folding a layer away leaves no dangling segment on its neighbours.
+ * `aboveFilled`/`belowFilled` stay global: how far the reviewer has got is a
+ * fact about the whole tour, not about one layer.
+ */
+function RailStop({
+  step,
+  active,
+  done,
+  first,
+  last,
+  aboveFilled,
+  belowFilled,
+  onClick,
+}: {
+  step: GuidedStep;
+  active: boolean;
+  done: boolean;
+  first: boolean;
+  last: boolean;
+  aboveFilled: boolean;
+  belowFilled: boolean;
+  onClick: () => void;
+}) {
+  const K = KIND[step.kind] ?? KIND.orient;
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "group flex w-full gap-2.5 rounded-lg px-2 text-left transition-colors hover:bg-foreground/[0.04]",
+        active && "bg-foreground/[0.05]",
+      )}
+    >
+      <span className="relative flex w-4 shrink-0 flex-col items-center self-stretch">
+        <span
+          className={cn(
+            "w-px flex-1",
+            first ? "bg-transparent" : aboveFilled ? "bg-foreground/35" : "bg-foreground/12",
+          )}
+        />
+        <span className="relative flex size-3.5 items-center justify-center">
+          {active && (
+            <span
+              aria-hidden
+              className="absolute inline-flex size-full rounded-full bg-foreground opacity-20 motion-safe:animate-ping"
+            />
+          )}
+          {/* Fill encodes STATE (done/current = accent, ahead = hollow).
+            The kind shows in the row heading, not on the node. */}
+          <span
+            className={cn(
+              "relative flex size-3.5 items-center justify-center rounded-full",
+              done && "bg-foreground/55 text-background",
+              active && "bg-foreground/75 text-background ring-4 ring-foreground/10",
+              !done && !active && "border-[1.5px] border-foreground/25 bg-background",
+            )}
+          >
+            {done && <Check className="size-2.5" strokeWidth={3} />}
+          </span>
+        </span>
+        <span
+          className={cn(
+            "w-px flex-1",
+            last ? "bg-transparent" : belowFilled ? "bg-foreground/35" : "bg-foreground/12",
+          )}
+        />
+      </span>
+      <span className="min-w-0 flex-1 py-2.5">
+        <span
+          className={cn(
+            "mb-1 block text-3xs font-medium uppercase leading-none tracking-wide",
+            K.text,
+            !active && "opacity-55",
+          )}
+        >
+          {K.label}
+        </span>
+        <span
+          className={cn(
+            "block truncate text-xs leading-snug",
+            active
+              ? "font-medium text-foreground"
+              : done
+                ? "text-muted-foreground"
+                : "text-muted-foreground/55",
+          )}
+        >
+          {step.title}
+        </span>
+      </span>
+    </button>
   );
 }
 

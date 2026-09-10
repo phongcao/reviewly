@@ -1,4 +1,4 @@
-import { verdictDisplay } from "@/lib/guided";
+import { type GuidedStep, type TourLayer, groupTourStops, verdictDisplay } from "@/lib/guided";
 import { describe, expect, it } from "vitest";
 
 /**
@@ -64,5 +64,87 @@ describe("verdictDisplay", () => {
     for (const done of [0, 1, 5, 11]) {
       expect(verdictDisplay("approve", { done, total: 12 }).seed, `${done}/12`).toBe(false);
     }
+  });
+});
+
+/**
+ * These pin the tour rail's grouping: the rail folds a layer away by hiding one
+ * group, so a group must hold exactly its layer's visible stops and remember
+ * where it sits in the whole tour. Getting `start` wrong makes the spine's
+ * progress fill disagree with the cursor.
+ */
+describe("groupTourStops", () => {
+  const step = (layerId?: string): GuidedStep => ({
+    path: "a.ts",
+    line: 1,
+    kind: "orient",
+    title: "t",
+    detail: "d",
+    ...(layerId ? { layerId } : {}),
+  });
+  const layer = (id: string, index: number): TourLayer => ({
+    id,
+    title: id,
+    index,
+    total: 3,
+    steps: 2,
+  });
+  const layers = [layer("l1", 1), layer("l2", 2), layer("l3", 3)];
+  // Two stops per layer, in plan order — what `mergeDeepTour` produces.
+  const steps = [step("l1"), step("l1"), step("l2"), step("l2"), step("l3"), step("l3")];
+  const all = [0, 1, 2, 3, 4, 5];
+
+  it("puts a classic tour's stops in one unlabeled, never-collapsible group", () => {
+    const groups = groupTourStops(
+      all,
+      all.map(() => step()),
+      undefined,
+    );
+    expect(groups).toEqual([{ layer: null, items: all, start: 0 }]);
+  });
+
+  it("returns nothing when every stop is filtered or dismissed away", () => {
+    expect(groupTourStops([], steps, layers)).toEqual([]);
+    expect(groupTourStops([], [], undefined)).toEqual([]);
+  });
+
+  it("splits a merged deep tour one group per layer, with global start offsets", () => {
+    const groups = groupTourStops(all, steps, layers);
+    expect(groups.map((g) => g.layer?.id)).toEqual(["l1", "l2", "l3"]);
+    expect(groups.map((g) => g.items)).toEqual([
+      [0, 1],
+      [2, 3],
+      [4, 5],
+    ]);
+    expect(groups.map((g) => g.start)).toEqual([0, 2, 4]);
+  });
+
+  it("keeps start indexing the FILTERED list when a filter empties a middle layer", () => {
+    // A kind filter dropped both of l2's stops: l3 now starts at visible position 2.
+    const groups = groupTourStops([0, 1, 4, 5], steps, layers);
+    expect(groups.map((g) => g.layer?.id)).toEqual(["l1", "l3"]);
+    expect(groups.map((g) => g.start)).toEqual([0, 2]);
+  });
+
+  it("heads a layer that a filter reduced to a single stop", () => {
+    const groups = groupTourStops([1, 2, 5], steps, layers);
+    expect(groups.map((g) => g.layer?.id)).toEqual(["l1", "l2", "l3"]);
+    expect(groups.map((g) => g.items)).toEqual([[1], [2], [5]]);
+    expect(groups.map((g) => g.start)).toEqual([0, 1, 2]);
+  });
+
+  it("merges stops with an unknown layer id into ONE unlabeled group, adding no spine break", () => {
+    // A batch whose layer left the partition: no heading exists, so the rail
+    // must not break between these two stops.
+    const orphans = [step("gone"), step("other")];
+    const groups = groupTourStops([0, 1], orphans, layers);
+    expect(groups).toEqual([{ layer: null, items: [0, 1], start: 0 }]);
+  });
+
+  it("separates an unlabeled run from a labeled one", () => {
+    const mixed = [step("l1"), step("gone"), step("l2")];
+    const groups = groupTourStops([0, 1, 2], mixed, layers);
+    expect(groups.map((g) => g.layer?.id ?? null)).toEqual(["l1", null, "l2"]);
+    expect(groups.map((g) => g.start)).toEqual([0, 1, 2]);
   });
 });

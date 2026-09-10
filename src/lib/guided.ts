@@ -37,6 +37,46 @@ export interface TourLayer {
   steps: number;
 }
 
+/** One run of consecutive tour stops that share a layer, as the rail draws it. */
+export interface TourGroup {
+  /** The layer heading, or null for a classic tour's single unlabeled run. */
+  layer: TourLayer | null;
+  /** Original step indices in this run, in visible order. */
+  items: number[];
+  /** Position of `items[0]` in the visible list. The rail's spine BREAKS are
+   * group-local, but "is this stop behind the cursor" is still a question about
+   * the whole tour, so a row needs its global position too. */
+  start: number;
+}
+
+/**
+ * Fold the visible stops into per-layer runs, so the tour rail can hide one
+ * layer's stops without disturbing the spine running through the others.
+ *
+ * Adjacent runs with no resolvable layer merge into a single unlabeled group —
+ * which is what a classic (unlayered) tour is, and what keeps a step carrying
+ * an unknown `layerId` from splitting the rail at a heading that isn't there.
+ */
+export function groupTourStops(
+  visible: number[],
+  steps: GuidedStep[],
+  layers: TourLayer[] | undefined,
+): TourGroup[] {
+  if (!layers?.length) {
+    return visible.length > 0 ? [{ layer: null, items: [...visible], start: 0 }] : [];
+  }
+  const byId = new Map(layers.map((l) => [l.id, l]));
+  const out: TourGroup[] = [];
+  visible.forEach((i, p) => {
+    const id = steps[i]?.layerId;
+    const layer = (id ? byId.get(id) : undefined) ?? null;
+    const prev = out[out.length - 1];
+    if (prev && prev.layer?.id === layer?.id) prev.items.push(i);
+    else out.push({ layer, items: [i], start: p });
+  });
+  return out;
+}
+
 export interface GuidedPlan {
   /** One sentence: what this PR does. */
   summary: string;
