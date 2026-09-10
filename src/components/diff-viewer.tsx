@@ -110,6 +110,56 @@ interface Anchor {
 interface LineRenderCtx {
   /** Wrap long lines (whitespace-pre-wrap) vs. overflow horizontally (pre). */
   wrap: boolean;
+  /**
+   * Approx. monospace characters that fit on one visual line of the code
+   * column, or 0 when unknown. Only used to size off-screen hunks (see
+   * `estimateHunkHeight`) — never to lay out real rows.
+   */
+  charsPerLine: number;
+}
+
+/**
+ * Total fixed chrome to the left of (and right of) the code column on a
+ * unified row: two w-10 gutters, a w-4 slot, the w-5 comment trigger, the w-3
+ * +/- marker and the pre's pr-4.
+ */
+const ROW_CHROME_PX = 40 + 40 + 16 + 20 + 12 + 16;
+
+/**
+ * Approximate characters per visual line in the code column, or 0 before the
+ * first measurement. Measures the real mono advance width rather than assuming
+ * one, so a zoom change or a different fallback font stays accurate.
+ */
+function useCodeColumnChars(ref: React.RefObject<HTMLDivElement | null>): number {
+  const [chars, setChars] = useState(0);
+
+  useEffect(() => {
+    const root = ref.current;
+    if (!root) return;
+
+    const probe = document.createElement("span");
+    probe.className = "font-mono text-xs";
+    probe.style.cssText =
+      "position:absolute;visibility:hidden;white-space:pre;pointer-events:none;left:-9999px";
+    probe.textContent = "0".repeat(100);
+    root.appendChild(probe);
+
+    const measure = () => {
+      const advance = probe.getBoundingClientRect().width / 100;
+      const codeWidth = root.clientWidth - ROW_CHROME_PX;
+      setChars(advance > 0 && codeWidth > 0 ? Math.floor(codeWidth / advance) : 0);
+    };
+    measure();
+
+    const ro = new ResizeObserver(measure);
+    ro.observe(root);
+    return () => {
+      ro.disconnect();
+      probe.remove();
+    };
+  }, [ref]);
+
+  return chars;
 }
 
 /** State shared across all rows so we can show one popover and extend ranges. */
@@ -164,7 +214,12 @@ export function DiffViewer({
   );
   const setGapExpanded = useViewedFiles((s) => s.setGapExpanded);
 
-  const lineCtx: LineRenderCtx = { wrap: diffWrap };
+  // Width of the code column in monospace characters, remeasured when the pane
+  // resizes. Feeds the off-screen hunk size estimate only (see
+  // `estimateHunkHeight`); rows themselves are always laid out by the browser.
+  const charsPerLine = useCodeColumnChars(rootRef);
+
+  const lineCtx: LineRenderCtx = { wrap: diffWrap, charsPerLine };
 
   // Has a *new* focus request arrived on this render? Derived here rather than
   // tracked inside one of the effects below, so both consumers (the scroll-to-
@@ -1019,12 +1074,19 @@ function HunkBlock({
 
   // Big-diff perf (SAFE): let the browser skip layout/paint for off-screen
   // hunks via `content-visibility:auto`, reserving an estimated height so the
-  // scrollbar stays stable. ~22px/row is a rough line-height estimate. No
-  // virtualization or logic change — purely a rendering hint.
-  const estHeight = Math.max(1, decorated.length) * 22;
+  // scrollbar stays stable. No virtualization or logic change — purely a
+  // rendering hint.
+  //
+  // `bg-background` is load-bearing, not cosmetic. A skipped subtree paints
+  // nothing, and every ancestor up to <html> is translucent (the macOS
+  // vibrancy setup in globals.css) over a `transparent: true` window whose
+  // base colour is #00000000. Without an opaque surface *inside* the
+  // containment boundary, a hunk that WebKit hasn't finished painting yet
+  // composites as window black — the flash seen when scrolling fast.
+  const estHeight = estimateHunkHeight(decorated, line);
   return (
     <div
-      className="border-b border-border/20 [content-visibility:auto]"
+      className="border-b border-border/20 bg-background [content-visibility:auto]"
       style={{ containIntrinsicSize: `auto ${estHeight}px` }}
     >
       {decorated.map((row, i) => (
@@ -1040,6 +1102,34 @@ function HunkBlock({
       ))}
     </div>
   );
+}
+
+const ROW_LINE_HEIGHT = 18.6; // 12px * 1.55 leading
+const ROW_PADDING_Y = 4; // py-0.5, top + bottom
+
+/**
+ * Height a hunk will occupy once rendered, used only as the reserved size for
+ * `content-visibility:auto`.
+ *
+ * A row is one 12px/1.55 line box plus 4px of vertical padding (~22.6px), which
+ * is why the old flat `rows * 22` estimate was fine — but only while lines do
+ * not wrap. With `diffWrap` on (the default) a long prose line in a Markdown
+ * diff occupies several visual lines: measured against this component's own
+ * type ramp, a 600-char paragraph renders ~97px against the 22px reserved, so
+ * the block grew >4x the instant it scrolled into view. Every such reveal
+ * shifted content under the scroll offset and forced another layout+paint pass,
+ * which is what made fast scrolling drop frames.
+ */
+function estimateHunkHeight(rows: DecoratedLine[], ctx: LineRenderCtx): number {
+  if (!ctx.wrap || ctx.charsPerLine <= 0) {
+    return Math.max(1, rows.length) * (ROW_LINE_HEIGHT + ROW_PADDING_Y);
+  }
+  let total = 0;
+  for (const row of rows) {
+    const visualLines = Math.max(1, Math.ceil(row.text.length / ctx.charsPerLine));
+    total += visualLines * ROW_LINE_HEIGHT + ROW_PADDING_Y;
+  }
+  return Math.max(1, Math.round(total));
 }
 
 /* ───────────────────── selection helpers ───────────────────── */
