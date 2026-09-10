@@ -30,6 +30,16 @@ interface State {
    */
   expandedGaps: Record<string, Record<string, Record<string, true>>>;
   setGapExpanded: (key: string, path: string, gapIdx: number) => void;
+  /**
+   * Where the reviewer had scrolled to in each file's diff, so leaving a file
+   * and coming back resumes mid-file instead of snapping to the top. Keyed by
+   * viewedKey → filePath → scrollTop.
+   *
+   * Head-sha-keyed like everything else here: once the PR moves, the old
+   * offsets are meaningless because the diff itself changed.
+   */
+  scrollOffsets: Record<string, Record<string, number>>;
+  setScrollOffset: (key: string, path: string, top: number) => void;
 }
 
 export function viewedKey(owner: string, repo: string, number: number, sha: string): string {
@@ -70,6 +80,18 @@ export const useViewedFiles = create<State>()(
           else delete next[path];
         }
         set({ collapsed: { ...get().collapsed, [key]: next } });
+      },
+      scrollOffsets: {},
+      setScrollOffset: (key, path, top) => {
+        // `?? {}` guards rows persisted before this field existed.
+        const byKey = get().scrollOffsets?.[key] ?? {};
+        if (byKey[path] === top) return;
+        set({
+          scrollOffsets: {
+            ...(get().scrollOffsets ?? {}),
+            [key]: { ...byKey, [path]: top },
+          },
+        });
       },
       expandedGaps: {},
       setGapExpanded: (key, path, gapIdx) => {

@@ -8,8 +8,8 @@ import { useAiAvailable } from "@/lib/ai/use-ai-available";
 import { useDeepTourRunner } from "@/lib/ai/use-deep-tour";
 import {
   type LayerPlan,
-  type LayerRisk,
   type LayerStats,
+  RISK_CHIP,
   RISK_LABEL,
   type ReviewLayer,
   heuristicLayers,
@@ -157,12 +157,6 @@ export function useLayerScope({
     };
   }, [plan, stats, files, headSha, entry?.active, entry?.headSha, select, advance]);
 }
-
-const RISK_CHIP: Record<LayerRisk, string> = {
-  low: "text-muted-foreground bg-foreground/[0.06]",
-  medium: "text-info bg-info/12",
-  high: "text-warning bg-warning/12",
-};
 
 interface BarProps {
   scope: LayerScope;

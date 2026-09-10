@@ -208,14 +208,57 @@ export function DiffViewer({
   // biome-ignore lint/correctness/useExhaustiveDependencies: reset on file change
   useEffect(() => setNullPatchExpanded(false), [path]);
 
-  // Reset the diff scroll back to the top whenever the file changes.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: scroll reset on file change
+  // Last focus request this component acted on, so a file change that arrives
+  // WITH a jump can be told apart from an ordinary one. See the effect below.
+  const lastFocusNonce = useRef(focusNonce);
+
+  // Remember where the reviewer was in each file's diff, so leaving a file and
+  // coming back resumes mid-file instead of snapping to the top — the position
+  // is half of "where was I", and losing it on every `[` / `]` is what makes a
+  // long file feel unreviewable.
+  //
+  // Read through `getState()` rather than a selector on purpose: subscribing
+  // would re-render the whole diff on every write.
   useEffect(() => {
     const root = rootRef.current;
     if (!root) return;
     const sc = scrollParent(root);
-    if (sc) sc.scrollTop = 0;
-  }, [path]);
+    if (!sc) return;
+
+    // A guided-tour jump owns the scroll for this render — it rAFs its own
+    // scrollIntoView off the same `path` change, and restoring underneath it
+    // would yank the reviewer away from the step they just opened.
+    //
+    // Keyed off a FRESH nonce, not `focusLine != null`: `focusLine` is never
+    // cleared back to null, so testing it would disable restore permanently
+    // after the first jump.
+    const focusing = focusNonce !== lastFocusNonce.current;
+    lastFocusNonce.current = focusNonce;
+
+    if (!focusing) {
+      const saved = viewedKey
+        ? (useViewedFiles.getState().scrollOffsets?.[viewedKey]?.[path] ?? 0)
+        : 0;
+      if (saved > 0) {
+        // Defer: the incoming file's rows haven't laid out yet, so the
+        // container isn't tall enough to accept a non-zero offset.
+        const raf = requestAnimationFrame(() => {
+          sc.scrollTop = saved;
+        });
+        return () => {
+          cancelAnimationFrame(raf);
+          if (viewedKey) useViewedFiles.getState().setScrollOffset(viewedKey, path, sc.scrollTop);
+        };
+      }
+      sc.scrollTop = 0;
+    }
+
+    return () => {
+      if (viewedKey) useViewedFiles.getState().setScrollOffset(viewedKey, path, sc.scrollTop);
+    };
+    // `focusNonce` is a dependency so the ref above stays current even when a
+    // jump lands on the file that's already open.
+  }, [path, viewedKey, focusNonce]);
 
   const gapFor = (idx: number): GapInfo | null => {
     if (!fileLines || fileLines.length === 0) return null;

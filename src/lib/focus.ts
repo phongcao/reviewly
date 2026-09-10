@@ -49,6 +49,11 @@ const TEST_PATTERNS = [
   /\.(test|spec)\.[a-z]+$/,
   /_test\.(go|py|rb|rs)$/,
   /_spec\.rb$/,
+  // pytest's dominant convention is a `test_` PREFIX, not a `_test` suffix, and
+  // `conftest.py` holds the fixtures. Missing these meant a Python PR's tests
+  // were ranked and grouped as production code.
+  /(^|\/)test_[^/]*\.py$/,
+  /(^|\/)conftest\.py$/,
 ];
 
 /** True when the path is a test file or lives under a test directory. */

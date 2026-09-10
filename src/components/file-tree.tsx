@@ -1,5 +1,6 @@
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { HIDE_LABEL, type HideReason, classify } from "@/lib/focus";
+import { CATEGORY_LABEL, type FileClass, classifyFile } from "@/lib/layers";
 import type { PullFile } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import { useUi } from "@/stores/ui";
@@ -36,6 +37,8 @@ interface FileNode {
   kind: "file";
   file: PullFile;
   reason: HideReason | null;
+  /** Structural category + risk, for the row's chip. */
+  cls: FileClass;
 }
 interface FolderNode {
   kind: "folder";
@@ -45,7 +48,9 @@ interface FolderNode {
 }
 type TreeNode = FileNode | FolderNode;
 
-function buildTree(items: { file: PullFile; reason: HideReason | null }[]): TreeNode[] {
+function buildTree(
+  items: { file: PullFile; reason: HideReason | null; cls: FileClass }[],
+): TreeNode[] {
   const root: FolderNode = { kind: "folder", name: "", path: "", children: [] };
   for (const item of items) {
     const parts = item.file.filename.split("/");
@@ -66,7 +71,12 @@ function buildTree(items: { file: PullFile; reason: HideReason | null }[]): Tree
       }
       current = next;
     }
-    current.children.push({ kind: "file", file: item.file, reason: item.reason });
+    current.children.push({
+      kind: "file",
+      file: item.file,
+      reason: item.reason,
+      cls: item.cls,
+    });
   }
   const sortNodes = (nodes: TreeNode[]): TreeNode[] => {
     nodes.sort((a, b) => {
@@ -178,9 +188,14 @@ export function FileTree({
   const setFolderCollapsed = useViewedFiles((s) => s.setCollapsed);
   const setFolderCollapsedBulk = useViewedFiles((s) => s.setCollapsedBulk);
 
-  // Classify each file once; we keep the reason around so we can show a label.
+  // Classify each file once; we keep the reason around so we can show a label,
+  // and hand it to `classifyFile` so the generated-file check doesn't re-parse
+  // the patch a second time.
   const classified = useMemo(() => {
-    return files.map((f) => ({ file: f, reason: classify(f) }));
+    return files.map((f) => {
+      const reason = classify(f);
+      return { file: f, reason, cls: classifyFile(f.filename, f, reason) };
+    });
   }, [files]);
 
   const hiddenCount = classified.filter((c) => c.reason !== null).length;
@@ -473,6 +488,7 @@ export function FileTree({
                 rowRef={ref}
                 file={file}
                 reason={row.node.reason}
+                cls={row.node.cls}
                 depth={row.depth}
                 active={isRowActive}
                 focused={isRowFocused}
@@ -660,6 +676,7 @@ function FileRow({
   rowRef,
   file,
   reason,
+  cls,
   depth,
   active,
   focused,
@@ -672,6 +689,7 @@ function FileRow({
   rowRef?: React.Ref<HTMLLIElement>;
   file: PullFile;
   reason: HideReason | null;
+  cls: FileClass;
   depth: number;
   active: boolean;
   focused: boolean;
@@ -722,9 +740,23 @@ function FileRow({
         </span>
         <span className="min-w-0 flex-1 truncate">{basename}</span>
         <CommentBadge count={comments} />
-        {reason && (
+        {reason ? (
           <span className="shrink-0 rounded bg-foreground/[0.06] px-1 text-xs text-muted-foreground">
             {HIDE_LABEL[reason]}
+          </span>
+        ) : (
+          // Deliberately neutral. The category is a LABEL, not a verdict: the
+          // bucket→risk mapping is fixed (every `core` file is high, always), so
+          // tinting it would only restate the word in colour — and would clash
+          // with the layer chip above, which carries a real per-PR judgment in
+          // the same visual language. Per-file risk earns colour once it has
+          // actual signals behind it (churn, fan-in, auth paths) and a reason to
+          // show alongside.
+          <span
+            className="shrink-0 rounded bg-foreground/[0.06] px-1 text-4xs font-medium leading-4 text-muted-foreground"
+            title={cls.title}
+          >
+            {CATEGORY_LABEL[cls.id] ?? cls.id}
           </span>
         )}
         {file.additions + file.deletions > 0 && (

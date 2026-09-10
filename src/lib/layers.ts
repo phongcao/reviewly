@@ -1,5 +1,5 @@
 import { extractObjects, firstString, stripFence, toArray, toStringArray } from "@/lib/ai/json";
-import { classify, isTestFile } from "@/lib/focus";
+import { type HideReason, classify, isTestFile } from "@/lib/focus";
 import type { PullFile } from "@/lib/tauri";
 
 /**
@@ -229,7 +229,18 @@ interface Bucket {
   risk: LayerRisk;
   /** Position in the final reading order (low = read first). */
   rank: number;
-  match: (path: string, file: PullFile) => boolean;
+  /** `reason` is the focus-mode classification, passed in so the callers that
+   * already computed it don't pay to parse the patch twice. */
+  match: (path: string, file: PullFile, reason: HideReason | null) => boolean;
+}
+
+/** The public, per-file slice of a `Bucket` — what a row needs to label itself. */
+export interface FileClass {
+  /** Bucket id, e.g. "core" — key into `CATEGORY_LABEL`. */
+  id: string;
+  /** Human-readable bucket name, e.g. "Core logic". */
+  title: string;
+  risk: LayerRisk;
 }
 
 const has = (path: string, re: RegExp) => re.test(path);
@@ -248,10 +259,8 @@ const BUCKETS: Bucket[] = [
     risk: "low",
     rank: 80,
     // `classify` is the same rule focus mode uses to hide diff noise.
-    match: (_p, f) => {
-      const reason = classify(f);
-      return reason === "lockfile" || reason === "generated" || reason === "snapshot";
-    },
+    match: (_p, _f, reason) =>
+      reason === "lockfile" || reason === "generated" || reason === "snapshot",
   },
   {
     id: "tests",
@@ -284,7 +293,12 @@ const BUCKETS: Bucket[] = [
     match: (p) =>
       has(p, /(^|\/)(migrations?|migrate|schema|prisma|db|database|entities|models)\//) ||
       has(p, /\.sql$/) ||
-      has(p, /(^|\/)schema\.[a-z]+$/),
+      has(p, /(^|\/)schema\.[a-z]+$/) ||
+      // Python keeps these as modules, not directories, and Alembic — the
+      // standard migration tool — uses `alembic/versions/` rather than
+      // `migrations/`.
+      has(p, /(^|\/)(models|schemas)\.py$/) ||
+      has(p, /(^|\/)alembic\//),
   },
   {
     id: "types",
@@ -297,7 +311,10 @@ const BUCKETS: Bucket[] = [
       has(p, /\.d\.ts$/) ||
       has(p, /\.(proto|graphql|gql)$/) ||
       has(p, /(^|\/)types?\//) ||
-      has(p, /(^|\/)(openapi|swagger)[^/]*$/i),
+      has(p, /(^|\/)(openapi|swagger)[^/]*$/i) ||
+      // `.pyi` is Python's `.d.ts`; `types.py` its `types/` directory.
+      has(p, /\.pyi$/) ||
+      has(p, /(^|\/)types\.py$/),
   },
   {
     id: "api",
@@ -330,7 +347,10 @@ const BUCKETS: Bucket[] = [
     match: (p) =>
       has(p, /\.(json|ya?ml|toml|ini|cfg|conf|env|lock)$/i) ||
       has(p, /(^|\/)\.github\//) ||
-      has(p, /(^|\/)(Dockerfile|Makefile|Justfile)[^/]*$/i),
+      has(p, /(^|\/)(Dockerfile|Makefile|Justfile)[^/]*$/i) ||
+      // Matched by basename: the rule above keys off extension, so Python's
+      // config modules read as ordinary source without this.
+      has(p, /(^|\/)(config|settings|setup)\.py$/),
   },
   {
     id: "core",
@@ -351,10 +371,29 @@ const BUCKETS: Bucket[] = [
  * Coarser than an AI plan (it reads paths, not code), but it's instant, works
  * with no CLI configured, and is often enough to make a 60-file PR tractable.
  */
+/** What a single changed file is, structurally — the same judgement the offline
+ * split uses to group files, exposed per file so the tree can label each row.
+ *
+ * Deterministic and instant: paths and the focus-mode reason, no AI, no clone.
+ * Pass `reason` when the caller already has it (`file-tree` does) so the
+ * generated-file check doesn't re-parse the patch.
+ *
+ * Classification is decoration, never a filter — see `RISK_LABEL`, where `low`
+ * means "skim", not "skip". Hiding files is focus mode's job, and only ever at
+ * the reviewer's request. */
+export function classifyFile(
+  path: string,
+  file: PullFile,
+  reason: HideReason | null = classify(file),
+): FileClass {
+  const bucket = BUCKETS.find((b) => b.match(path, file, reason)) ?? BUCKETS[BUCKETS.length - 1];
+  return { id: bucket.id, title: bucket.title, risk: bucket.risk };
+}
+
 export function heuristicLayers(files: PullFile[]): LayerPlan {
   const grouped = new Map<string, string[]>();
   for (const f of files) {
-    const bucket = BUCKETS.find((b) => b.match(f.filename, f)) ?? BUCKETS[BUCKETS.length - 1];
+    const bucket = classifyFile(f.filename, f);
     const list = grouped.get(bucket.id);
     if (list) list.push(f.filename);
     else grouped.set(bucket.id, [f.filename]);
@@ -422,4 +461,26 @@ export const RISK_LABEL: Record<LayerRisk, string> = {
   low: "Skim",
   medium: "Read",
   high: "Read closely",
+};
+
+/** Risk as a chip tint. Lives here rather than in a component so the layer
+ * briefing and the per-file rows can't drift apart. */
+export const RISK_CHIP: Record<LayerRisk, string> = {
+  low: "text-muted-foreground bg-foreground/[0.06]",
+  medium: "text-info bg-info/12",
+  high: "text-warning bg-warning/12",
+};
+
+/** Short category labels for the file tree. Lowercase and single-word, matching
+ * `HIDE_LABEL`, because the row has ~35px to spare. */
+export const CATEGORY_LABEL: Record<string, string> = {
+  data: "data",
+  types: "types",
+  core: "core",
+  api: "api",
+  ui: "ui",
+  config: "config",
+  tests: "tests",
+  docs: "docs",
+  generated: "gen",
 };
