@@ -135,6 +135,73 @@ Return ONLY a single JSON object — no prose, no markdown fence. Shape:
 Return the JSON object only.`;
 }
 
+/**
+ * Behavioral before/after for ONE changed symbol, asked on demand from a tour
+ * stop.
+ *
+ * The hard part isn't producing a summary — it's stopping the model from
+ * narrating the diff back ("adds a check", "refactors the loop"), which tells
+ * the reviewer nothing they couldn't see. So the prompt asks for two lists of
+ * what the code DOES, in execution order, and makes the change list a
+ * consequence of the difference between them rather than a separate act of
+ * summarizing.
+ *
+ * `refactor_only` is offered explicitly and without penalty. A model that feels
+ * obliged to find a behavioral change will invent one, and "nothing observable
+ * changed" is both the most common truth in a large PR and the most useful
+ * thing a reviewer can be told.
+ */
+export function buildBehaviorPrompt(o: {
+  path: string;
+  line: number;
+  endLine?: number;
+  title: string;
+  /** The file's unified diff, so this works with no clone present. */
+  patch: string;
+  /** True when a local checkout is available to read beyond the diff. */
+  clone: boolean;
+}): string {
+  const loc = `${o.path}:${o.line}${o.endLine ? `-${o.endLine}` : ""}`;
+  return `You are explaining ONE changed symbol to a code reviewer as BEHAVIOR, not as a description of the edit.
+
+## The symbol
+${loc} — the change described as "${o.title}". Work out which function / method / class / route contains that line and describe THAT symbol.
+
+## What to produce
+Two lists of what the code DOES, as a reader would execute it:
+- "before": the behavior of the OLD version, one step per bullet, in execution order.
+- "after": the behavior of the NEW version, same form.
+Then "changes": what actually differs, derived by comparing your two lists.
+
+A symbol added by this diff has an empty "before". A symbol deleted by it has an empty "after".
+
+## Rules that make this useful
+- Describe BEHAVIOR, never the edit. "Items where \`quantity <= 0\` no longer contribute to the total" — not "adds a continue statement", "updates the loop", "improves handling".
+- PRESERVE the things that carry meaning, verbatim from the code: identifiers, conditions, thresholds, error types, routes, state values, config keys, retry/timeout values. "Retry delay becomes \`2^attempt * 500ms\`, capped at \`30s\`" beats "retries now back off".
+- Every bullet must be supported by code you can actually see${o.clone ? " (read the file — you have a checkout)" : " in the diff below"}. Do not infer behavior you cannot point at. If the symbol calls something you can't see, describe the call, not what you imagine it does.
+- Only put a name in backticks if it appears verbatim in the code you read. Never invent a symbol to make a sentence read better.
+- Keep each bullet to one clause. 3-7 bullets per list; fewer if the symbol is small.
+
+## Classifying each change
+- "new_guard" — a condition now rejects / skips input that previously went through.
+- "behavior_added" / "behavior_removed" — the code now does, or no longer does, something observable.
+- "ordering_change" — same steps, different order, and the order matters.
+- "contract_change" — signature, return shape, or an API/route surface changed.
+- "error_change" — what is raised, caught, retried, or swallowed changed.
+- "refactor_only" — the code was reorganized and you can detect NO observable difference in input/output, side effects, or errors.
+
+If the whole change is behavior-preserving, say so: emit "before" and "after" that match and a single "refactor_only" change. That is a complete, correct, useful answer — do not manufacture a behavioral difference to seem thorough.
+
+## Output
+Return ONLY a single JSON object — no prose, no markdown fence:
+{"symbol":"Name.of.symbol","before":["…"],"after":["…"],"changes":[{"type":"new_guard","text":"…"}]}
+
+# The file's diff
+\`\`\`diff
+${o.patch}
+\`\`\``;
+}
+
 /** Free-form review-chat system prompt — supports the <action> post protocol. */
 export const CHAT_SYSTEM = `You are a code-review assistant inside a desktop PR-review app. Answer in concise markdown.
 
