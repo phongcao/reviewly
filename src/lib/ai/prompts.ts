@@ -155,17 +155,26 @@ export function buildBehaviorPrompt(o: {
   path: string;
   line: number;
   endLine?: number;
-  title: string;
+  /**
+   * What the reviewer pointed at: a tour stop's title, or the symbol git names
+   * in the hunk header. Absent when they simply selected lines — the location
+   * alone is then the whole of the request, which is why this is optional
+   * rather than faked with a placeholder the model would try to interpret.
+   */
+  subject?: string;
   /** The file's unified diff, so this works with no clone present. */
   patch: string;
   /** True when a local checkout is available to read beyond the diff. */
   clone: boolean;
 }): string {
   const loc = `${o.path}:${o.line}${o.endLine ? `-${o.endLine}` : ""}`;
+  const subject = o.subject?.trim()
+    ? `${loc} — the reviewer is looking at "${o.subject.trim()}".`
+    : `${loc} — the lines the reviewer selected.`;
   return `You are explaining ONE changed symbol to a code reviewer as BEHAVIOR, not as a description of the edit.
 
 ## The symbol
-${loc} — the change described as "${o.title}". Work out which function / method / class / route contains that line and describe THAT symbol.
+${subject} Work out which function / method / class / route contains that range and describe THAT symbol. If the range spans several symbols, describe the one the reviewer is most likely asking about — the one carrying the changed lines — and say which you chose in "symbol".
 
 ## What to produce
 Two lists of what the code DOES, as a reader would execute it:

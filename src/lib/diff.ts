@@ -115,3 +115,23 @@ export function toSplit(hunk: Hunk): SplitRow[] {
   }
   return rows;
 }
+
+/**
+ * Split a `@@ … @@` header into its range, the new-file start line, and the
+ * enclosing-symbol hint git appends.
+ *
+ * That suffix is git's own guess at the function or class containing the hunk —
+ * free structure with no parser of our own. It is frequently EMPTY: git needs
+ * preceding context matching a "function line" for the file's language, so a
+ * newly added file (whose first hunk starts at line 1) almost never has one.
+ * Callers must treat the symbol as a hint, never as a guarantee.
+ */
+export function parseHunkHeader(text: string): {
+  range: string;
+  symbol: string;
+  newStart: number;
+} {
+  const m = text.match(/^(@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@)\s?(.*)$/);
+  if (!m) return { range: text, symbol: "", newStart: 0 };
+  return { range: m[1], symbol: m[3], newStart: Number(m[2]) };
+}

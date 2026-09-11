@@ -1,3 +1,4 @@
+import { BehaviorPanel } from "@/components/behavior-panel";
 import { CommentByline } from "@/components/comment-byline";
 import { Composer } from "@/components/composer";
 import { DiffSelectionToolbar } from "@/components/diff-selection-toolbar";
@@ -7,12 +8,15 @@ import { ReviewThreadGroup } from "@/components/review-thread";
 import { TooltipFor } from "@/components/tooltip-for";
 import { buildSnippet, refFromLines } from "@/lib/ai/attach";
 import { attachContext } from "@/lib/ai/attach-bridge";
-import { type DiffLine, type Hunk, parsePatch, toSplit } from "@/lib/diff";
+import { useBehavior } from "@/lib/ai/use-behavior";
+import type { BehaviorDiff } from "@/lib/behavior";
+import { type DiffLine, type Hunk, parseHunkHeader, parsePatch, toSplit } from "@/lib/diff";
 import { detectLanguage, highlightLine } from "@/lib/lang";
 import type { ReviewLocation } from "@/lib/review-context";
 import type { DraftComment, ReviewThread, ReviewThreadGraphQL } from "@/lib/tauri";
 import { safeOpenUrl } from "@/lib/ui";
 import { cn } from "@/lib/utils";
+import { useLocalRepos } from "@/stores/local-repos";
 import { useReviewPrefs } from "@/stores/review-prefs";
 import { useViewedFiles } from "@/stores/viewed-files";
 import { diffWordsWithSpace } from "diff";
@@ -21,6 +25,7 @@ import {
   ChevronUp,
   Copy,
   ExternalLink,
+  GitCompare,
   Link as LinkIcon,
   MessageSquarePlus,
   PanelRight,
@@ -30,7 +35,16 @@ import {
   UnfoldVertical,
   WrapText,
 } from "lucide-react";
-import { Fragment, createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Fragment,
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { toast } from "sonner";
 
 interface Props {
@@ -103,6 +117,10 @@ interface ThreadMeta {
   onOpenInEditor?: (line: number) => void;
   /** Open this file at a line in the context pane, beside the diff. */
   onPeek?: (line: number) => void;
+  /** Explain the symbol at this hunk as behavior. Absent = feature off. */
+  onExplainBehavior?: (line: number, symbol: string) => void;
+  /** The hunk (by new-file start line) currently waiting on an explanation. */
+  behaviorPending?: number | null;
 }
 const ThreadMetaContext = createContext<ThreadMeta | null>(null);
 
@@ -205,6 +223,59 @@ export function DiffViewer({
   onAskAi,
 }: Props) {
   const hunks = useMemo(() => parsePatch(patch), [patch]);
+
+  // Behavior explanations requested from this file's diff — by the hunk header
+  // or by a selection. Keyed by the enclosing hunk's new-file start so the
+  // panel renders under the code it describes, and cleared when the file
+  // changes since the answer is about this diff only.
+  const localRepos = useLocalRepos((r) => r.repos);
+  const behaviorCwd = useMemo(
+    () => localRepos.find((r) => r.owner === owner && r.repo === repo)?.path ?? null,
+    [localRepos, owner, repo],
+  );
+  const { explain } = useBehavior(behaviorCwd);
+  const [behavior, setBehavior] = useState<{ anchor: number; diff: BehaviorDiff } | null>(null);
+  const [pendingHunk, setPendingHunk] = useState<number | null>(null);
+  useEffect(() => {
+    setBehavior(null);
+    setPendingHunk(null);
+  }, []);
+
+  /** New-file start of the hunk containing `line`, for anchoring the panel. */
+  const hunkAt = useCallback(
+    (line: number): number =>
+      hunks.find((h) => h.lines.some((l) => l.newLine !== null && l.newLine >= line))?.newStart ??
+      hunks[0]?.newStart ??
+      line,
+    [hunks],
+  );
+
+  const runExplain = useCallback(
+    async (line: number, endLine: number | undefined, subject: string | undefined) => {
+      const anchor = hunkAt(line);
+      setPendingHunk(anchor);
+      try {
+        const d = await explain({ path, line, endLine, subject, patch }, `${path}:${line}`);
+        if (d) setBehavior({ anchor, diff: d });
+      } finally {
+        setPendingHunk(null);
+      }
+    },
+    [explain, hunkAt, patch, path],
+  );
+
+  const explainHunk = useCallback(
+    (line: number, symbol: string) => void runExplain(line, undefined, symbol || undefined),
+    [runExplain],
+  );
+
+  // A selection carries no symbol name, so the model is told only the range and
+  // works out the enclosing symbol itself — the same job it already does for a
+  // hunk, with one less hint.
+  const explainSelection = useCallback(
+    (from: number, to: number) => void runExplain(from, to > from ? to : undefined, undefined),
+    [runExplain],
+  );
   const lang = useMemo(() => detectLanguage(path), [path]);
   const bounds = useMemo(() => hunks.map(hunkBounds), [hunks]);
   const rootRef = useRef<HTMLDivElement>(null);
@@ -582,6 +653,8 @@ export function DiffViewer({
                 ? (line: number) => onOpenInEditor(path, line)
                 : undefined,
               onPeek: onPeek ? (line: number) => onPeek({ path, line }) : undefined,
+              onExplainBehavior: explainHunk,
+              behaviorPending: pendingHunk,
             }}
           >
             <DiffSelectionToolbar
@@ -593,6 +666,7 @@ export function DiffViewer({
               fileLines={fileLines}
               onAskAi={onAskAi}
               onPeek={onPeek}
+              onExplainBehavior={explainSelection}
             />
             <div
               ref={rootRef}
@@ -636,6 +710,8 @@ export function DiffViewer({
         // never appeared on an ordinary diff — the one place it matters.
         onOpenInEditor: onOpenInEditor ? (line: number) => onOpenInEditor(path, line) : undefined,
         onPeek: onPeek ? (line: number) => onPeek({ path, line }) : undefined,
+        onExplainBehavior: explainHunk,
+        behaviorPending: pendingHunk,
       }}
     >
       {toolbar}
@@ -648,6 +724,7 @@ export function DiffViewer({
         fileLines={fileLines}
         onAskAi={onAskAi}
         onPeek={onPeek}
+        onExplainBehavior={explainSelection}
       />
       <div
         ref={rootRef}
@@ -685,6 +762,11 @@ export function DiffViewer({
               hideWhitespace={hideWhitespace}
               line={lineCtx}
             />
+            {behavior?.anchor === h.newStart && (
+              <div className="px-3 pb-2 font-sans">
+                <BehaviorPanel diff={behavior.diff} onClose={() => setBehavior(null)} />
+              </div>
+            )}
           </Fragment>
         ))}
         <GapExpander
@@ -934,20 +1016,24 @@ function GapExpander({
   );
 }
 
-function parseHunkHeader(text: string): { range: string; symbol: string } {
-  const m = text.match(/^(@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@)\s?(.*)$/);
-  if (!m) return { range: text, symbol: "" };
-  return { range: m[1], symbol: m[2] };
-}
-
 /** Sticky breadcrumb shown at the top of each hunk — keeps the enclosing
- * symbol in view while you scroll through the changes. */
+ * symbol in view while you scroll through the changes.
+ *
+ * Also the per-hunk entry point for a behavior explanation: the `@@ … @@`
+ * suffix is git's own guess at the enclosing symbol, which is a free, exact
+ * anchor with no parser of our own. The button is revealed on hover rather than
+ * always drawn — a always-visible button on every hunk of a 120-file PR turns
+ * "explain this" into the default way to read the diff, which is the one thing
+ * this feature must not become. */
 function HunkHeaderBar({ text, gutter }: { text: string; gutter?: string }) {
-  const { range, symbol } = parseHunkHeader(text);
+  const { range, symbol, newStart } = parseHunkHeader(text);
+  const meta = useContext(ThreadMetaContext);
+  const explain = meta?.onExplainBehavior;
+  const busy = meta?.behaviorPending === newStart;
   return (
-    <div className="sticky top-0 z-10 flex border-y border-hairline bg-card/95 backdrop-blur-md">
+    <div className="group/hunk sticky top-0 z-10 flex items-center border-y border-hairline bg-card/95 backdrop-blur-md">
       {gutter && <span className={cn("shrink-0", gutter)} />}
-      <pre className="flex-1 select-text truncate px-3 py-1 text-xs">
+      <pre className="min-w-0 flex-1 select-text truncate px-3 py-1 text-xs">
         {symbol ? (
           <>
             <span className="text-muted-foreground/45">{range} </span>
@@ -957,6 +1043,23 @@ function HunkHeaderBar({ text, gutter }: { text: string; gutter?: string }) {
           <span className="text-muted-foreground/80">{range}</span>
         )}
       </pre>
+      {explain && newStart > 0 && (
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => explain(newStart, symbol)}
+          title={symbol ? `Explain the behavior of ${symbol}` : "Explain this hunk's behavior"}
+          className={cn(
+            "mr-2 inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 font-sans text-2xs text-muted-foreground transition-opacity hover:bg-foreground/8 hover:text-foreground disabled:opacity-50",
+            busy
+              ? "opacity-100"
+              : "opacity-0 focus-visible:opacity-100 group-hover/hunk:opacity-100",
+          )}
+        >
+          <GitCompare className="size-3" />
+          {busy ? "Explaining…" : "Behavior"}
+        </button>
+      )}
     </div>
   );
 }

@@ -1,7 +1,7 @@
 import { type PrContextRef, buildSnippet, refFromSelection, refLocation } from "@/lib/ai/attach";
 import { attachContext } from "@/lib/ai/attach-bridge";
 import type { ReviewLocation } from "@/lib/review-context";
-import { PanelRight, Sparkles } from "lucide-react";
+import { GitCompare, PanelRight, Sparkles } from "lucide-react";
 import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
@@ -18,6 +18,8 @@ interface Props {
   onAskAi?: () => void;
   /** Opens the selected region in the review context pane. Omitted = no button. */
   onPeek?: (loc: ReviewLocation) => void;
+  /** Explains the selected range as behavior. Omitted = no button. */
+  onExplainBehavior?: (from: number, to: number) => void;
 }
 
 /**
@@ -39,6 +41,7 @@ export function DiffSelectionToolbar({
   fileLines,
   onAskAi,
   onPeek,
+  onExplainBehavior,
 }: Props) {
   const [rect, setRect] = useState<DOMRect | null>(null);
   const refRef = useRef<PrContextRef | null>(null);
@@ -127,7 +130,7 @@ export function DiffSelectionToolbar({
 
   // Width grew with the second action, so centre against a wider bar and keep
   // the whole thing on screen.
-  const width = onPeek ? 216 : 128;
+  const width = 128 + (onPeek ? 88 : 0) + (onExplainBehavior ? 92 : 0);
   const left = Math.min(
     Math.max(rect.left + rect.width / 2 - width / 2, 8),
     Math.max(8, window.innerWidth - width - 8),
@@ -174,6 +177,20 @@ export function DiffSelectionToolbar({
         >
           <PanelRight className="size-3 text-primary" />
           Open in context
+        </button>
+      )}
+      {onExplainBehavior && (
+        <button
+          type="button"
+          onClick={() => {
+            onExplainBehavior(ref.from ?? 0, ref.to ?? ref.from ?? 0);
+            clear();
+          }}
+          title="Explain what this code does, before and after the change"
+          className="flex items-center gap-1.5 rounded-md px-1.5 py-1 transition-colors hover:bg-primary/15"
+        >
+          <GitCompare className="size-3 text-primary" />
+          Behavior
         </button>
       )}
       <span className="px-1 text-muted-foreground/60">{label}</span>
