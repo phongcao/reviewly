@@ -105,6 +105,16 @@ describe("verifySteps", () => {
 });
 
 describe("citedIdentifiers", () => {
+  it("ignores built-in error types a summary names generically", () => {
+    const s = step({ detail: "Guards against `KeyError` and `ValueError`." });
+    expect(citedIdentifiers(s)).toEqual([]);
+  });
+
+  it("still catches a fabricated domain symbol", () => {
+    const s = step({ detail: "Raises `ValidationFailure` when `Unauthorized`." });
+    expect(citedIdentifiers(s).sort()).toEqual(["Unauthorized", "ValidationFailure"]);
+  });
+
   it("tokenizes expressions and ignores keywords and short tokens", () => {
     const s = step({
       title: "Guard",

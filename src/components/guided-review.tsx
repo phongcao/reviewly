@@ -10,6 +10,7 @@ import { CLONE_ABSENT_CLAUSE, buildGuidedSystem } from "@/lib/ai/prompts";
 import { useAiAvailable } from "@/lib/ai/use-ai-available";
 import { useDeepTourRunner } from "@/lib/ai/use-deep-tour";
 import { verifyStep } from "@/lib/ai/verify";
+import { type CoverageReport, RISK_LABEL, blindSpots, tourCoverage } from "@/lib/coverage";
 import { type DeepTourProgress, deepTourProgress, mergeDeepTour, stepId } from "@/lib/deep-tour";
 import { parsePatch } from "@/lib/diff";
 import { relativeTime } from "@/lib/format";
@@ -574,6 +575,21 @@ function DeepTour({
   const layerTitle = (id: string): string =>
     entry?.plan.layers.find((l) => l.id === id)?.title ?? id;
 
+  // Files belonging to layers that haven't been toured yet. Reconciled against
+  // the PR's current files for the same reason `mergeDeepTour` is: the
+  // partition was snapshotted when the tour began and the PR has kept moving.
+  // Without this the coverage strip would report 8 queued layers as a blind
+  // spot and read as an accusation instead of a progress report.
+  const pendingPaths = useMemo(() => {
+    const out = new Set<string>();
+    if (!entry) return out;
+    for (const layer of reconcileLayers(entry.plan, files).layers) {
+      if (entry.byLayer[layer.id]) continue;
+      for (const p of layer.files) out.add(p);
+    }
+    return out;
+  }, [entry, files]);
+
   const strip = (
     <DeepTourStrip
       done={info.done.length}
@@ -625,6 +641,7 @@ function DeepTour({
           generatedAt={oldest?.generatedAt ?? Date.now()}
           progress={progress}
           coverage={{ done: info.done.length, total: info.total }}
+          pendingPaths={pendingPaths}
           focusIndex={focusIndex}
           onFocusConsumed={() => clearFocus(prKey)}
           stale={!!headSha && !!entry?.headSha && entry.headSha !== headSha}
@@ -978,6 +995,112 @@ function Intro({
   );
 }
 
+/**
+ * What the tour did not look at.
+ *
+ * The tour's own counters ("28 stops", "Layer 2 of 10") describe the work that
+ * was done, and a reviewer reads them as if they described the PR. They don't:
+ * the per-layer step budget means a large PR cannot get a stop on every file,
+ * so a confident, well-anchored tour can still leave real code unexamined. That
+ * gap is invisible — which makes it the one failure mode a reviewer cannot
+ * catch by reading more carefully.
+ *
+ * So the headline here is coverage of CHANGED LINES, not a count of stops, and
+ * queued layers are reported separately from genuine gaps: an in-flight deep
+ * tour is incomplete, not negligent.
+ */
+function CoverageStrip({
+  cov,
+  onOpenFile,
+}: {
+  cov: CoverageReport;
+  onOpenFile: (path: string, line?: number) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const gaps = useMemo(() => blindSpots(cov), [cov]);
+  const totalChurn = Object.values(cov.churn).reduce((a, b) => a + b, 0);
+  if (totalChurn === 0) return null;
+
+  // Queued layers are not yet a verdict on anything, so they are excluded from
+  // the denominator's claim rather than counted as read or as missed.
+  const analyzed = cov.churn.toured;
+  const pct = Math.round((analyzed / totalChurn) * 100);
+  const risky = cov.atRisk.length;
+
+  return (
+    <div className="px-5 pt-2.5">
+      <div className="flex flex-wrap items-center gap-x-2.5 gap-y-1 text-2xs text-muted-foreground">
+        <span className="text-muted-foreground/60">Coverage</span>
+        <span className="font-medium tabular-nums text-foreground/80">
+          {analyzed.toLocaleString()} of {totalChurn.toLocaleString()} changed lines ({pct}%)
+        </span>
+        {cov.counts.pending > 0 && (
+          <span className="tabular-nums">· {cov.counts.pending} files queued</span>
+        )}
+        {cov.counts.skippable + cov.counts.tests > 0 && (
+          <span className="tabular-nums">
+            · {cov.counts.skippable + cov.counts.tests} skippable
+          </span>
+        )}
+        {gaps.length > 0 ? (
+          <button
+            type="button"
+            onClick={() => setOpen((o) => !o)}
+            className={cn(
+              "inline-flex items-center gap-1 rounded-full px-2 py-0.5 font-medium transition-colors",
+              risky > 0
+                ? "bg-warning/12 text-warning hover:bg-warning/20"
+                : "bg-foreground/5 text-foreground/70 hover:bg-foreground/10",
+            )}
+          >
+            {risky > 0 && <AlertTriangle className="size-3" />}
+            {gaps.length} file{gaps.length === 1 ? "" : "s"} with no stop
+            {risky > 0 && ` · ${risky} sensitive`}
+            <ChevronRight className={cn("size-3 transition-transform", open && "rotate-90")} />
+          </button>
+        ) : (
+          cov.counts.pending === 0 && (
+            <span className="inline-flex items-center gap-1 text-success">
+              <Check className="size-3" />
+              every changed file has a stop
+            </span>
+          )
+        )}
+      </div>
+
+      {open && gaps.length > 0 && (
+        <ul className="mt-1.5 space-y-px rounded-lg bg-foreground/[0.03] p-1.5">
+          {gaps.map((g) => (
+            <li key={g.file.filename}>
+              <button
+                type="button"
+                onClick={() => onOpenFile(g.file.filename)}
+                className="flex w-full items-center gap-2 rounded px-1.5 py-1 text-left text-2xs transition-colors hover:bg-foreground/5"
+              >
+                <FileCode className="size-3 shrink-0 text-muted-foreground/60" />
+                <span className="min-w-0 flex-1 truncate font-mono text-foreground/80">
+                  {g.file.filename}
+                </span>
+                {g.risks.map((r) => (
+                  <span
+                    key={r}
+                    className="shrink-0 rounded-full bg-warning/12 px-1.5 py-px font-medium text-warning"
+                  >
+                    {RISK_LABEL[r]}
+                  </span>
+                ))}
+                <span className="shrink-0 tabular-nums text-muted-foreground/60">
+                  {g.file.changes.toLocaleString()}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function Tour({
   prKey,
   plan,
@@ -985,6 +1108,7 @@ function Tour({
   generatedAt,
   progress,
   coverage,
+  pendingPaths,
   focusIndex,
   onFocusConsumed,
   stale,
@@ -1009,6 +1133,9 @@ function Tour({
    * the diff budget) in one call.
    */
   coverage?: { done: number; total: number };
+  /** Files belonging to layers that haven't been toured yet, so the coverage
+   * strip reports a queued layer as queued rather than as a gap. */
+  pendingPaths?: ReadonlySet<string>;
   /** A stop to jump to once, on the reviewer's explicit request (opening one
    * layer of a deep tour). Null on every other render. */
   focusIndex?: number | null;
@@ -1027,6 +1154,12 @@ function Tour({
   // A "clean bill of health" tour: a summary + verdict but nothing to walk
   // through. The step nav / spine / counter all collapse to just the verdict.
   const noSteps = total === 0;
+  // What the tour did NOT look at. Derived at read time from the PR's real
+  // files, so it tracks the diff rather than a snapshot taken at generation.
+  const cov = useMemo(
+    () => tourCoverage(plan.steps, files, pendingPaths),
+    [plan.steps, files, pendingPaths],
+  );
   const preferPost = useReviewPrefs((s) => s.defaultSuggestionAction === "post");
   const { markSeen, setLastActive, dismiss, restoreDismissed } = progress;
   const localRepos = useLocalRepos((s) => s.repos);
@@ -1570,6 +1703,10 @@ function Tour({
           )}
         </div>
       )}
+
+      {/* What the tour didn't reach — sits with the focus chips because it
+          answers the same question they do: where should I look next? */}
+      <CoverageStrip cov={cov} onOpenFile={onOpenFile} />
 
       {/* Timeline spine (the journey at a glance) + the reading pane (the
           focused stop). The spine carries progress on its own — nodes fill in

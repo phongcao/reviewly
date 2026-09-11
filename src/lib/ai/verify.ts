@@ -48,10 +48,56 @@ export interface VerifiedStep {
   evidence: StepEvidence;
 }
 
-/** Tokens that show up inside quoted expressions (`quantity <= 0`, `if (!user)`)
- * and carry no identity, so their absence from the diff proves nothing. Kept
- * deliberately small: over-stopping hides real fabrications. */
+/**
+ * Tokens that carry no identity, so their absence from the diff proves nothing.
+ *
+ * Three groups: language keywords that appear inside quoted expressions
+ * (`quantity <= 0`, `if (!user)`); built-in error and container types, which a
+ * model names generically when describing behaviour ("guards against
+ * `KeyError`") rather than quoting the file; and conventional doc filenames.
+ *
+ * Measured against two real tours (78 stops): without the built-ins, 3 of 4
+ * flags were false positives — enough to train a reviewer to ignore the banner,
+ * which costs more than the fabrications it catches. Still kept deliberately
+ * small, because over-stopping hides the real ones: a fabricated domain symbol
+ * like `ValidationFailure` or `Unauthorized` is not on this list and is exactly
+ * what the check exists to find.
+ */
 const NOISE = new Set([
+  // Built-in error types — named generically, not quoted from the code.
+  "assertionerror",
+  "attributeerror",
+  "baseexception",
+  "error",
+  "exception",
+  "filenotfounderror",
+  "importerror",
+  "indexerror",
+  "ioerror",
+  "keyerror",
+  "notimplementederror",
+  "oserror",
+  "rangeerror",
+  "referenceerror",
+  "runtimeerror",
+  "stopiteration",
+  "syntaxerror",
+  "typeerror",
+  "valueerror",
+  "zerodivisionerror",
+  // Built-in container / global types.
+  "array",
+  "dict",
+  "json",
+  "list",
+  "object",
+  "promise",
+  "tuple",
+  // Conventional filenames a summary cites without the PR touching them.
+  "changelog",
+  "license",
+  "readme",
+  "todo",
   "and",
   "async",
   "await",
