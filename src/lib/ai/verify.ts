@@ -98,6 +98,7 @@ const NOISE = new Set([
   "license",
   "readme",
   "todo",
+  // Language keywords, which appear inside quoted expressions.
   "and",
   "async",
   "await",
@@ -172,8 +173,7 @@ const BACKTICKED = /`([^`\n]+)`/g;
  * A span may be a whole expression, so it is tokenized rather than matched
  * whole: `quantity <= 0` grounds on `quantity`.
  */
-export function citedIdentifiers(step: GuidedStep): string[] {
-  const text = `${step.title}\n${step.detail}\n${step.suggestion ?? ""}`;
+export function citedIdentifiers(text: string): string[] {
   const out = new Set<string>();
   for (const span of text.matchAll(BACKTICKED)) {
     for (const tok of span[1].matchAll(IDENT)) {
@@ -198,8 +198,30 @@ function findFile(files: PullFile[], path: string): PullFile | undefined {
   return files.find((f) => f.filename.toLowerCase() === lower);
 }
 
+/** Anything the model asserted and anchored — a tour stop, or one behavioral
+ * change in a behavior panel. Verification doesn't care which. */
+export interface Claim {
+  path: string;
+  line: number;
+  endLine?: number;
+  /** The prose whose backticked identifiers must hold up. */
+  text: string;
+}
+
+/** Everything a tour stop asserts, as one blob for the identifier check. */
+const stepText = (step: GuidedStep): string =>
+  `${step.title}\n${step.detail}\n${step.suggestion ?? ""}`;
+
+/** Verify one tour stop. */
+export const verifyStep = (step: GuidedStep, files: PullFile[], corpus?: string): StepEvidence =>
+  verifyClaim(
+    { path: step.path, line: step.line, endLine: step.endLine, text: stepText(step) },
+    files,
+    corpus,
+  );
+
 /**
- * Verify one stop against the PR's files.
+ * Verify one claim against the PR's files.
  *
  * `files` must be the PR's real file list — the same list `mergeDeepTour` and
  * `InlineDiff` resolve against — so a stop is judged against exactly what the
@@ -207,27 +229,27 @@ function findFile(files: PullFile[], path: string): PullFile | undefined {
  *
  * Pass `corpus` when verifying a batch, to hoist the join out of the loop.
  */
-export function verifyStep(step: GuidedStep, files: PullFile[], corpus?: string): StepEvidence {
+export function verifyClaim(claim: Claim, files: PullFile[], corpus?: string): StepEvidence {
   // Every changed line in the PR. An identifier missing from the cited file but
   // present in a sibling is still grounded — cross-file narration ("this is the
   // caller of `validate`") is legitimate and common, and the fabrications worth
   // catching are symbols that exist nowhere at all.
   const all = corpus ?? prCorpus(files);
 
-  const file = findFile(files, step.path);
+  const file = findFile(files, claim.path);
   if (!file) {
     // Nothing to stand the claim up against, and `InlineDiff` will say as much.
     // Still not deleted: a fabricated anchor on a real concern is a reason to
     // read the code, not a reason to hide the concern.
     return {
       grade: "heuristic",
-      ungrounded: citedIdentifiers(step).filter((id) => !all.includes(id)),
-      reason: `${step.path} isn't among this PR's changed files.`,
+      ungrounded: citedIdentifiers(claim.text).filter((id) => !all.includes(id)),
+      reason: `${claim.path} isn't among this PR's changed files.`,
     };
   }
 
-  const lo = step.line;
-  const hi = step.endLine && step.endLine >= lo ? step.endLine : lo;
+  const lo = claim.line;
+  const hi = claim.endLine && claim.endLine >= lo ? claim.endLine : lo;
   const inRange = (n: number | null) => n !== null && n >= lo && n <= hi;
 
   // The hunk that actually contains the anchor — same rule as `InlineDiff`, so a
@@ -241,7 +263,7 @@ export function verifyStep(step: GuidedStep, files: PullFile[], corpus?: string)
   // then the whole PR. Each widening is a weaker claim, but only total absence
   // is reported.
   const window = hunk ? hunk.lines.map((l) => l.text).join("\n") : (file.patch ?? "");
-  const ungrounded = citedIdentifiers(step).filter(
+  const ungrounded = citedIdentifiers(claim.text).filter(
     (id) => !window.includes(id) && !all.includes(id),
   );
 

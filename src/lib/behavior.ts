@@ -25,7 +25,7 @@
  * lists matching — is what lets a reviewer skim a file honestly instead of
  * re-deriving that conclusion by hand.
  */
-import { extractObjects, stripFence, toArray, toStringArray } from "@/lib/ai/json";
+import { extractObjects, stripFence, toArray, toInt, toStringArray } from "@/lib/ai/json";
 
 /** How a change relates to observable behavior. */
 export type ChangeClass =
@@ -37,9 +37,19 @@ export type ChangeClass =
   | "error_change"
   | "refactor_only";
 
+/** Where a change's evidence lives, as new-file lines — the same convention
+ * `GuidedStep` uses, so a click lands in the diff viewer without translation. */
+export interface ChangeRange {
+  line: number;
+  endLine?: number;
+}
+
 export interface BehaviorChange {
   type: ChangeClass;
   text: string;
+  /** Lines backing this claim. Empty when the model supplied none, which is
+   * itself a signal — an unanchored statement is graded down, never hidden. */
+  ranges: ChangeRange[];
 }
 
 export interface BehaviorDiff {
@@ -97,15 +107,33 @@ function toClass(raw: unknown): ChangeClass {
   return "behavior_added";
 }
 
+/** One `{line, endLine?}` from the model, or null if it carries no usable
+ * line. Tolerates a bare number and numeric strings, like `toStep`. */
+function toRange(p: unknown): ChangeRange | null {
+  if (typeof p === "number" || typeof p === "string") {
+    const n = toInt(p);
+    return n !== null && n >= 1 ? { line: n } : null;
+  }
+  if (typeof p !== "object" || p === null) return null;
+  const o = p as Record<string, unknown>;
+  const line = toInt(o.line);
+  if (line === null || line < 1) return null;
+  const end = toInt(o.endLine);
+  return { line, endLine: end !== null && end >= line ? end : undefined };
+}
+
 function toChange(p: unknown): BehaviorChange | null {
   if (typeof p === "string") {
-    return p.trim() ? { type: "behavior_added", text: p.trim() } : null;
+    return p.trim() ? { type: "behavior_added", text: p.trim(), ranges: [] } : null;
   }
   if (typeof p !== "object" || p === null) return null;
   const o = p as Record<string, unknown>;
   const text = typeof o.text === "string" ? o.text.trim() : "";
   if (!text) return null;
-  return { type: toClass(o.type), text };
+  const ranges = toArray(o.ranges ?? o.lines)
+    .map(toRange)
+    .filter((r): r is ChangeRange => r !== null);
+  return { type: toClass(o.type), text, ranges };
 }
 
 /**

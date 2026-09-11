@@ -2286,7 +2286,15 @@ const Step = ({
           )}
         </div>
 
-        {behavior && <BehaviorPanel diff={behavior} onClose={() => setBehavior(null)} />}
+        {behavior && (
+          <BehaviorPanel
+            diff={behavior}
+            path={step.path}
+            files={files}
+            onGoToLine={(line) => onOpenFile(step.path, line)}
+            onClose={() => setBehavior(null)}
+          />
+        )}
 
         {/* Cleared: show the AI's reasoning and let the reviewer close it (or
             keep it if they disagree) — never a silent black-box dismiss. */}

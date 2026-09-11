@@ -13,7 +13,7 @@ import type { BehaviorDiff } from "@/lib/behavior";
 import { type DiffLine, type Hunk, parseHunkHeader, parsePatch, toSplit } from "@/lib/diff";
 import { detectLanguage, highlightLine } from "@/lib/lang";
 import type { ReviewLocation } from "@/lib/review-context";
-import type { DraftComment, ReviewThread, ReviewThreadGraphQL } from "@/lib/tauri";
+import type { DraftComment, PullFile, ReviewThread, ReviewThreadGraphQL } from "@/lib/tauri";
 import { safeOpenUrl } from "@/lib/ui";
 import { cn } from "@/lib/utils";
 import { useLocalRepos } from "@/stores/local-repos";
@@ -280,6 +280,17 @@ export function DiffViewer({
   // A selection carries no symbol name, so the model is told only the range and
   // works out the enclosing symbol itself — the same job it already does for a
   // hunk, with one less hint.
+  // Verification needs a PullFile list; inside the viewer we have exactly one
+  // file, which is also the only one its claims may cite.
+  const behaviorFiles = useMemo(() => [{ filename: path, patch } as PullFile], [path, patch]);
+
+  /** Scroll to a new-file line in this diff — same row lookup as `navComment`. */
+  const goToLine = useCallback((line: number) => {
+    const el = rootRef.current?.querySelector<HTMLElement>(`[data-line="${line}"]`);
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+    else toast.info(`Line ${line} isn't rendered in this diff.`);
+  }, []);
+
   const explainSelection = useCallback(
     (from: number, to: number) => void runExplain(from, to > from ? to : undefined, undefined),
     [runExplain],
@@ -765,7 +776,13 @@ export function DiffViewer({
                 indistinguishable from nothing happening. */}
             {behavior?.path === path && behavior.anchor === h.newStart && (
               <div ref={revealBehavior} className="px-3 pt-2 font-sans">
-                <BehaviorPanel diff={behavior.diff} onClose={() => setBehavior(null)} />
+                <BehaviorPanel
+                  diff={behavior.diff}
+                  path={path}
+                  files={behaviorFiles}
+                  onGoToLine={goToLine}
+                  onClose={() => setBehavior(null)}
+                />
               </div>
             )}
             <HunkBlock

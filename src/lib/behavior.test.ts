@@ -5,7 +5,13 @@ const ok = JSON.stringify({
   symbol: "calculate_price",
   before: ["Sum every item.", "Apply item discounts."],
   after: ["Skip items where `quantity <= 0`.", "Sum the rest.", "Apply item discounts."],
-  changes: [{ type: "new_guard", text: "Items where `quantity <= 0` no longer contribute." }],
+  changes: [
+    {
+      type: "new_guard",
+      text: "Items where `quantity <= 0` no longer contribute.",
+      ranges: [{ line: 12, endLine: 14 }],
+    },
+  ],
 });
 
 describe("parseBehavior", () => {
@@ -17,6 +23,7 @@ describe("parseBehavior", () => {
     expect(b?.changes[0]).toEqual({
       type: "new_guard",
       text: "Items where `quantity <= 0` no longer contribute.",
+      ranges: [{ line: 12, endLine: 14 }],
     });
   });
 
@@ -31,7 +38,7 @@ describe("parseBehavior", () => {
 
   it("accepts a bare string in the changes array", () => {
     const b = parseBehavior('{"before":["a"],"after":["b"],"changes":["it changed"]}');
-    expect(b?.changes).toEqual([{ type: "behavior_added", text: "it changed" }]);
+    expect(b?.changes).toEqual([{ type: "behavior_added", text: "it changed", ranges: [] }]);
   });
 
   it("normalizes near-miss change types", () => {
@@ -72,6 +79,31 @@ describe("parseBehavior", () => {
   });
 });
 
+describe("change ranges", () => {
+  it("parses ranges and tolerates a bare line number", () => {
+    const b = parseBehavior(
+      '{"before":["a"],"after":["b"],"changes":[{"type":"new_guard","text":"x","ranges":[{"line":"42","endLine":40},99]}]}',
+    );
+    // endLine before line is dropped; a bare number becomes a single line.
+    expect(b?.changes[0].ranges).toEqual([{ line: 42, endLine: undefined }, { line: 99 }]);
+  });
+
+  it("accepts the `lines` spelling as well as `ranges`", () => {
+    const b = parseBehavior('{"after":["b"],"changes":[{"text":"x","lines":[7]}]}');
+    expect(b?.changes[0].ranges).toEqual([{ line: 7 }]);
+  });
+
+  it("leaves ranges empty rather than inventing one", () => {
+    const b = parseBehavior('{"after":["b"],"changes":[{"text":"x"}]}');
+    expect(b?.changes[0].ranges).toEqual([]);
+  });
+
+  it("drops a nonsense line number", () => {
+    const b = parseBehavior('{"after":["b"],"changes":[{"text":"x","ranges":[0,-3,"abc"]}]}');
+    expect(b?.changes[0].ranges).toEqual([]);
+  });
+});
+
 describe("isPureRefactor", () => {
   it("is true only when every stated change is refactor_only", () => {
     expect(
@@ -79,7 +111,7 @@ describe("isPureRefactor", () => {
         symbol: "x",
         before: ["a"],
         after: ["a"],
-        changes: [{ type: "refactor_only", text: "reorganized" }],
+        changes: [{ type: "refactor_only", text: "reorganized", ranges: [] }],
       }),
     ).toBe(true);
     expect(
@@ -88,8 +120,8 @@ describe("isPureRefactor", () => {
         before: ["a"],
         after: ["b"],
         changes: [
-          { type: "refactor_only", text: "reorganized" },
-          { type: "new_guard", text: "and a guard" },
+          { type: "refactor_only", text: "reorganized", ranges: [] },
+          { type: "new_guard", text: "and a guard", ranges: [] },
         ],
       }),
     ).toBe(false);

@@ -182,6 +182,8 @@ Two lists of what the code DOES, as a reader would execute it:
 - "after": the behavior of the NEW version, same form.
 Then "changes": what actually differs, derived by comparing your two lists.
 
+Keep the two lists PARALLEL: the same steps, in the same order, worded IDENTICALLY where the behavior didn't change. They are shown side by side, so an unchanged step must read the same on both sides or the reader cannot tell what moved. Add or drop a bullet only where a step genuinely appeared or disappeared.
+
 A symbol added by this diff has an empty "before". A symbol deleted by it has an empty "after".
 
 ## Rules that make this useful
@@ -202,9 +204,15 @@ A symbol added by this diff has an empty "before". A symbol deleted by it has an
 
 If the whole change is behavior-preserving, say so: emit "before" and "after" that match and a single "refactor_only" change. That is a complete, correct, useful answer — do not manufacture a behavioral difference to seem thorough.
 
+## Anchoring — every change must be checkable
+Each entry in "changes" carries "ranges": the lines in the diff that PROVE it, as NEW-file line numbers (the \`+\` side of the \`@@\` header). A reviewer clicks these to land on the code, and a statement nobody can check is worth less than no statement.
+- Cite the lines that actually demonstrate the change — the added guard, the new call, the removed branch. Prefer \`+\` lines; for something the diff REMOVES, cite the new-file line where it used to be.
+- Use "endLine" when the evidence spans several lines. One to three ranges per change is normal.
+- Never invent a line number. If you genuinely cannot point at one, return an empty "ranges" rather than a guess — a guess is worse than an admission.
+
 ## Output
 Return ONLY a single JSON object — no prose, no markdown fence:
-{"symbol":"Name.of.symbol","before":["…"],"after":["…"],"changes":[{"type":"new_guard","text":"…"}]}
+{"symbol":"Name.of.symbol","before":["…"],"after":["…"],"changes":[{"type":"new_guard","text":"…","ranges":[{"line":142,"endLine":153}]}]}
 
 "symbol" is the BARE NAME only — \`calculate_price\`, \`JobWorker.run\`, \`POST /documents\`, or the module name. Never a sentence, never a parenthetical explanation; it is rendered as a heading.
 

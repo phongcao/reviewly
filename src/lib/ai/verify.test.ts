@@ -106,29 +106,22 @@ describe("verifySteps", () => {
 
 describe("citedIdentifiers", () => {
   it("ignores built-in error types a summary names generically", () => {
-    const s = step({ detail: "Guards against `KeyError` and `ValueError`." });
-    expect(citedIdentifiers(s)).toEqual([]);
+    expect(citedIdentifiers("Guards against `KeyError` and `ValueError`.")).toEqual([]);
   });
 
   it("still catches a fabricated domain symbol", () => {
-    const s = step({ detail: "Raises `ValidationFailure` when `Unauthorized`." });
-    expect(citedIdentifiers(s).sort()).toEqual(["Unauthorized", "ValidationFailure"]);
+    const out = citedIdentifiers("Raises `ValidationFailure` when `Unauthorized`.");
+    expect(out.sort()).toEqual(["Unauthorized", "ValidationFailure"]);
   });
 
   it("tokenizes expressions and ignores keywords and short tokens", () => {
-    const s = step({
-      title: "Guard",
-      detail: "`if (quantity <= 0) return null` and `db` and `ValidationFailure`",
-    });
-    expect(citedIdentifiers(s).sort()).toEqual(["ValidationFailure", "quantity"]);
+    const out = citedIdentifiers(
+      "`if (quantity <= 0) return null` and `db` and `ValidationFailure`",
+    );
+    expect(out.sort()).toEqual(["ValidationFailure", "quantity"]);
   });
 
   it("reads unbackticked prose as narration, not as a claim", () => {
-    expect(citedIdentifiers(step({ detail: "This calls OrderValidator." }))).toEqual([]);
-  });
-
-  it("checks the suggestion body too", () => {
-    const s = step({ detail: "", suggestion: "Consider renaming `calculate_price`." });
-    expect(citedIdentifiers(s)).toEqual(["calculate_price"]);
+    expect(citedIdentifiers("This calls OrderValidator.")).toEqual([]);
   });
 });
