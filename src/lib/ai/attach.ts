@@ -1,4 +1,5 @@
 import { parsePatch } from "@/lib/diff";
+import type { ReviewLocation } from "@/lib/review-context";
 import type { PullFile } from "@/lib/tauri";
 
 /**
@@ -6,6 +7,13 @@ import type { PullFile } from "@/lib/tauri";
  * diff, or a whole file picked with `@`. These ride along with the question as
  * a "# Focused context" block so the model knows exactly what's being asked
  * about, instead of guessing from the whole-PR diff.
+ *
+ * A `PrContextRef` is an *attachment*, not a place: it carries a side, a range
+ * and captured code because the model needs all three. Where the reviewer is
+ * *looking* is `ReviewLocation` (`@/lib/review-context`), which is deliberately
+ * just a path and a line. The two meet at `refLocation` below — one canonical
+ * location type, projected onto from here, rather than a second one defined
+ * alongside it.
  */
 
 export type ContextSide = "LEFT" | "RIGHT";
@@ -66,6 +74,21 @@ export function refFromLines(
 
 export function refForFile(path: string): PrContextRef {
   return { id: `file:${path}`, kind: "file", path };
+}
+
+/**
+ * Project an attachment onto the place it points at, for handing to the review
+ * context pane.
+ *
+ * A whole-file ref has no line, and a snippet anchors on the first line of its
+ * range: the pane shows the file from the top of the region the reviewer picked
+ * out, which is where they were already reading. The `side` is dropped on
+ * purpose — the pane renders the file at the PR head, where LEFT line numbers
+ * don't address anything.
+ */
+export function refLocation(ref: PrContextRef): ReviewLocation {
+  if (ref.kind === "file" || ref.side === "LEFT") return { path: ref.path };
+  return ref.from != null ? { path: ref.path, line: ref.from } : { path: ref.path };
 }
 
 /** `foo.ts:120-134`, `foo.ts:120`, or plain `foo.ts` for a whole-file ref. */

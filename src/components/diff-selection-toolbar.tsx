@@ -1,6 +1,7 @@
-import { type PrContextRef, buildSnippet, refFromSelection } from "@/lib/ai/attach";
+import { type PrContextRef, buildSnippet, refFromSelection, refLocation } from "@/lib/ai/attach";
 import { attachContext } from "@/lib/ai/attach-bridge";
-import { Sparkles } from "lucide-react";
+import type { ReviewLocation } from "@/lib/review-context";
+import { PanelRight, Sparkles } from "lucide-react";
 import { type RefObject, useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
@@ -15,6 +16,8 @@ interface Props {
   fileLines?: string[];
   /** Opens (or focuses) the chat once something is attached. */
   onAskAi?: () => void;
+  /** Opens the selected region in the review context pane. Omitted = no button. */
+  onPeek?: (loc: ReviewLocation) => void;
 }
 
 /**
@@ -35,6 +38,7 @@ export function DiffSelectionToolbar({
   prKey,
   fileLines,
   onAskAi,
+  onPeek,
 }: Props) {
   const [rect, setRect] = useState<DOMRect | null>(null);
   const refRef = useRef<PrContextRef | null>(null);
@@ -121,31 +125,59 @@ export function DiffSelectionToolbar({
       ? `Lines ${ref.from}–${ref.to}`
       : `Line ${ref.from}`;
 
-  const left = Math.min(Math.max(rect.left + rect.width / 2 - 60, 8), window.innerWidth - 128);
+  // Width grew with the second action, so centre against a wider bar and keep
+  // the whole thing on screen.
+  const width = onPeek ? 216 : 128;
+  const left = Math.min(
+    Math.max(rect.left + rect.width / 2 - width / 2, 8),
+    Math.max(8, window.innerWidth - width - 8),
+  );
   const top = rect.top > 44 ? rect.top - 34 : rect.bottom + 8;
 
+  const clear = () => {
+    window.getSelection()?.removeAllRanges();
+    hide();
+  };
+
   return createPortal(
-    <button
-      type="button"
-      // Without this the mousedown collapses the selection before onClick can
-      // read it.
+    <div
+      // Without this the mousedown collapses the selection before either
+      // onClick can read it.
       onMouseDown={(e) => e.preventDefault()}
-      onClick={() => {
-        attachContext(prKey, {
-          ...ref,
-          code: buildSnippet(patch, ref.side ?? "RIGHT", ref.from ?? 0, ref.to ?? 0, fileLines),
-        });
-        window.getSelection()?.removeAllRanges();
-        hide();
-        onAskAi?.();
-      }}
       style={{ left, top }}
-      className="fixed z-[60] flex items-center gap-1.5 rounded-lg border border-border/60 bg-popover/95 px-2 py-1 font-sans text-2xs font-medium text-foreground shadow-xl backdrop-blur-xl transition-colors hover:bg-primary/15"
+      className="fixed z-[60] flex items-center gap-0.5 rounded-lg border border-border/60 bg-popover/95 p-0.5 font-sans text-2xs font-medium text-foreground shadow-xl backdrop-blur-xl"
     >
-      <Sparkles className="size-3 text-primary" />
-      Ask AI
-      <span className="text-muted-foreground/60">{label}</span>
-    </button>,
+      <button
+        type="button"
+        onClick={() => {
+          attachContext(prKey, {
+            ...ref,
+            code: buildSnippet(patch, ref.side ?? "RIGHT", ref.from ?? 0, ref.to ?? 0, fileLines),
+          });
+          clear();
+          onAskAi?.();
+        }}
+        className="flex items-center gap-1.5 rounded-md px-1.5 py-1 transition-colors hover:bg-primary/15"
+      >
+        <Sparkles className="size-3 text-primary" />
+        Ask AI
+      </button>
+      {onPeek && (
+        <button
+          type="button"
+          onClick={() => {
+            onPeek(refLocation(ref));
+            clear();
+          }}
+          title="Read this file beside the diff — doesn't affect review progress"
+          className="flex items-center gap-1.5 rounded-md px-1.5 py-1 transition-colors hover:bg-primary/15"
+        >
+          <PanelRight className="size-3 text-primary" />
+          Open in context
+        </button>
+      )}
+      <span className="px-1 text-muted-foreground/60">{label}</span>
+    </div>,
     document.body,
   );
 }

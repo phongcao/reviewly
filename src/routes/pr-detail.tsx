@@ -46,6 +46,7 @@ import { parsePatch } from "@/lib/diff";
 import { isTestFile } from "@/lib/focus";
 import { relativeTime } from "@/lib/format";
 import { celebrate } from "@/lib/kite-release";
+import type { ReviewLocation } from "@/lib/review-context";
 import type {
   ActionsJob,
   ActionsStep,
@@ -492,7 +493,17 @@ export function PRDetailPage() {
   const setLastEditorTargetId = useEditorPrefs((s) => s.setLastTargetId);
   const contextOpen = useReviewContext((s) => s.open);
   const toggleContext = useReviewContext((s) => s.toggle);
+  const navigateContext = useReviewContext((s) => s.navigate);
   const changedPaths = useMemo(() => fileList.map((f) => f.filename), [fileList]);
+
+  // Open a place in the context pane. `navigate` reveals the pane itself, so a
+  // peek from a closed pane is still one interaction. Deliberately does not
+  // touch `current`, the scroll position, or viewed state — the diff must stay
+  // exactly where the reviewer left it.
+  const peek = useCallback(
+    (loc: ReviewLocation) => navigateContext(prViewKey, loc),
+    [navigateContext, prViewKey],
+  );
 
   // Hand a diff line off to the reviewer's editor, opened on that exact line.
   // Only offered when a clone is mapped — there is nothing on disk to open
@@ -1483,6 +1494,7 @@ export function PRDetailPage() {
                       focusLine={focusLine}
                       focusNonce={focusNonce}
                       onOpenInEditor={localRepo ? openInEditor : undefined}
+                      onPeek={peek}
                       headSha={headSha}
                       viewedKey={vk}
                       fileLinesLoading={fileContent.isLoading && fileContent.dataUpdatedAt === 0}

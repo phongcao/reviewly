@@ -9,6 +9,7 @@ import { buildSnippet, refFromLines } from "@/lib/ai/attach";
 import { attachContext } from "@/lib/ai/attach-bridge";
 import { type DiffLine, type Hunk, parsePatch, toSplit } from "@/lib/diff";
 import { detectLanguage, highlightLine } from "@/lib/lang";
+import type { ReviewLocation } from "@/lib/review-context";
 import type { DraftComment, ReviewThread, ReviewThreadGraphQL } from "@/lib/tauri";
 import { safeOpenUrl } from "@/lib/ui";
 import { cn } from "@/lib/utils";
@@ -22,6 +23,7 @@ import {
   ExternalLink,
   Link as LinkIcon,
   MessageSquarePlus,
+  PanelRight,
   Sparkles,
   SquarePen,
   TextQuote,
@@ -68,6 +70,8 @@ interface Props {
   fileLinesLoading?: boolean;
   /** Opens (or focuses) the AI chat after code is pinned to it from the diff. */
   onAskAi?: () => void;
+  /** Opens a location in the review context pane, beside the diff. */
+  onPeek?: (loc: ReviewLocation) => void;
 }
 
 interface GapInfo {
@@ -97,6 +101,8 @@ interface ThreadMeta {
   onAskAi?: () => void;
   /** Open this file at a line in the reviewer's editor; absent with no clone. */
   onOpenInEditor?: (line: number) => void;
+  /** Open this file at a line in the context pane, beside the diff. */
+  onPeek?: (line: number) => void;
 }
 const ThreadMetaContext = createContext<ThreadMeta | null>(null);
 
@@ -192,6 +198,7 @@ export function DiffViewer({
   focusLine,
   focusNonce,
   onOpenInEditor,
+  onPeek,
   headSha,
   viewedKey,
   fileLinesLoading = false,
@@ -574,6 +581,7 @@ export function DiffViewer({
               onOpenInEditor: onOpenInEditor
                 ? (line: number) => onOpenInEditor(path, line)
                 : undefined,
+              onPeek: onPeek ? (line: number) => onPeek({ path, line }) : undefined,
             }}
           >
             <DiffSelectionToolbar
@@ -584,6 +592,7 @@ export function DiffViewer({
               prKey={`${owner}/${repo}#${number}`}
               fileLines={fileLines}
               onAskAi={onAskAi}
+              onPeek={onPeek}
             />
             <div
               ref={rootRef}
@@ -613,7 +622,21 @@ export function DiffViewer({
 
   return (
     <ThreadMetaContext.Provider
-      value={{ owner, repo, number, reviewThreads, viewerLogin, patch, fileLines, onAskAi }}
+      value={{
+        owner,
+        repo,
+        number,
+        reviewThreads,
+        viewerLogin,
+        patch,
+        fileLines,
+        onAskAi,
+        // Both of these used to be omitted here and supplied only in the
+        // null-patch branch above, so the gutter popover's "Open in editor"
+        // never appeared on an ordinary diff — the one place it matters.
+        onOpenInEditor: onOpenInEditor ? (line: number) => onOpenInEditor(path, line) : undefined,
+        onPeek: onPeek ? (line: number) => onPeek({ path, line }) : undefined,
+      }}
     >
       {toolbar}
       <DiffSelectionToolbar
@@ -624,6 +647,7 @@ export function DiffViewer({
         prKey={`${owner}/${repo}#${number}`}
         fileLines={fileLines}
         onAskAi={onAskAi}
+        onPeek={onPeek}
       />
       <div
         ref={rootRef}
@@ -1579,6 +1603,19 @@ function CommentPopover({
               >
                 <Sparkles className="size-3" />
                 Ask AI
+              </button>
+            )}
+            {meta?.onPeek && (
+              <button
+                type="button"
+                onClick={() => {
+                  meta.onPeek?.(r.from);
+                  ui.close();
+                }}
+                className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-2xs font-medium text-muted-foreground/70 transition-colors hover:bg-primary/10 hover:text-primary"
+              >
+                <PanelRight className="size-3" />
+                Open in context
               </button>
             )}
             {meta?.onOpenInEditor && (
