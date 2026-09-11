@@ -9,6 +9,7 @@ import type { ContextOptions, ReviewContext } from "@/lib/ai/context";
 import { CLONE_ABSENT_CLAUSE, buildGuidedSystem } from "@/lib/ai/prompts";
 import { useAiAvailable } from "@/lib/ai/use-ai-available";
 import { useDeepTourRunner } from "@/lib/ai/use-deep-tour";
+import { verifyStep } from "@/lib/ai/verify";
 import { type DeepTourProgress, deepTourProgress, mergeDeepTour, stepId } from "@/lib/deep-tour";
 import { parsePatch } from "@/lib/diff";
 import { relativeTime } from "@/lib/format";
@@ -1991,6 +1992,12 @@ const Step = ({
   const refined = result?.verdict === "valid" ? result.finding : null;
   const checkable = !!onCheckAI && (step.kind === "concern" || step.kind === "question");
 
+  // Deterministic grounding check, at read time against the PR's real files —
+  // same reasoning as `mergeDeepTour`: the PR keeps moving, so a grade computed
+  // when the tour was generated could outlive the diff it describes. Only a
+  // downgrade is surfaced; annotating every well-anchored stop would be noise.
+  const evidence = useMemo(() => verifyStep(step, files), [step, files]);
+
   async function runCheck() {
     if (!onCheckAI || checking) return;
     setChecking(true);
@@ -2061,6 +2068,19 @@ const Step = ({
 
       {/* content */}
       <div className="min-w-0 pt-3 pb-8">
+        {/* Grounding caveat, BEFORE the snippet — a reviewer should know the
+            anchor is shaky while reading it, not after. The stop itself is
+            never hidden: an unverifiable concern is a reason to read the code,
+            not a reason to keep it from the reviewer. */}
+        {evidence.grade === "heuristic" && (
+          <div className="mb-2 flex items-start gap-2 rounded-lg bg-warning/10 px-2.5 py-2 text-xs text-warning">
+            <AlertTriangle className="mt-px size-3 shrink-0" />
+            <span className="min-w-0 flex-1">
+              Couldn't verify this against the diff — {evidence.reason} Read the source before
+              acting on it.
+            </span>
+          </div>
+        )}
         <div>
           <InlineDiff files={files} path={step.path} line={step.line} endLine={step.endLine} />
         </div>
