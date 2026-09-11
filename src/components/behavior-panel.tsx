@@ -21,13 +21,51 @@ import { GitCompare, X } from "lucide-react";
  * "nothing observable changed" is a finding, and the most common one in a large
  * PR.
  */
+/**
+ * Render the backticked spans the model emits as actual code.
+ *
+ * Deliberately lighter than the app's `.prose-reviewly code` chip: these
+ * bullets are written to preserve identifiers, so a single line routinely
+ * carries half a dozen spans, and a bordered-and-padded chip on each turns the
+ * line into a wall of boxes that wraps worse than the prose it decorates. Same
+ * colour language, none of the chrome.
+ *
+ * A full markdown renderer would be the other option, but inline code is the
+ * only markup in play and its block-level output would fight the list layout.
+ */
+function Prose({ text }: { text: string }) {
+  const parts = text.split(/`([^`]+)`/g);
+  return (
+    <>
+      {parts.map((part, i) =>
+        i % 2 === 1 ? (
+          <code
+            key={`${i}:${part}`}
+            className="rounded-sm bg-primary/8 px-0.5 font-mono text-[0.92em] text-primary/90 [overflow-wrap:anywhere]"
+          >
+            {part}
+          </code>
+        ) : (
+          part
+        ),
+      )}
+    </>
+  );
+}
+
 export function BehaviorPanel({ diff, onClose }: { diff: BehaviorDiff; onClose: () => void }) {
   const refactor = isPureRefactor(diff);
+  const both = diff.before.length > 0 && diff.after.length > 0;
+  const onlySide: "before" | "after" | null =
+    diff.after.length > 0 ? "after" : diff.before.length > 0 ? "before" : null;
   return (
     <div className="mt-3 rounded-lg border border-hairline bg-foreground/[0.02] p-3">
       <div className="flex items-center gap-2">
         <GitCompare className="size-3.5 shrink-0 text-info" />
-        <span className="min-w-0 flex-1 truncate font-mono text-xs font-medium text-foreground/90">
+        {/* Wrap rather than truncate: the model occasionally answers with a
+            qualified name or a short scope note, and an ellipsis would hide
+            exactly the part that disambiguates it. */}
+        <span className="min-w-0 flex-1 break-words font-mono text-xs font-medium text-foreground/90 [overflow-wrap:anywhere]">
           {diff.symbol || "Behavior"}
         </span>
         {refactor && (
@@ -44,11 +82,27 @@ export function BehaviorPanel({ diff, onClose }: { diff: BehaviorDiff; onClose: 
         />
       </div>
 
-      {(diff.before.length > 0 || diff.after.length > 0) && (
+      {/* An ADDED symbol has no "before" and a DELETED one has no "after".
+          Rendering the empty side as a half-width column spends half the panel
+          on two words — and in a PR of new files that is every panel. So a
+          one-sided change gets the full width and a one-line note instead. */}
+      {both ? (
         <div className="mt-2.5 grid gap-3 sm:grid-cols-2">
-          <BehaviorList label="Before" items={diff.before} empty="Did not exist." />
-          <BehaviorList label="After" items={diff.after} empty="Removed." />
+          <BehaviorList label="Before" items={diff.before} />
+          <BehaviorList label="After" items={diff.after} />
         </div>
+      ) : (
+        onlySide && (
+          <div className="mt-2.5">
+            <BehaviorList
+              label={onlySide === "after" ? "Behavior" : "Behavior before removal"}
+              items={onlySide === "after" ? diff.after : diff.before}
+              note={
+                onlySide === "after" ? "New — did not exist before." : "Removed by this change."
+              }
+            />
+          </div>
+        )
       )}
 
       {diff.changes.length > 0 && (
@@ -61,7 +115,9 @@ export function BehaviorPanel({ diff, onClose }: { diff: BehaviorDiff; onClose: 
               >
                 {CHANGE_SIGN[c.type]}
               </span>
-              <span className="min-w-0 flex-1 text-foreground/90">{c.text}</span>
+              <span className="min-w-0 flex-1 text-foreground/90">
+                <Prose text={c.text} />
+              </span>
               <span className={cn("shrink-0 text-2xs", CHANGE_STYLE[c.type])}>
                 {CHANGE_LABEL[c.type]}
               </span>
@@ -80,19 +136,21 @@ export function BehaviorPanel({ diff, onClose }: { diff: BehaviorDiff; onClose: 
 function BehaviorList({
   label,
   items,
-  empty,
+  note,
 }: {
   label: string;
   items: string[];
-  empty: string;
+  /** Shown under the label — what the missing other side means. */
+  note?: string;
 }) {
   return (
     <div className="min-w-0">
       <p className="text-2xs font-medium uppercase tracking-wide text-muted-foreground/60">
         {label}
       </p>
+      {note && <p className="mt-0.5 text-2xs italic text-muted-foreground">{note}</p>}
       {items.length === 0 ? (
-        <p className="mt-1 text-xs italic text-muted-foreground">{empty}</p>
+        <p className="mt-1 text-xs italic text-muted-foreground">Nothing stated.</p>
       ) : (
         <ol className="mt-1 space-y-0.5">
           {items.map((t, i) => (
@@ -100,7 +158,9 @@ function BehaviorList({
               <span aria-hidden className="text-muted-foreground/40">
                 •
               </span>
-              <span className="min-w-0 flex-1">{t}</span>
+              <span className="min-w-0 flex-1">
+                <Prose text={t} />
+              </span>
             </li>
           ))}
         </ol>

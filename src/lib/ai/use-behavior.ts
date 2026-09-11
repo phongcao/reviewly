@@ -35,7 +35,13 @@ export function useBehavior(cwd: string | null) {
 
   const explain = useCallback(
     async (req: BehaviorRequest, key: string): Promise<BehaviorDiff | null> => {
-      if (pending) return null;
+      // One at a time — but SAY so. Returning null silently here is
+      // indistinguishable from a failure at the call site, which is how a
+      // dropped click reads to the reviewer as "nothing happened".
+      if (pending) {
+        toast.info("Still explaining the previous selection — one at a time.");
+        return null;
+      }
       if (!req.patch) {
         toast.warning(`${req.path} has no diff to explain — it may be binary or too large.`);
         return null;

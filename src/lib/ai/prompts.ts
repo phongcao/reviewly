@@ -174,7 +174,7 @@ export function buildBehaviorPrompt(o: {
   return `You are explaining ONE changed symbol to a code reviewer as BEHAVIOR, not as a description of the edit.
 
 ## The symbol
-${subject} Work out which function / method / class / route contains that range and describe THAT symbol. If the range spans several symbols, describe the one the reviewer is most likely asking about — the one carrying the changed lines — and say which you chose in "symbol".
+${subject} Work out which function / method / class / route contains that range and describe THAT symbol. If the range spans several, describe the one carrying the changed lines. If nothing encloses it — a module docstring, imports, or top-level statements — describe the MODULE as the symbol.
 
 ## What to produce
 Two lists of what the code DOES, as a reader would execute it:
@@ -189,7 +189,8 @@ A symbol added by this diff has an empty "before". A symbol deleted by it has an
 - PRESERVE the things that carry meaning, verbatim from the code: identifiers, conditions, thresholds, error types, routes, state values, config keys, retry/timeout values. "Retry delay becomes \`2^attempt * 500ms\`, capped at \`30s\`" beats "retries now back off".
 - Every bullet must be supported by code you can actually see${o.clone ? " (read the file — you have a checkout)" : " in the diff below"}. Do not infer behavior you cannot point at. If the symbol calls something you can't see, describe the call, not what you imagine it does.
 - Only put a name in backticks if it appears verbatim in the code you read. Never invent a symbol to make a sentence read better.
-- Keep each bullet to one clause. 3-7 bullets per list; fewer if the symbol is small.
+- Keep each bullet to ONE clause of at most ~20 words. Split a compound step into two bullets rather than writing a paragraph.
+- How many: 3-7 bullets for a function or method, up to 12 for a whole module or class. Fewer if the symbol is small. If you need more than that, you are listing lines rather than describing behavior — group them.
 
 ## Classifying each change
 - "new_guard" — a condition now rejects / skips input that previously went through.
@@ -204,6 +205,8 @@ If the whole change is behavior-preserving, say so: emit "before" and "after" th
 ## Output
 Return ONLY a single JSON object — no prose, no markdown fence:
 {"symbol":"Name.of.symbol","before":["…"],"after":["…"],"changes":[{"type":"new_guard","text":"…"}]}
+
+"symbol" is the BARE NAME only — \`calculate_price\`, \`JobWorker.run\`, \`POST /documents\`, or the module name. Never a sentence, never a parenthetical explanation; it is rendered as a heading.
 
 # The file's diff
 \`\`\`diff

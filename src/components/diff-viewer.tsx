@@ -234,11 +234,19 @@ export function DiffViewer({
     [localRepos, owner, repo],
   );
   const { explain } = useBehavior(behaviorCwd);
-  const [behavior, setBehavior] = useState<{ anchor: number; diff: BehaviorDiff } | null>(null);
+  // Keyed by path so an answer can't outlive the file it describes when this
+  // viewer is pointed at another one — a render-time guard rather than a reset
+  // effect, so there is no frame where the stale panel is still on screen.
+  const [behavior, setBehavior] = useState<{
+    path: string;
+    anchor: number;
+    diff: BehaviorDiff;
+  } | null>(null);
   const [pendingHunk, setPendingHunk] = useState<number | null>(null);
-  useEffect(() => {
-    setBehavior(null);
-    setPendingHunk(null);
+  /** Bring a freshly-rendered panel into view — it may be inserted above the
+   * current scroll position, which would otherwise look like nothing happened. */
+  const revealBehavior = useCallback((el: HTMLDivElement | null) => {
+    el?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, []);
 
   /** New-file start of the hunk containing `line`, for anchoring the panel. */
@@ -256,7 +264,7 @@ export function DiffViewer({
       setPendingHunk(anchor);
       try {
         const d = await explain({ path, line, endLine, subject, patch }, `${path}:${line}`);
-        if (d) setBehavior({ anchor, diff: d });
+        if (d) setBehavior({ path, anchor, diff: d });
       } finally {
         setPendingHunk(null);
       }
@@ -751,6 +759,15 @@ export function DiffViewer({
               onAddComment={onAddComment}
               line={lineCtx}
             />
+            {/* ABOVE the hunk, not after it. A hunk can be hundreds of rows
+                long (a new file is one hunk), so a panel appended after the
+                block lands far below the header the reviewer just clicked —
+                indistinguishable from nothing happening. */}
+            {behavior?.path === path && behavior.anchor === h.newStart && (
+              <div ref={revealBehavior} className="px-3 pt-2 font-sans">
+                <BehaviorPanel diff={behavior.diff} onClose={() => setBehavior(null)} />
+              </div>
+            )}
             <HunkBlock
               path={path}
               lang={lang}
@@ -762,11 +779,6 @@ export function DiffViewer({
               hideWhitespace={hideWhitespace}
               line={lineCtx}
             />
-            {behavior?.anchor === h.newStart && (
-              <div className="px-3 pb-2 font-sans">
-                <BehaviorPanel diff={behavior.diff} onClose={() => setBehavior(null)} />
-              </div>
-            )}
           </Fragment>
         ))}
         <GapExpander
