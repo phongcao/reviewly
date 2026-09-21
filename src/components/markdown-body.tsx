@@ -2,7 +2,7 @@ import { GhAttachment, isGhAttachmentUrl } from "@/components/gh-attachment";
 import { safeOpenUrl } from "@/lib/ui";
 import { cn } from "@/lib/utils";
 import { Children, type ComponentPropsWithoutRef, type ReactNode, isValidElement } from "react";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { type UrlTransform } from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
@@ -10,6 +10,12 @@ import remarkGfm from "remark-gfm";
 interface Props {
   children: string | null | undefined;
   className?: string;
+  /**
+   * Rewrite link/image URLs before rendering — e.g. the Markdown preview
+   * resolves a document's relative paths against its repo. Omitted, links are
+   * left as-authored (react-markdown's own protocol filtering still applies).
+   */
+  urlTransform?: UrlTransform;
 }
 
 // Allow GitHub-flavored details/summary and the usual rehype-sanitize defaults.
@@ -71,7 +77,7 @@ const components = {
  * clicks to the OS browser, and proxies GitHub-hosted media through Rust
  * with our auth token so screenshots/videos load.
  */
-export function MarkdownBody({ children, className }: Props) {
+export function MarkdownBody({ children, className, urlTransform }: Props) {
   if (!children) return null;
   return (
     <div className={cn("prose-reviewly", className)}>
@@ -79,6 +85,7 @@ export function MarkdownBody({ children, className }: Props) {
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeRaw, [rehypeSanitize, schema]]}
         components={components}
+        urlTransform={urlTransform}
       >
         {children}
       </ReactMarkdown>

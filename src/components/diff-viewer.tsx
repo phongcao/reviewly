@@ -3,6 +3,7 @@ import { CommentByline } from "@/components/comment-byline";
 import { Composer } from "@/components/composer";
 import { DiffSelectionToolbar } from "@/components/diff-selection-toolbar";
 import { MarkdownBody } from "@/components/markdown-body";
+import { MarkdownPreview } from "@/components/markdown-preview";
 import { ReactionsBar } from "@/components/reactions-bar";
 import { ReviewThreadGroup } from "@/components/review-thread";
 import { TooltipFor } from "@/components/tooltip-for";
@@ -12,6 +13,7 @@ import { useBehavior } from "@/lib/ai/use-behavior";
 import type { BehaviorDiff } from "@/lib/behavior";
 import { type DiffLine, type Hunk, parseHunkHeader, parsePatch, toSplit } from "@/lib/diff";
 import { detectLanguage, highlightLine } from "@/lib/lang";
+import { isMarkdownPath } from "@/lib/markdown";
 import type { ReviewLocation } from "@/lib/review-context";
 import type { DraftComment, PullFile, ReviewThread, ReviewThreadGraphQL } from "@/lib/tauri";
 import { safeOpenUrl } from "@/lib/ui";
@@ -21,12 +23,14 @@ import { useReviewPrefs } from "@/stores/review-prefs";
 import { useViewedFiles } from "@/stores/viewed-files";
 import { diffWordsWithSpace } from "diff";
 import {
+  BookOpenText,
   ChevronDown,
   ChevronUp,
   Copy,
   ExternalLink,
   GitCompare,
   Link as LinkIcon,
+  MessageSquare,
   MessageSquarePlus,
   PanelRight,
   Sparkles,
@@ -304,6 +308,12 @@ export function DiffViewer({
   const setDiffWrap = useReviewPrefs((s) => s.setDiffWrap);
   const hideWhitespace = useReviewPrefs((s) => s.hideWhitespace);
   const setHideWhitespace = useReviewPrefs((s) => s.setHideWhitespace);
+  // Render Markdown files as documents rather than diffs. Review-wide (not
+  // per-file) so a docs-heavy PR is read in one mode instead of re-toggled
+  // twenty times; the toggle only appears on files it applies to.
+  const markdownPreview = useReviewPrefs((s) => s.markdownPreview);
+  const setMarkdownPreview = useReviewPrefs((s) => s.setMarkdownPreview);
+  const isMarkdown = useMemo(() => isMarkdownPath(path), [path]);
 
   // Persisted expanded context gaps for this file (keyed by viewedKey → path).
   const persistedGaps = useViewedFiles((s) =>
@@ -606,8 +616,13 @@ export function DiffViewer({
     }
   }
 
+  const showPreview = isMarkdown && markdownPreview;
+
   const toolbar = (
     <DiffToolbar
+      markdown={isMarkdown}
+      preview={showPreview}
+      onTogglePreview={() => setMarkdownPreview(!markdownPreview)}
       wrap={diffWrap}
       onToggleWrap={() => setDiffWrap(!diffWrap)}
       hideWhitespace={hideWhitespace}
@@ -620,6 +635,27 @@ export function DiffViewer({
       onOpenGitHub={() => safeOpenUrl(permalink())}
     />
   );
+
+  // Rendered Markdown replaces the rows entirely — the diff's line gutters,
+  // comment popovers and context expanders have nothing to attach to in prose.
+  // The toolbar stays put so one click is always the way back.
+  if (showPreview) {
+    return (
+      <div ref={rootRef}>
+        {toolbar}
+        <MarkdownPreview
+          path={path}
+          owner={owner}
+          repo={repo}
+          headSha={headSha}
+          fileLines={fileLines}
+          hunks={hunks}
+          loading={fileLinesLoading}
+        />
+        <div ref={endRef} aria-hidden className="h-px" />
+      </div>
+    );
+  }
 
   if (hunks.length === 0) {
     // Better null-patch handling: instead of a dead-end message, offer to load
@@ -864,8 +900,16 @@ function ToolBtn({
   );
 }
 
-/** Top toolbar: wrap toggle, hide-whitespace toggle, comment nav, copy actions. */
+/**
+ * Top toolbar: Markdown preview toggle (Markdown files only), wrap toggle,
+ * hide-whitespace toggle, comment nav, copy actions. In preview mode the
+ * row-level controls drop out — they describe rows that aren't rendered —
+ * leaving the preview toggle, the comment count, and the copy/open actions.
+ */
 function DiffToolbar({
+  markdown,
+  preview,
+  onTogglePreview,
   wrap,
   onToggleWrap,
   hideWhitespace,
@@ -877,6 +921,9 @@ function DiffToolbar({
   onCopyPermalink,
   onOpenGitHub,
 }: {
+  markdown: boolean;
+  preview: boolean;
+  onTogglePreview: () => void;
   wrap: boolean;
   onToggleWrap: () => void;
   hideWhitespace: boolean;
@@ -890,32 +937,67 @@ function DiffToolbar({
 }) {
   return (
     <div className="flex flex-wrap items-center gap-1 border-b border-hairline bg-card/95 px-2 py-1 font-sans">
-      <ToolBtn
-        tip={wrap ? "Wrapping long lines" : "Not wrapping (overflow)"}
-        onClick={onToggleWrap}
-        pressed={wrap}
-        active={wrap}
-      >
-        <WrapText className="size-3.5" />
-        Wrap
-      </ToolBtn>
-      <ToolBtn
-        tip="Collapse changes that differ only in whitespace"
-        onClick={onToggleHideWhitespace}
-        pressed={hideWhitespace}
-        active={hideWhitespace}
-      >
-        <TextQuote className="size-3.5" />
-        Hide whitespace
-      </ToolBtn>
-      <div className="mx-0.5 h-4 w-px bg-border/50" aria-hidden />
-      <ToolBtn tip="Previous comment" onClick={onPrevComment} disabled={commentCount === 0}>
-        <ChevronUp className="size-3.5" />
-      </ToolBtn>
-      <span className="text-xs tabular-nums text-muted-foreground/70">{commentCount}</span>
-      <ToolBtn tip="Next comment" onClick={onNextComment} disabled={commentCount === 0}>
-        <ChevronDown className="size-3.5" />
-      </ToolBtn>
+      {markdown && (
+        <>
+          <ToolBtn
+            tip={
+              preview
+                ? "Showing rendered Markdown — switch back to the raw diff (m)"
+                : "Render this Markdown file as a document (m)"
+            }
+            onClick={onTogglePreview}
+            pressed={preview}
+            active={preview}
+          >
+            <BookOpenText className="size-3.5" />
+            Preview
+          </ToolBtn>
+          <div className="mx-0.5 h-4 w-px bg-border/50" aria-hidden />
+        </>
+      )}
+      {preview ? (
+        <ToolBtn
+          tip={
+            commentCount === 0
+              ? "No inline comments on this file"
+              : "Inline comments live on the diff — switch back to read them"
+          }
+          onClick={onTogglePreview}
+          disabled={commentCount === 0}
+        >
+          <MessageSquare className="size-3.5" />
+          {commentCount}
+        </ToolBtn>
+      ) : (
+        <>
+          <ToolBtn
+            tip={wrap ? "Wrapping long lines" : "Not wrapping (overflow)"}
+            onClick={onToggleWrap}
+            pressed={wrap}
+            active={wrap}
+          >
+            <WrapText className="size-3.5" />
+            Wrap
+          </ToolBtn>
+          <ToolBtn
+            tip="Collapse changes that differ only in whitespace"
+            onClick={onToggleHideWhitespace}
+            pressed={hideWhitespace}
+            active={hideWhitespace}
+          >
+            <TextQuote className="size-3.5" />
+            Hide whitespace
+          </ToolBtn>
+          <div className="mx-0.5 h-4 w-px bg-border/50" aria-hidden />
+          <ToolBtn tip="Previous comment" onClick={onPrevComment} disabled={commentCount === 0}>
+            <ChevronUp className="size-3.5" />
+          </ToolBtn>
+          <span className="text-xs tabular-nums text-muted-foreground/70">{commentCount}</span>
+          <ToolBtn tip="Next comment" onClick={onNextComment} disabled={commentCount === 0}>
+            <ChevronDown className="size-3.5" />
+          </ToolBtn>
+        </>
+      )}
       <div className="ml-auto flex items-center gap-1">
         <ToolBtn tip="Copy file path" onClick={onCopyPath}>
           <Copy className="size-3.5" />

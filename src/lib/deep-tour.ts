@@ -29,6 +29,20 @@ export const stepId = (step: GuidedStep): string =>
 const SEVERITY: GuidedVerdict[] = ["request_changes", "comment", "approve"];
 
 /**
+ * The only two fields of a `DeepTourEntry` that decide what a merged tour
+ * CONTAINS: the layer partition and the batches that have landed on it.
+ *
+ * Deliberately narrower than `DeepTourEntry`. The entry also carries the
+ * reviewer's cursor (`lastActiveId`, `seen`, `dismissed`), which changes on
+ * every stop they move to — and since the store replaces the entry object on
+ * each of those writes, a merge memoized on the whole entry re-ran on every
+ * click and handed the UI 200+ freshly-allocated step objects that were equal
+ * to the ones it already had. Taking only what the merge reads lets the caller
+ * memoize on exactly that, so cursor movement stops rebuilding the tour.
+ */
+export type TouredLayers = Pick<DeepTourEntry, "plan" | "byLayer">;
+
+/**
  * Fold the per-layer tours that have landed so far into one `GuidedPlan`.
  *
  * Merging happens at READ time and is never stored — the same choice
@@ -41,7 +55,7 @@ const SEVERITY: GuidedVerdict[] = ["request_changes", "comment", "approve"];
  * files here, so files pushed since the tour started surface as an untoured
  * trailing layer rather than vanishing.
  */
-export function mergeDeepTour(entry: DeepTourEntry, files: PullFile[]): GuidedPlan {
+export function mergeDeepTour(entry: TouredLayers, files: PullFile[]): GuidedPlan {
   const plan: LayerPlan = reconcileLayers(entry.plan, files);
   const steps: GuidedStep[] = [];
   const seen = new Set<string>();
@@ -153,7 +167,7 @@ export interface DeepTourProgress {
 }
 
 export function deepTourProgress(
-  entry: DeepTourEntry | undefined,
+  entry: TouredLayers | undefined,
   files: PullFile[],
   busy: Set<string>,
 ): DeepTourProgress {

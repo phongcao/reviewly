@@ -403,6 +403,8 @@ function CodeReviewSection() {
   const setDiffWrap = useReviewPrefs((s) => s.setDiffWrap);
   const hideWhitespace = useReviewPrefs((s) => s.hideWhitespace);
   const setHideWhitespace = useReviewPrefs((s) => s.setHideWhitespace);
+  const markdownPreview = useReviewPrefs((s) => s.markdownPreview);
+  const setMarkdownPreview = useReviewPrefs((s) => s.setMarkdownPreview);
   const diffView = useUi((s) => s.diffView);
   const setDiffView = useUi((s) => s.setDiffView);
   const focusMode = useUi((s) => s.focusMode);
@@ -474,6 +476,12 @@ function CodeReviewSection() {
           description="Collapse lines that differ only by whitespace when reading a diff."
           checked={hideWhitespace}
           onChange={setHideWhitespace}
+        />
+        <SettingToggle
+          label="Render Markdown files"
+          description="Open .md files as rendered documents instead of a raw diff. Toggle per file with the Preview button or m."
+          checked={markdownPreview}
+          onChange={setMarkdownPreview}
         />
       </Card>
     </CollapsibleSection>

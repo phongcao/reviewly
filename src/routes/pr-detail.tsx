@@ -46,6 +46,7 @@ import { parsePatch } from "@/lib/diff";
 import { isTestFile } from "@/lib/focus";
 import { relativeTime } from "@/lib/format";
 import { celebrate } from "@/lib/kite-release";
+import { isMarkdownPath } from "@/lib/markdown";
 import type { ReviewLocation } from "@/lib/review-context";
 import type {
   ActionsJob,
@@ -658,6 +659,13 @@ export function PRDetailPage() {
         // Toggle "viewed" for the current file (item 37).
         e.preventDefault();
         if (vk && cur) setViewedFile(vk, cur, !viewedMap?.[cur]);
+      } else if (e.key === "m") {
+        // Rendered Markdown / raw diff. Only meaningful on a Markdown file, so
+        // the key stays free everywhere else.
+        if (!isMarkdownPath(cur)) return;
+        e.preventDefault();
+        const prefs = useReviewPrefs.getState();
+        prefs.setMarkdownPreview(!prefs.markdownPreview);
       } else if (e.key === "\\") {
         // Show/hide the review context pane. `\` is unclaimed, sits next to the
         // bracket keys that already move between files, and needs no chord.

@@ -1,4 +1,4 @@
-import { citedIdentifiers, verifyStep, verifySteps } from "@/lib/ai/verify";
+import { citedIdentifiers, prCorpus, verifyStep, verifySteps } from "@/lib/ai/verify";
 import type { GuidedStep } from "@/lib/guided";
 import type { PullFile } from "@/lib/tauri";
 import { describe, expect, it } from "vitest";
@@ -92,6 +92,32 @@ describe("verifyStep", () => {
     const e = verifyStep(step({ path: "assets/logo.png" }), binary);
     expect(e.grade).toBe("heuristic");
     expect(e.reason).not.toContain("isn't among");
+  });
+});
+
+describe("a hoisted corpus", () => {
+  // The tour pane renders every stop at once and re-verifies them together, so
+  // it joins the PR's diff once and passes it in rather than letting each stop
+  // rebuild it. That is only safe while the two paths grade identically.
+  const withSibling = [...files, file("workers/job.py", "@@ -1,1 +1,2 @@\n+class JobWorker:")];
+  const steps = [
+    step(),
+    step({ path: "gone.py" }),
+    step({ line: 13 }),
+    step({ detail: "Mirrors the check in `JobWorker`." }),
+    step({ detail: "Delegates to `OrderValidator`." }),
+  ];
+
+  it("grades every stop exactly as verifying each one alone does", () => {
+    const corpus = prCorpus(withSibling);
+    for (const s of steps) {
+      expect(verifyStep(s, withSibling, corpus)).toEqual(verifyStep(s, withSibling));
+    }
+  });
+
+  it("still finds a sibling's identifier — the corpus is the whole PR, not one file", () => {
+    const s = step({ detail: "Mirrors the check in `JobWorker`." });
+    expect(verifyStep(s, withSibling, prCorpus(withSibling)).grade).toBe("exact");
   });
 });
 

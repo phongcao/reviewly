@@ -71,6 +71,7 @@ const GROUPS: Group[] = [
       { keys: ["n"], label: "Mark viewed & jump to next file" },
       { keys: ["v"], label: "Toggle viewed for the current file" },
       { keys: ["c"], label: "Next file with unresolved comments" },
+      { keys: ["m"], label: "Toggle rendered Markdown for the current file" },
       { keys: ["\\"], label: "Toggle the review context pane" },
       { keys: ["⌘", "B"], label: "Toggle unified / split diff" },
       { keys: ["⌘", "F"], label: "Find in diff" },

@@ -11,7 +11,7 @@ import { CLONE_ABSENT_CLAUSE, buildGuidedSystem } from "@/lib/ai/prompts";
 import { useAiAvailable } from "@/lib/ai/use-ai-available";
 import { useBehavior } from "@/lib/ai/use-behavior";
 import { useDeepTourRunner } from "@/lib/ai/use-deep-tour";
-import { verifyStep } from "@/lib/ai/verify";
+import { prCorpus, verifyStep } from "@/lib/ai/verify";
 import type { BehaviorDiff } from "@/lib/behavior";
 import { type CoverageReport, RISK_LABEL, blindSpots, tourCoverage } from "@/lib/coverage";
 import { type DeepTourProgress, deepTourProgress, mergeDeepTour, stepId } from "@/lib/deep-tour";
@@ -66,6 +66,7 @@ import {
 import {
   type ComponentType,
   Fragment,
+  memo,
   useCallback,
   useEffect,
   useMemo,
@@ -125,6 +126,25 @@ const KIND: Record<
 /** Stable empty set, so a tour with no collapse support doesn't hand the rail a
  * fresh `Set` identity on every render. */
 const NO_COLLAPSE: ReadonlySet<string> = new Set();
+
+/**
+ * A callback with a permanent identity that always invokes the latest version
+ * handed to it.
+ *
+ * Load-bearing for `Step`'s memoization, and the reason is worth stating: a
+ * tour of this size only stays responsive if moving the cursor re-renders the
+ * two stops whose appearance actually changed rather than all of them. But
+ * nearly every handler a stop receives is rebuilt on a cursor move anyway —
+ * `progress`'s methods are recreated whenever read state changes, and the
+ * page's own `onAddComment` / `onOpenFile` are inline arrows. Passing those
+ * straight down would defeat `memo` on every single click. Wrapping them here
+ * decouples "this handler does the newest thing" from "this prop changed".
+ */
+function useEvent<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
+  const ref = useRef(fn);
+  ref.current = fn;
+  return useCallback((...args: A) => ref.current(...args), []);
+}
 
 /** The tour's suggested verdict → its chip + the review event it seeds. */
 const VERDICT_META: Record<
@@ -495,10 +515,21 @@ function DeepTour({
     [gen?.errors],
   );
 
-  const plan = useMemo(() => (entry ? mergeDeepTour(entry, files) : null), [entry, files]);
+  // Keyed on the partition + the landed batches, NOT on `entry`. The store
+  // replaces the entry object every time the reviewer moves the cursor (see
+  // `TouredLayers`), and merging on that re-derived the whole tour — and every
+  // step object in it — on each click. These two fields change only when a
+  // layer actually lands, which is the only time the merge can differ.
+  const layerPlan = entry?.plan;
+  const byLayer = entry?.byLayer;
+  const toured = useMemo(
+    () => (layerPlan && byLayer ? { plan: layerPlan, byLayer } : null),
+    [layerPlan, byLayer],
+  );
+  const plan = useMemo(() => (toured ? mergeDeepTour(toured, files) : null), [toured, files]);
   const info: DeepTourProgress = useMemo(
-    () => deepTourProgress(entry, files, busy),
-    [entry, files, busy],
+    () => deepTourProgress(toured ?? undefined, files, busy),
+    [toured, files, busy],
   );
 
   // Index ↔ stable id, rebuilt whenever the merged plan changes. This is the
@@ -586,13 +617,13 @@ function DeepTour({
   // spot and read as an accusation instead of a progress report.
   const pendingPaths = useMemo(() => {
     const out = new Set<string>();
-    if (!entry) return out;
-    for (const layer of reconcileLayers(entry.plan, files).layers) {
-      if (entry.byLayer[layer.id]) continue;
+    if (!toured) return out;
+    for (const layer of reconcileLayers(toured.plan, files).layers) {
+      if (toured.byLayer[layer.id]) continue;
       for (const p of layer.files) out.add(p);
     }
     return out;
-  }, [entry, files]);
+  }, [toured, files]);
 
   const strip = (
     <DeepTourStrip
@@ -1165,7 +1196,14 @@ function Tour({
     [plan.steps, files, pendingPaths],
   );
   const preferPost = useReviewPrefs((s) => s.defaultSuggestionAction === "post");
-  const { markSeen, setLastActive, dismiss, restoreDismissed } = progress;
+  // `progress` is rebuilt every time read state changes — i.e. on every stop
+  // the reviewer visits — so its methods are taken through `useEvent`. That
+  // keeps the keyboard/cursor effects below from resubscribing on each move,
+  // and keeps `dismiss` usable as a prop on a memoized Step.
+  const markSeen = useEvent(progress.markSeen);
+  const setLastActive = useEvent(progress.setLastActive);
+  const dismiss = useEvent(progress.dismiss);
+  const { restoreDismissed } = progress;
   const localRepos = useLocalRepos((s) => s.repos);
   // The PR's local clone path — gives the per-step AI check real code to read
   // against (the "Check with AI" button only appears when this exists).
@@ -1175,28 +1213,28 @@ function Tour({
   }, [prKey, localRepos]);
   // Verify one concern against the clone; the Step auto-dismisses (resolved) or
   // refines the comment (valid) from the result.
-  const checkWithAI = useCallback(
-    async (step: GuidedStep): Promise<CheckResult | null> => {
-      try {
-        const out = await invoke<string>("ai_review", {
-          ...aiInvokeArgs(),
-          cwd,
-          prompt: checkPrompt(step),
-        });
-        return parseCheckResult(out);
-      } catch (e) {
-        toast.error(`AI check failed — ${String(e)}`);
-        return null;
-      }
-    },
-    [cwd],
-  );
+  const checkWithAI = useEvent(async (step: GuidedStep): Promise<CheckResult | null> => {
+    try {
+      const out = await invoke<string>("ai_review", {
+        ...aiInvokeArgs(),
+        cwd,
+        prompt: checkPrompt(step),
+      });
+      return parseCheckResult(out);
+    } catch (e) {
+      toast.error(`AI check failed — ${String(e)}`);
+      return null;
+    }
+  });
   // Explain ONE stop's symbol as behavior (before / after / what changed).
   // Unlike the concern check this does NOT require a clone: the file's own
   // patch carries both sides of the change. Shared with the diff viewer's hunk
   // and selection entry points so all three ask the same question.
   const { explain } = useBehavior(cwd);
-  const explainBehavior = useCallback(
+  // `explain` changes identity whenever a request starts or finishes (it closes
+  // over the hook's `pending` guard), so it goes through `useEvent` too — the
+  // guard still reads the newest value, it just stops churning Step's props.
+  const explainBehavior = useEvent(
     (step: GuidedStep): Promise<BehaviorDiff | null> =>
       explain(
         {
@@ -1208,21 +1246,17 @@ function Tour({
         },
         `${step.path}:${step.line}`,
       ),
-    [explain, files],
   );
   // Open a step's file — but only if it's actually part of this PR. A tour can
   // occasionally name a path that isn't in the diff (a stale or mistaken
   // reference); opening that would land on nothing, so warn instead.
-  const openStep = useCallback(
-    (path: string, line?: number) => {
-      if (!files.some((f) => f.filename === path)) {
-        toast.warning(`${path} isn't a file in this PR — it may be a stale or mistaken reference.`);
-        return;
-      }
-      onOpenFile(path, line);
-    },
-    [files, onOpenFile],
-  );
+  const openStep = useEvent((path: string, line?: number) => {
+    if (!files.some((f) => f.filename === path)) {
+      toast.warning(`${path} isn't a file in this PR — it may be a stale or mistaken reference.`);
+      return;
+    }
+    onOpenFile(path, line);
+  });
   const [active, setActive] = useState(() => Math.max(0, Math.min(progress.lastActive, total - 1)));
   const [posted, setPosted] = useState<Set<number>>(new Set());
   const [filter, setFilter] = useState<StepKind | null>(null);
@@ -1233,6 +1267,26 @@ function Tour({
   const scrollRef = useRef<HTMLDivElement>(null);
   const stepRefs = useRef<(HTMLElement | null)[]>([]);
   const scrolledRef = useRef(false);
+  const setStepRef = useCallback((i: number, el: HTMLElement | null) => {
+    stepRefs.current[i] = el;
+  }, []);
+
+  // Every changed line in the PR, joined once for the whole tour. Each stop's
+  // grounding check needs this window, and `verifyClaim` builds it itself when
+  // it isn't given one — which on a 200-stop tour meant concatenating the
+  // entire diff (megabytes) once per stop, per render. Hoisting it is what the
+  // function's `corpus` parameter is for.
+  const corpus = useMemo(() => prCorpus(files), [files]);
+
+  // Posting one stop's comment straight to GitHub. Split in two so it can be
+  // both stable and absent: Step keys the whole post-vs-add affordance off
+  // whether this prop is undefined, while the handler itself must not change
+  // identity — the page passes an inline arrow, and any render of it would
+  // otherwise re-render every mounted stop.
+  const postComment = useEvent((step: GuidedStep, body: string) =>
+    onPostComment ? onPostComment({ path: step.path, line: step.line, body }) : Promise.resolve(),
+  );
+  const postStep = onPostComment ? postComment : undefined;
 
   // While a programmatic jump (click a node / next / prev) is smooth-scrolling,
   // hold the chosen stop active until the scroll actually arrives — otherwise
@@ -1435,37 +1489,93 @@ function Tour({
   useEffect(() => {
     const root = scrollRef.current;
     if (!root) return;
+
+    // Small tolerance throughout so a jumped-to stop (which lands ~flush at the
+    // top) still registers as current — a tight `<= 1` would snap back to the
+    // previous stop after a click/next jump.
+    const atTop = (i: number, top: number): boolean | null => {
+      const el = stepRefs.current[i];
+      if (!el) return null;
+      return el.getBoundingClientRect().top - top <= 4;
+    };
+
+    // The last visible stop that has scrolled to/above the top edge.
+    function stuck(top: number): number {
+      let current = visible[0] ?? 0;
+      for (const i of visible) {
+        const above = atTop(i, top);
+        if (above === null) continue;
+        if (above) current = i;
+        else break;
+      }
+      return current;
+    }
+
+    // Has a jump's smooth scroll ARRIVED at its target? Equivalent to
+    // `stuck(top) === target` — the stops above the target are above it in the
+    // document too, so they need no measuring — but it reads two rects instead
+    // of one per stop passed over. On a 200-stop tour that is the difference
+    // between two layout reads and two hundred, on every frame of the
+    // animation, which is most of what made a click feel slow.
+    function arrived(target: number, top: number): boolean {
+      const pos = visible.indexOf(target);
+      // A target the filter hid can never become the stuck stop, exactly as
+      // under the full scan — hold until `beginJump`'s safety timer releases.
+      if (pos < 0) return false;
+      if (atTop(target, top) !== true) {
+        // Nothing is pinned yet (the intro is still on screen). The scan's
+        // default in that case is the first visible stop, so a jump to that one
+        // has arrived; any other is still on its way.
+        return target === visible[0];
+      }
+      for (let p = pos + 1; p < visible.length; p++) {
+        const above = atTop(visible[p], top);
+        if (above === null) continue;
+        return !above;
+      }
+      return true; // nothing mounted below it — the target is as stuck as it gets
+    }
+
     function syncStuck() {
       if (!root) return;
       const top = root.getBoundingClientRect().top;
-      let current = visible[0] ?? 0;
-      for (const i of visible) {
-        const el = stepRefs.current[i];
-        if (!el) continue;
-        // Small tolerance so a jumped-to stop (which lands ~flush at the top)
-        // still registers as current — a tight `<= 1` would snap back to the
-        // previous stop after a click/next jump.
-        if (el.getBoundingClientRect().top - top <= 4) current = i;
-        else break;
-      }
       // A jump is animating: hold the chosen stop until the scroll reaches it,
       // so we don't flash each stop it passes over on the way.
-      if (jumpTargetRef.current !== null) {
-        if (current !== jumpTargetRef.current) return;
+      const target = jumpTargetRef.current;
+      if (target !== null) {
+        if (!arrived(target, top)) return;
         jumpTargetRef.current = null;
+        setActive(target);
+        return;
       }
-      setActive(current);
+      setActive(stuck(top));
     }
+
+    // Coalesced to one measurement per frame. Scroll fires faster than that
+    // during a smooth scroll, and every extra call is a forced layout against
+    // the whole reading pane.
+    let frame = 0;
+    function onScroll() {
+      if (frame) return;
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        syncStuck();
+      });
+    }
+
     syncStuck();
-    root.addEventListener("scroll", syncStuck, { passive: true });
-    return () => root.removeEventListener("scroll", syncStuck);
+    root.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      root.removeEventListener("scroll", onScroll);
+      if (frame) cancelAnimationFrame(frame);
+    };
   }, [visible]);
 
-  function addComment(step: GuidedStep, idx: number, body: string) {
+  const addComment = useEvent((step: GuidedStep, idx: number, body: string) => {
     if (!body.trim()) return;
     onAddComment({ path: step.path, line: step.line, body: body.trim(), side: "RIGHT" });
     setPosted((s) => new Set(s).add(idx));
-  }
+  });
 
   const setLastVerdict = useReviewVerdict((s) => s.setLast);
   const verdict = plan.verdict ? VERDICT_META[plan.verdict] : null;
@@ -1900,23 +2010,18 @@ function Tour({
             const stop = (
               <Step
                 key={i}
-                setRef={(el) => {
-                  stepRefs.current[i] = el;
-                }}
+                setRef={setStepRef}
                 step={step}
                 index={i}
                 files={files}
+                corpus={corpus}
                 preferPost={preferPost}
                 posted={posted.has(i)}
-                onAdd={(body) => addComment(step, i, body)}
-                onPost={
-                  onPostComment
-                    ? (body) => onPostComment({ path: step.path, line: step.line, body })
-                    : undefined
-                }
+                onAdd={addComment}
+                onPost={postStep}
                 onCheckAI={cwd ? checkWithAI : undefined}
                 onExplainBehavior={explainBehavior}
-                onDismiss={() => dismiss(i)}
+                onDismiss={dismiss}
                 onOpenFile={openStep}
               />
             );
@@ -2114,11 +2219,21 @@ function parseCheckResult(out: string): CheckResult {
   return { verdict: "valid", finding: out.trim() };
 }
 
-const Step = ({
+/**
+ * One stop in the reading pane.
+ *
+ * Memoized, and every handler it takes is index- or step-parameterised rather
+ * than pre-bound, so the tour can hand all of its stops the same prop
+ * identities. Without both halves, moving the cursor re-rendered every mounted
+ * stop — on a deep tour that is 200+ markdown bodies, syntax-highlighted
+ * snippets and comment composers rebuilt to change which one is highlighted.
+ */
+const Step = memo(function Step({
   setRef,
   step,
   index,
   files,
+  corpus,
   preferPost,
   posted,
   onAdd,
@@ -2128,23 +2243,30 @@ const Step = ({
   onDismiss,
   onOpenFile,
 }: {
-  setRef: (el: HTMLElement | null) => void;
+  setRef: (index: number, el: HTMLElement | null) => void;
   step: GuidedStep;
   index: number;
   files: PullFile[];
+  /** The whole PR's diff text, joined once by the tour — see `verifyClaim`. */
+  corpus: string;
   /** When posting straight to GitHub is available, make it the primary action. */
   preferPost: boolean;
   posted: boolean;
-  onAdd: (body: string) => void;
-  onPost?: (body: string) => Promise<void>;
+  onAdd: (step: GuidedStep, index: number, body: string) => void;
+  onPost?: (step: GuidedStep, body: string) => Promise<void>;
   /** Verify this concern against the local clone (concern/question kinds). */
   onCheckAI?: (step: GuidedStep) => Promise<CheckResult | null>;
   /** Explain this stop's symbol as behavior (before / after / what changed). */
   onExplainBehavior?: (step: GuidedStep) => Promise<BehaviorDiff | null>;
-  onDismiss?: () => void;
+  onDismiss?: (index: number) => void;
   onOpenFile: (path: string, line?: number) => void;
-}) => {
+}) {
   const kind = KIND[step.kind] ?? KIND.orient;
+  const sectionRef = useCallback((el: HTMLElement | null) => setRef(index, el), [setRef, index]);
+  const dismiss = useMemo(
+    () => (onDismiss ? () => onDismiss(index) : undefined),
+    [onDismiss, index],
+  );
   const Icon = kind.icon;
   const [posting, setPosting] = useState(false);
   const [postedGh, setPostedGh] = useState(false);
@@ -2160,7 +2282,7 @@ const Step = ({
   // same reasoning as `mergeDeepTour`: the PR keeps moving, so a grade computed
   // when the tour was generated could outlive the diff it describes. Only a
   // downgrade is surfaced; annotating every well-anchored stop would be noise.
-  const evidence = useMemo(() => verifyStep(step, files), [step, files]);
+  const evidence = useMemo(() => verifyStep(step, files, corpus), [step, files, corpus]);
 
   async function runCheck() {
     if (!onCheckAI || checking) return;
@@ -2197,7 +2319,7 @@ const Step = ({
     if (!onPost || !b.trim() || posting) return;
     setPosting(true);
     try {
-      await onPost(b.trim());
+      await onPost(step, b.trim());
       setPostedGh(true);
     } catch (e) {
       toast.error(`Couldn't post — ${String(e)}`);
@@ -2207,7 +2329,7 @@ const Step = ({
   }
 
   return (
-    <section ref={setRef} className="animate-tour-fade-in">
+    <section ref={sectionRef} className="animate-tour-fade-in">
       {/* sticky header — the current stop stays pinned while you read it.
           Opaque so the diff scrolls cleanly *under* it (no bleed-through). The
           pinning itself marks "where you are", so the row stays neutral. */}
@@ -2235,12 +2357,12 @@ const Step = ({
           {step.path.split("/").pop()}:{step.line}
           {step.endLine ? `-${step.endLine}` : ""}
         </button>
-        {onDismiss && (
+        {dismiss && (
           <IconButton
             label="Dismiss this stop"
             icon={X}
             size="icon-xs"
-            onClick={onDismiss}
+            onClick={dismiss}
             className="shrink-0 text-muted-foreground/60 hover:text-foreground"
           />
         )}
@@ -2309,8 +2431,8 @@ const Step = ({
               <Button size="xs" variant="ghost" onClick={() => setResult(null)}>
                 Keep it
               </Button>
-              {onDismiss && (
-                <Button size="xs" variant="secondary" onClick={onDismiss}>
+              {dismiss && (
+                <Button size="xs" variant="secondary" onClick={dismiss}>
                   Dismiss stop
                   <X className="size-3" />
                 </Button>
@@ -2348,7 +2470,7 @@ const Step = ({
             }
             submitIcon={primaryPost ? <Send className="size-3" /> : undefined}
             submitting={posting}
-            onSubmit={primaryPost ? (b) => post(b) : (b) => onAdd(b)}
+            onSubmit={primaryPost ? (b) => post(b) : (b) => onAdd(step, index, b)}
             secondaryLabel={
               canPost
                 ? primaryPost
@@ -2360,7 +2482,9 @@ const Step = ({
                     : "Post to GitHub"
                 : undefined
             }
-            onSecondary={canPost ? (primaryPost ? (b) => onAdd(b) : (b) => post(b)) : undefined}
+            onSecondary={
+              canPost ? (primaryPost ? (b) => onAdd(step, index, b) : (b) => post(b)) : undefined
+            }
             footerStatus={
               postedGh ? (
                 <span className="inline-flex items-center gap-1 pl-0.5 text-2xs text-success">
@@ -2377,7 +2501,7 @@ const Step = ({
       </div>
     </section>
   );
-};
+});
 
 function InlineDiff({
   files,
@@ -2395,6 +2519,10 @@ function InlineDiff({
   const lo = line;
   const hi = endLine && endLine >= line ? endLine : line;
 
+  // Rows, already syntax-highlighted. The highlighting belongs INSIDE the memo:
+  // Prism is the expensive part of drawing a snippet, and running it in the
+  // render body meant re-tokenising every visible line of every mounted stop
+  // each time the tour re-rendered.
   const window = useMemo(() => {
     const hunks = parsePatch(file?.patch ?? null);
     const inRange = (nl: number | null | undefined) => nl != null && nl >= lo && nl <= hi;
@@ -2423,8 +2551,11 @@ function InlineDiff({
     const CTX = 4;
     const from = Math.max(0, first - CTX);
     const to = Math.min(rows.length, last + CTX + 1);
-    return rows.slice(from, to);
-  }, [file?.patch, lo, hi]);
+    return rows.slice(from, to).map((l) => ({
+      line: l,
+      html: highlightLine(l.text, lang) || "&nbsp;",
+    }));
+  }, [file?.patch, lo, hi, lang]);
 
   if (!window) {
     return (
@@ -2439,7 +2570,7 @@ function InlineDiff({
   const inRange = (nl: number | null | undefined) => nl != null && nl >= lo && nl <= hi;
   return (
     <div className="overflow-x-auto rounded-lg border border-border/40 bg-card/60 py-1 font-mono text-xs leading-[1.5]">
-      {window.map((l, i) => {
+      {window.map(({ line: l, html }, i) => {
         const num = l.newLine ?? l.oldLine;
         const hit = inRange(l.newLine);
         return (
@@ -2468,7 +2599,7 @@ function InlineDiff({
             <pre
               className="min-w-0 flex-1 whitespace-pre-wrap break-words pr-3 text-foreground/90"
               // biome-ignore lint/security/noDangerouslySetInnerHtml: Prism-highlighted
-              dangerouslySetInnerHTML={{ __html: highlightLine(l.text, lang) || "&nbsp;" }}
+              dangerouslySetInnerHTML={{ __html: html }}
             />
           </div>
         );
