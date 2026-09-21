@@ -260,6 +260,7 @@ Press `?` anywhere for the in-app cheatsheet. (`⌘` is `Ctrl` on Windows/Linux.
 ```bash
 bun install
 bun run tauri dev       # launch the desktop app with hot reload
+# REVIEWLY_GH_TOKEN=$(gh auth token) bun tauri dev
 ```
 
 **Other scripts**

@@ -337,6 +337,8 @@ pub fn run() {
             commands::app::get_launch_at_login,
             commands::app::set_start_in_tray,
             commands::app::set_app_icon,
+            commands::backup::write_bundle,
+            commands::backup::read_bundle,
             // attachments
             commands::attachments::gh_fetch_attachment,
             // actions (mutations: reactions, labels, reviewers, merge, etc.)

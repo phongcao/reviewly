@@ -34,6 +34,9 @@ interface State {
   dismiss: (key: string, idx: number) => void;
   /** Bring every dismissed stop back. */
   restoreDismissed: (key: string) => void;
+  /** Merge tours from an exported bundle. Newer `generatedAt` wins per PR.
+   * Returns how many entries actually landed. */
+  importEntries: (entries: Record<string, GuidedEntry>) => number;
 }
 
 /** Drop the oldest entries once we exceed the cap. */
@@ -88,6 +91,19 @@ export const useGuided = create<State>()(
         if (d.includes(idx)) return;
         set({ byPr: { ...get().byPr, [key]: { ...cur, dismissed: [...d, idx] } } });
       },
+      importEntries: (entries) => {
+        const cur = get().byPr;
+        const next = { ...cur };
+        let added = 0;
+        for (const [key, entry] of Object.entries(entries)) {
+          if (cur[key] && cur[key].generatedAt >= entry.generatedAt) continue;
+          next[key] = entry;
+          added++;
+        }
+        if (added > 0) set({ byPr: evict(next) });
+        return added;
+      },
+
       restoreDismissed: (key) => {
         const cur = get().byPr[key];
         if (!cur || (cur.dismissed ?? []).length === 0) return;

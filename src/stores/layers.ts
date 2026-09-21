@@ -26,6 +26,9 @@ interface State {
   set: (key: string, plan: LayerPlan, meta: { headSha: string; source: string }) => void;
   reset: (key: string) => void;
   setActive: (key: string, layerId: string) => void;
+  /** Merge plans from an exported bundle. Newer `generatedAt` wins per PR.
+   * Returns how many entries actually landed. */
+  importEntries: (entries: Record<string, LayersEntry>) => number;
 }
 
 /** Drop the oldest entries once we exceed the cap. */
@@ -60,6 +63,19 @@ export const useLayers = create<State>()(
         delete next[key];
         set({ byPr: next });
       },
+      importEntries: (entries) => {
+        const cur = get().byPr;
+        const next = { ...cur };
+        let added = 0;
+        for (const [key, entry] of Object.entries(entries)) {
+          if (cur[key] && cur[key].generatedAt >= entry.generatedAt) continue;
+          next[key] = entry;
+          added++;
+        }
+        if (added > 0) set({ byPr: evict(next) });
+        return added;
+      },
+
       setActive: (key, layerId) => {
         const cur = get().byPr[key];
         if (!cur || cur.active === layerId) return;

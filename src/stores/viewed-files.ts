@@ -40,6 +40,13 @@ interface State {
    */
   scrollOffsets: Record<string, Record<string, number>>;
   setScrollOffset: (key: string, path: string, top: number) => void;
+  /**
+   * Merge viewed marks from an exported bundle. Union per key rather than
+   * newest-wins: these rows are already head-sha-keyed, so two machines writing
+   * the same key were looking at the same diff and both sets of marks are true.
+   * Returns how many keys were touched.
+   */
+  importViewed: (viewed: Record<string, Record<string, true>>) => number;
 }
 
 export function viewedKey(owner: string, repo: string, number: number, sha: string): string {
@@ -64,6 +71,20 @@ export const useViewedFiles = create<State>()(
         delete rest[key];
         set({ viewed: rest });
       },
+      importViewed: (incoming) => {
+        const cur = get().viewed;
+        const next = { ...cur };
+        let touched = 0;
+        for (const [key, paths] of Object.entries(incoming)) {
+          const merged = { ...(cur[key] ?? {}), ...paths };
+          if (Object.keys(merged).length === Object.keys(cur[key] ?? {}).length) continue;
+          next[key] = merged;
+          touched++;
+        }
+        if (touched > 0) set({ viewed: next });
+        return touched;
+      },
+
       collapsed: {},
       setCollapsed: (key, path, c) => {
         const current = get().collapsed[key] ?? {};
