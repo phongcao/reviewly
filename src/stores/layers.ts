@@ -11,6 +11,12 @@ export interface LayersEntry {
   headSha: string;
   /** Who produced it: an AI provider id, or "structure" for the offline split. */
   source: string;
+  /** Model that produced an AI plan, as the backend reported it (e.g.
+   * "claude-opus-5-5[1m]"). Absent for the structural split, older plans, and
+   * CLIs that don't report it while running on their default. */
+  model?: string;
+  /** Reasoning effort the plan was made with; absent = the CLI's default. */
+  effort?: string;
   /** Epoch ms when generated. */
   generatedAt: number;
   /** Layer id the reviewer is on. */
@@ -23,7 +29,11 @@ const MAX_ENTRIES = 40;
 interface State {
   /** Persisted plans keyed by `${owner}/${repo}#${number}`. */
   byPr: Record<string, LayersEntry>;
-  set: (key: string, plan: LayerPlan, meta: { headSha: string; source: string }) => void;
+  set: (
+    key: string,
+    plan: LayerPlan,
+    meta: { headSha: string; source: string; model?: string; effort?: string },
+  ) => void;
   reset: (key: string) => void;
   setActive: (key: string, layerId: string) => void;
   /** Merge plans from an exported bundle. Newer `generatedAt` wins per PR.
@@ -53,6 +63,8 @@ export const useLayers = create<State>()(
               plan,
               headSha: meta.headSha,
               source: meta.source,
+              ...(meta.model ? { model: meta.model } : {}),
+              ...(meta.effort ? { effort: meta.effort } : {}),
               generatedAt: Date.now(),
               active: plan.layers[0]?.id ?? "",
             },

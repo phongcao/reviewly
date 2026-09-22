@@ -12,6 +12,8 @@ interface AiDone {
   error?: string;
   provider?: string;
   headSha?: string;
+  model?: string | null;
+  effort?: string | null;
   canceled?: boolean;
 }
 
@@ -28,7 +30,7 @@ export function useLayersEvents() {
     let unsub: (() => void) | undefined;
     (async () => {
       unsub = await subscribe<AiDone>("ai:done", (e) => {
-        const { key, ok, output, error, provider, headSha, canceled } = e.payload;
+        const { key, ok, output, error, provider, headSha, model, effort, canceled } = e.payload;
         if (!key.startsWith(LAYERS_KEY_PREFIX)) return;
         const prKey = key.slice(LAYERS_KEY_PREFIX.length);
         const gen = useLayersGen.getState();
@@ -63,7 +65,12 @@ export function useLayersEvents() {
           toast.error(`Layering failed · ${ref}`);
           return;
         }
-        useLayers.getState().set(prKey, plan, { headSha: headSha ?? "", source: provider ?? "" });
+        useLayers.getState().set(prKey, plan, {
+          headSha: headSha ?? "",
+          source: provider ?? "",
+          model: model ?? undefined,
+          effort: effort ?? undefined,
+        });
         toast.success(`Layers ready · ${ref}`, {
           description: `${plan.layers.length} layers to read in order`,
         });

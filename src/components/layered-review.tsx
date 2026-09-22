@@ -6,6 +6,7 @@ import { type ContextOptions, type ReviewContext, buildLayerContext } from "@/li
 import { buildLayeredSystem } from "@/lib/ai/prompts";
 import { useAiAvailable } from "@/lib/ai/use-ai-available";
 import { useDeepTourRunner } from "@/lib/ai/use-deep-tour";
+import { relativeTime } from "@/lib/format";
 import {
   type LayerPlan,
   type LayerStats,
@@ -22,10 +23,16 @@ import {
 import type { PullFile } from "@/lib/tauri";
 import { invoke } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
-import { PROVIDER_LABEL, aiInvokeArgs, useAiProvider } from "@/stores/ai";
+import {
+  type AiProvider,
+  EFFORT_SHORT,
+  PROVIDER_LABEL,
+  aiInvokeArgs,
+  useAiProvider,
+} from "@/stores/ai";
 import { useDeepTour } from "@/stores/deep-tour";
 import { useDeepTourGen } from "@/stores/deep-tour-gen";
-import { useLayers } from "@/stores/layers";
+import { type LayersEntry, useLayers } from "@/stores/layers";
 import { useLayersGen } from "@/stores/layers-gen";
 import { useReviewPrefs } from "@/stores/review-prefs";
 import { useUi } from "@/stores/ui";
@@ -497,6 +504,13 @@ export function LayerBar(props: BarProps) {
               </Button>
             </TooltipFor>
           )}
+          {entry && entry.source !== "structure" && (
+            <TooltipFor label={planByline(entry).full}>
+              <span className="max-w-40 shrink-0 cursor-default truncate text-2xs text-muted-foreground/70">
+                {planByline(entry).short}
+              </span>
+            </TooltipFor>
+          )}
           <TooltipFor label="Split this PR again">
             <Button
               size="icon-xs"
@@ -581,4 +595,21 @@ export function LayerBar(props: BarProps) {
 
 function Shell({ children }: { children: ReactNode }) {
   return <div className="border-b border-hairline px-5 py-2.5">{children}</div>;
+}
+
+/** Who made an AI plan, for the layer bar: a terse "opus-5-5 · high" (the
+ *  `claude-` prefix and a `[1m]` context tag dropped to fit) and the full
+ *  story for its tooltip. Effort shows as "default" when none was sent — the
+ *  CLI's own setting applied. Plans from before this was recorded have no
+ *  model, so they show the provider instead. */
+function planByline(entry: LayersEntry): { short: string; full: string } {
+  const who = PROVIDER_LABEL[entry.source as AiProvider] ?? entry.source;
+  const effort = entry.effort ? (EFFORT_SHORT[entry.effort] ?? entry.effort) : "default";
+  const model = entry.model?.replace(/^claude-/, "").replace(/\[.*\]$/, "");
+  return {
+    short: `${model ?? who} · ${effort}`,
+    full: `Planned by ${who}${entry.model ? ` · ${entry.model}` : ""} · ${
+      entry.effort ? `${entry.effort} effort` : "default effort"
+    } · ${relativeTime(entry.generatedAt)}`,
+  };
 }

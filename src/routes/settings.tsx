@@ -28,6 +28,7 @@ import {
 import { invoke } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import {
+  type AiEffort,
   type AiProvider,
   CLI_PROVIDERS,
   MODEL_SUGGESTIONS,
@@ -215,6 +216,7 @@ export function SettingsPage() {
 
               {provider === "openai" ? <OpenAiConfig /> : <CliModelConfig provider={provider} />}
 
+              {provider === "claude" && <AiEffortConfig />}
               <AiTimeoutConfig />
 
               <AiInstructions />
@@ -934,6 +936,51 @@ function OpenAiField({
         className="w-full"
       />
     </label>
+  );
+}
+
+const EFFORT_OPTIONS: { value: string; label: string }[] = [
+  { value: "default", label: "Claude default" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "Extra high" },
+  { value: "max", label: "Max" },
+];
+
+/** Reasoning effort for Claude runs, sent as `--effort`. "Claude default"
+ *  sends nothing, so the CLI's own setting applies. */
+function AiEffortConfig() {
+  const effort = useAiProvider((s) => s.claudeEffort);
+  const setEffort = useAiProvider((s) => s.setClaudeEffort);
+  const value = effort ?? "default";
+  return (
+    <div className="mt-4 flex items-center justify-between gap-4 border-t border-hairline pt-4">
+      <div className="min-w-0">
+        <p className="text-xs font-medium text-foreground">Effort</p>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          How hard Claude thinks before answering. Higher is slower and costs more, but plans and
+          reviews are more careful.
+        </p>
+      </div>
+      <Select
+        value={value}
+        onValueChange={(v) => v && setEffort(v === "default" ? null : (v as AiEffort))}
+      >
+        <SelectTrigger size="sm" className="w-36 text-xs text-foreground">
+          <SelectValue>
+            {(v) => EFFORT_OPTIONS.find((o) => o.value === v)?.label ?? String(v)}
+          </SelectValue>
+        </SelectTrigger>
+        <SelectContent>
+          {EFFORT_OPTIONS.map((o) => (
+            <SelectItem key={o.value} value={o.value} className="text-xs">
+              {o.label}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
   );
 }
 

@@ -46,7 +46,16 @@ fn provider_bin(provider: &str) -> &str {
     }
 }
 
+/// A one-shot run's final text, plus the model that answered — as reported by
+/// the backend when it says (Claude), else the model that was asked for. `None`
+/// means "the CLI's own default, unreported".
+struct AiRun {
+    text: String,
+    model: Option<String>,
+}
+
 /// Dispatch a one-shot run to the selected backend and return its final text.
+#[allow(clippy::too_many_arguments)]
 async fn run_provider(
     provider: &str,
     prompt: &str,
@@ -55,13 +64,16 @@ async fn run_provider(
     model: Option<String>,
     api_key: Option<String>,
     timeout_secs: Option<u64>,
-) -> AppResult<String> {
-    match provider {
-        "codex" => run_codex(prompt, cwd, model.as_deref(), timeout_secs).await,
-        "gemini" => run_gemini(prompt, cwd, model.as_deref(), timeout_secs).await,
-        "openai" => run_openai_compatible(prompt, base_url, model, api_key, timeout_secs).await,
-        _ => run_claude(prompt, cwd, model.as_deref(), timeout_secs).await,
-    }
+    effort: Option<&str>,
+) -> AppResult<AiRun> {
+    let asked = model.as_deref().map(str::trim).filter(|m| !m.is_empty()).map(String::from);
+    let text = match provider {
+        "codex" => run_codex(prompt, cwd, model.as_deref(), timeout_secs).await?,
+        "gemini" => run_gemini(prompt, cwd, model.as_deref(), timeout_secs).await?,
+        "openai" => run_openai_compatible(prompt, base_url, model, api_key, timeout_secs).await?,
+        _ => return run_claude(prompt, cwd, model.as_deref(), timeout_secs, effort).await,
+    };
+    Ok(AiRun { text, model: asked })
 }
 
 /// Run the AI CLI inside the PR's local clone (when one exists) so the agent can
@@ -146,6 +158,51 @@ fn add_model(cmd: &mut Command, flag: &str, model: Option<&str>) {
     if let Some(m) = model.map(str::trim).filter(|m| !m.is_empty()) {
         cmd.arg(flag).arg(m);
     }
+}
+
+/// Levels `claude --effort` accepts. Anything else is dropped rather than
+/// passed through, so a stale setting can't fail every run.
+const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// The effort level to actually send: a known level, or `None` for the CLI's
+/// own default.
+fn effort_level(effort: Option<&str>) -> Option<&str> {
+    effort.map(str::trim).filter(|e| EFFORTS.contains(e))
+}
+
+/// Append Claude's `--effort` flag when a known level is configured.
+fn add_effort(cmd: &mut Command, effort: Option<&str>) {
+    if let Some(e) = effort_level(effort) {
+        cmd.arg("--effort").arg(e);
+    }
+}
+
+/// The model that did the bulk of a Claude run, from the `modelUsage` map in
+/// `--output-format json|stream-json` results. A run can touch more than one
+/// model (a small helper model runs alongside the main one), so pick the one
+/// that processed the most tokens.
+fn main_model(result: &serde_json::Value) -> Option<String> {
+    let usage = result.get("modelUsage")?.as_object()?;
+    let tokens = |u: &serde_json::Value| -> u64 {
+        ["inputTokens", "outputTokens", "cacheReadInputTokens", "cacheCreationInputTokens"]
+            .iter()
+            .filter_map(|k| u.get(*k).and_then(serde_json::Value::as_u64))
+            .sum()
+    };
+    usage.iter().max_by_key(|(_, u)| tokens(u)).map(|(name, _)| name.clone())
+}
+
+/// A parsed `claude -p --output-format json` result: the answer text, whether
+/// the CLI flagged the run as failed, and the model that answered. `None` when
+/// stdout isn't that JSON shape — the caller then treats it as plain text.
+fn parse_claude_json(stdout: &str) -> Option<(String, bool, Option<String>)> {
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).ok()?;
+    if v.get("type")?.as_str()? != "result" {
+        return None;
+    }
+    let text = v.get("result").and_then(serde_json::Value::as_str).unwrap_or("").trim().to_string();
+    let is_error = v.get("is_error").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    Some((text, is_error, main_model(&v)))
 }
 
 /// Turn a CLI failure (or a success with no output) into a *helpful* error.
@@ -247,13 +304,26 @@ pub async fn ai_review(
     model: Option<String>,
     api_key: Option<String>,
     timeout_secs: Option<u64>,
+    effort: Option<String>,
 ) -> AppResult<String> {
-    run_provider(&provider, &prompt, cwd.as_deref(), base_url, model, api_key, timeout_secs).await
+    run_provider(
+        &provider,
+        &prompt,
+        cwd.as_deref(),
+        base_url,
+        model,
+        api_key,
+        timeout_secs,
+        effort.as_deref(),
+    )
+    .await
+    .map(|r| r.text)
 }
 
 /// Run a review in the BACKGROUND, keyed by `key` (the PR). Returns immediately;
 /// the result is delivered via an `ai:done` event `{ key, ok, output|error,
-/// provider, headSha }`. Because the work runs in a Rust task (not tied to the
+/// provider, headSha, model?, effort? }` — `model` is the one that answered
+/// when known, `effort` the level that was sent (absent = the CLI's default). Because the work runs in a Rust task (not tied to the
 /// webview), it survives navigating away and webview refreshes — the event fires
 /// whenever it finishes and the reloaded UI's listener picks it up. `ai_inflight`
 /// lets the UI restore the "generating" state on mount.
@@ -270,6 +340,7 @@ pub async fn ai_review_bg(
     model: Option<String>,
     api_key: Option<String>,
     timeout_secs: Option<u64>,
+    effort: Option<String>,
 ) -> AppResult<()> {
     {
         let mut set = state.ai_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -283,9 +354,22 @@ pub async fn ai_review_bg(
     let head_sha = head_sha.unwrap_or_default();
     let task_key = key.clone();
     let handle = tauri::async_runtime::spawn(async move {
-        let result =
-            run_provider(&provider, &prompt, cwd.as_deref(), base_url, model, api_key, timeout_secs)
-                .await;
+        // Only Claude takes an effort level; don't report one the run never used.
+        let effort = match provider.as_str() {
+            "codex" | "gemini" | "openai" => None,
+            _ => effort_level(effort.as_deref()).map(String::from),
+        };
+        let result = run_provider(
+            &provider,
+            &prompt,
+            cwd.as_deref(),
+            base_url,
+            model,
+            api_key,
+            timeout_secs,
+            effort.as_deref(),
+        )
+        .await;
         if let Ok(mut set) = inflight.lock() {
             set.remove(&task_key);
         }
@@ -293,9 +377,10 @@ pub async fn ai_review_bg(
             t.remove(&task_key);
         }
         let payload = match result {
-            Ok(output) => serde_json::json!({
-                "key": task_key, "ok": true, "output": output,
+            Ok(run) => serde_json::json!({
+                "key": task_key, "ok": true, "output": run.text,
                 "provider": provider, "headSha": head_sha,
+                "model": run.model, "effort": effort,
             }),
             Err(e) => serde_json::json!({
                 "key": task_key, "ok": false, "error": e.to_string(),
@@ -364,19 +449,23 @@ async fn run_claude(
     cwd: Option<&str>,
     model: Option<&str>,
     timeout_secs: Option<u64>,
-) -> AppResult<String> {
+    effort: Option<&str>,
+) -> AppResult<AiRun> {
     let mut cmd = cli_command("claude");
     // Prompt goes over stdin, not argv: a large PR context could otherwise hit
     // the OS arg-length limit, while stdin has no such ceiling. `claude -p`
     // reads the query from stdin when no positional prompt is given.
+    // JSON rather than text output: the result also names the model that
+    // actually answered, which a blank Model setting otherwise hides.
     cmd.arg("-p")
         .arg("--output-format")
-        .arg("text")
+        .arg("json")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     add_model(&mut cmd, "--model", model);
+    add_effort(&mut cmd, effort);
     // With the PR's local clone present, let the review READ the repo
     // (read-only — no edits, no shell) so it can resolve its own questions from
     // the actual code instead of reasoning off the diff alone. Without a clone
@@ -402,22 +491,27 @@ async fn run_claude(
         }
     };
 
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Unparseable stdout is taken as plain text, so a CLI that stops speaking
+    // this JSON shape degrades to "model unknown" instead of failing the run.
+    let parsed = parse_claude_json(&stdout);
+    // The failure reason lives in `result`, not in the raw JSON — which would
+    // otherwise trip `cli_error`'s "model" check on the `modelUsage` key.
+    let detail = || match &parsed {
+        Some((text, _, _)) if !text.is_empty() => text.clone(),
+        _ => cli_detail(&output.stdout, &output.stderr),
+    };
     if !output.status.success() {
-        return Err(cli_error(
-            "claude",
-            &exit_code(&output.status),
-            &cli_detail(&output.stdout, &output.stderr),
-        ));
+        return Err(cli_error("claude", &exit_code(&output.status), &detail()));
     }
-    let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if out.is_empty() {
-        return Err(cli_error(
-            "claude",
-            "0",
-            &cli_detail(&output.stdout, &output.stderr),
-        ));
+    let (text, is_error, model) = match &parsed {
+        Some((text, is_error, model)) => (text.clone(), *is_error, model.clone()),
+        None => (stdout.trim().to_string(), false, None),
+    };
+    if is_error || text.is_empty() {
+        return Err(cli_error("claude", "0", &detail()));
     }
-    Ok(out)
+    Ok(AiRun { text, model })
 }
 
 /// Run the Claude CLI in *apply* mode — full edit + shell access — inside `cwd`,
@@ -676,6 +770,7 @@ pub async fn ai_stream(
     model: Option<String>,
     api_key: Option<String>,
     timeout_secs: Option<u64>,
+    effort: Option<String>,
 ) -> AppResult<()> {
     {
         let mut set = state.ai_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -698,6 +793,7 @@ pub async fn ai_stream(
             model,
             api_key,
             timeout_secs,
+            effort.as_deref(),
         )
         .await;
         if let Ok(mut s) = inflight.lock() {
@@ -725,6 +821,7 @@ pub async fn ai_stream(
 /// Returns (full_text, cost_usd). Claude and OpenAI-compatible stream live;
 /// codex/gemini have no clean token stream, so they run once and the whole
 /// result is emitted as a single chunk.
+#[allow(clippy::too_many_arguments)]
 async fn stream_provider(
     app: &AppHandle,
     key: &str,
@@ -735,12 +832,17 @@ async fn stream_provider(
     model: Option<String>,
     api_key: Option<String>,
     timeout_secs: Option<u64>,
+    effort: Option<&str>,
 ) -> AppResult<(String, Option<f64>)> {
     match provider {
-        "claude" => stream_claude(app, key, prompt, cwd, model.as_deref(), timeout_secs).await,
+        "claude" => {
+            stream_claude(app, key, prompt, cwd, model.as_deref(), timeout_secs, effort).await
+        }
         "openai" => stream_openai(app, key, prompt, base_url, model, api_key, timeout_secs).await,
         other => {
-            let text = run_provider(other, prompt, cwd, base_url, model, api_key, timeout_secs).await?;
+            let text = run_provider(other, prompt, cwd, base_url, model, api_key, timeout_secs, None)
+                .await?
+                .text;
             let _ = app.emit("ai:chunk", serde_json::json!({ "key": key, "delta": text }));
             Ok((text, None))
         }
@@ -754,6 +856,7 @@ async fn stream_claude(
     cwd: Option<&str>,
     model: Option<&str>,
     timeout_secs: Option<u64>,
+    effort: Option<&str>,
 ) -> AppResult<(String, Option<f64>)> {
     let mut cmd = cli_command("claude");
     // Prompt over stdin (not argv) so a large PR context can't hit the OS
@@ -768,6 +871,7 @@ async fn stream_claude(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     add_model(&mut cmd, "--model", model);
+    add_effort(&mut cmd, effort);
     apply_cwd(&mut cmd, cwd);
     let mut child = cmd
         .spawn()
@@ -949,4 +1053,46 @@ async fn stream_openai(
 #[tauri::command]
 pub fn path_is_dir(path: String) -> bool {
     std::path::Path::new(&path).is_dir()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_json_reports_the_main_model() {
+        // Trimmed from a real `claude -p --output-format json` run: a helper
+        // model ran alongside, with more OUTPUT tokens but far less work.
+        let out = r#"{"type":"result","is_error":false,"result":" ok ","modelUsage":{
+            "claude-haiku-4-5-20251001":{"inputTokens":897,"outputTokens":9},
+            "claude-opus-5-5[1m]":{"inputTokens":2,"outputTokens":4,"cacheReadInputTokens":21188,"cacheCreationInputTokens":14069}}}"#;
+        let (text, is_error, model) = parse_claude_json(out).unwrap();
+        assert_eq!(text, "ok");
+        assert!(!is_error);
+        assert_eq!(model.as_deref(), Some("claude-opus-5-5[1m]"));
+    }
+
+    #[test]
+    fn claude_json_error_and_missing_usage() {
+        let out = r#"{"type":"result","is_error":true,"result":"Not logged in"}"#;
+        let (text, is_error, model) = parse_claude_json(out).unwrap();
+        assert_eq!(text, "Not logged in");
+        assert!(is_error);
+        assert_eq!(model, None);
+    }
+
+    #[test]
+    fn non_json_stdout_is_not_parsed() {
+        assert!(parse_claude_json("plain answer").is_none());
+        assert!(parse_claude_json(r#"{"layers":[]}"#).is_none());
+    }
+
+    #[test]
+    fn effort_accepts_only_known_levels() {
+        assert_eq!(effort_level(Some(" high ")), Some("high"));
+        assert_eq!(effort_level(Some("xhigh")), Some("xhigh"));
+        assert_eq!(effort_level(Some("")), None);
+        assert_eq!(effort_level(Some("extreme")), None);
+        assert_eq!(effort_level(None), None);
+    }
 }

@@ -26,14 +26,27 @@ export const MODEL_SUGGESTIONS: Record<AiProvider, string[]> = {
     "sonnet",
     "opus",
     "haiku",
-    "claude-opus-4-8",
-    "claude-sonnet-4-6",
+    "claude-opus-5-5",
+    "claude-sonnet-5",
     "claude-haiku-4-5-20251001",
-    "claude-fable-5",
+    "claude-fable-5-1",
   ],
   codex: ["gpt-5-codex", "gpt-5", "o3", "o4-mini", "gpt-4.1"],
   gemini: ["gemini-2.5-pro", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.0-flash-exp"],
   openai: [],
+};
+
+/** Reasoning-effort levels `claude --effort` accepts, lowest first. */
+export const AI_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type AiEffort = (typeof AI_EFFORTS)[number];
+
+/** Short effort text for tight spots, e.g. the layer bar's "opus-5-5 · med". */
+export const EFFORT_SHORT: Record<string, string> = {
+  low: "low",
+  medium: "med",
+  high: "high",
+  xhigh: "xhigh",
+  max: "max",
 };
 
 interface State {
@@ -52,6 +65,10 @@ interface State {
   /** Optional model override per CLI provider (claude/codex/gemini). Empty = the CLI's own default. */
   cliModels: Partial<Record<AiProvider, string>>;
   setCliModel: (provider: AiProvider, model: string) => void;
+  /** Reasoning effort for Claude runs. `null` = the CLI's own default. Only
+   * Claude's CLI takes one, so other providers ignore it. */
+  claudeEffort: AiEffort | null;
+  setClaudeEffort: (effort: AiEffort | null) => void;
   /** How long an AI run may take before it's stopped, in seconds. `null` =
    * automatic (the backend picks 3 min, or 7 min when the PR's clone is present). */
   aiTimeoutSecs: number | null;
@@ -70,6 +87,8 @@ export const useAiProvider = create<State>()(
       cliModels: {},
       setCliModel: (provider, model) =>
         set((s) => ({ cliModels: { ...s.cliModels, [provider]: model } })),
+      claudeEffort: null,
+      setClaudeEffort: (claudeEffort) => set({ claudeEffort }),
       aiTimeoutSecs: null,
       setAiTimeoutSecs: (aiTimeoutSecs) => set({ aiTimeoutSecs }),
     }),
@@ -88,13 +107,15 @@ export function aiInvokeArgs(): {
   model?: string;
   apiKey?: string;
   timeoutSecs?: number;
+  effort?: AiEffort;
 } {
   const s = useAiProvider.getState();
   // `null`/0 → omit so the Rust side keeps its automatic default.
   const timeout = s.aiTimeoutSecs && s.aiTimeoutSecs > 0 ? { timeoutSecs: s.aiTimeoutSecs } : {};
   if (s.provider !== "openai") {
     const model = s.cliModels[s.provider]?.trim();
-    return { provider: s.provider, ...(model ? { model } : {}), ...timeout };
+    const effort = s.provider === "claude" && s.claudeEffort ? { effort: s.claudeEffort } : {};
+    return { provider: s.provider, ...(model ? { model } : {}), ...effort, ...timeout };
   }
   return { provider: s.provider, baseUrl: s.baseUrl, model: s.model, apiKey: s.apiKey, ...timeout };
 }

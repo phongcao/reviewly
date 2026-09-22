@@ -111,17 +111,22 @@ export function buildLayeredSystem(o: { layers: CountBand; size: PrSize }): stri
 A layer is a set of changed files that share ONE idea, so a reviewer can hold it in their head and finish it before moving on. "Same idea" — not "same folder". The migration and the model it backs belong together even in different directories; two unrelated features under src/ do not belong together just because they're both under src/.
 
 ## The order is the point
-Order layers so each one is understandable using only what came before it:
-1. Foundations first — schema / migrations / data model, then the types and contracts written against them.
-2. Then the logic that uses those foundations, then the surface that exposes it (API, routes, commands), then the UI that consumes it.
-3. Then tests, then config / CI, then generated files and lockfiles LAST — they're skimmed, not read.
-A reviewer landing on layer 3 should never have to say "wait, what is this type?" — that type should have been layer 1. When two layers are independent, put the riskier one first.
+Order layers so each one is understandable using only what came before it. Follow these positions as written rather than reordering by taste — the same PR should always read in the same order:
+1. Design context — ADRs, RFCs, design and architecture docs that say what is being built and why. They make every later layer faster to follow. Only when the PR contains such docs; never make this layer out of code.
+2. Foundations — schema / migrations / data model, then the types and contracts written against them.
+3. The logic that uses those foundations, then the surface that exposes it (API, routes, commands), then the UI that consumes it.
+4. Tests — what the code above claims to guarantee.
+5. Config / CI.
+6. User-facing docs — the top-level README, setup and usage guides, changelogs. Read once the code is known, so the reviewer can check them against it.
+7. Generated files and lockfiles LAST — they're skimmed, not read.
+A reviewer landing on layer 3 should never have to say "wait, what is this type?" — that type should have been an earlier layer. Skip any position the PR has nothing for. When two layers sit at the same position and are independent, put the riskier one first.
 
 ## Rules you cannot break
 - EVERY changed file appears in EXACTLY ONE layer. Not zero, not two. The complete list is given to you under "## Complete file list" — use it as your checklist and account for every entry.
 - Copy paths VERBATIM from that list. Never invent, abbreviate, re-case, or glob a path; never write "src/**" or "the rest of the components". If a path isn't in the list, it doesn't exist.
 - ${o.layers.min} to ${o.layers.max} layers for a PR this size (${o.size.files} changed files). Aim near the top of that range on a big PR. A layer of one important file is fine; twenty tiny layers is not a layering, and neither is one layer holding everything.
 - Group the noise: lockfiles, snapshots, and generated output all go in ONE trailing layer, never scattered.
+- Sort docs by what they say, not where they live: a doc that records a decision or explains the design is design context (position 1); one that tells someone how to set up, run, or use the system is user-facing (position 6). The one exception is a README sitting beside the code it documents (e.g. \`db/README.md\`) — it joins that code's layer.
 
 ## Fields
 - "title": 2-4 words naming the idea, not the folder ("Token refresh", "Rate-limit middleware" — not "src/auth changes").
