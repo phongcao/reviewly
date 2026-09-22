@@ -302,6 +302,9 @@ export function DiffViewer({
   const lang = useMemo(() => detectLanguage(path), [path]);
   const bounds = useMemo(() => hunks.map(hunkBounds), [hunks]);
   const rootRef = useRef<HTMLDivElement>(null);
+  // The rendered Markdown alone — not the file toolbar above it — so selecting
+  // the header's text never offers to attach it.
+  const proseRef = useRef<HTMLDivElement>(null);
 
   // Line-wrapping + whitespace-only collapsing are review-wide prefs.
   const diffWrap = useReviewPrefs((s) => s.diffWrap);
@@ -637,21 +640,37 @@ export function DiffViewer({
   );
 
   // Rendered Markdown replaces the rows entirely — the diff's line gutters,
-  // comment popovers and context expanders have nothing to attach to in prose.
-  // The toolbar stays put so one click is always the way back.
+  // comment popovers and context expanders have nothing to attach to in prose;
+  // only the "Ask AI" selection toolbar carries over. The file toolbar stays
+  // put so one click is always the way back.
   if (showPreview) {
     return (
       <div ref={rootRef}>
         {toolbar}
-        <MarkdownPreview
+        {/* Prose has no line rows, but it's still what the reviewer is reading:
+            highlight a passage and it pins to the chat as quoted text plus the
+            source lines behind it. */}
+        <DiffSelectionToolbar
+          rootRef={proseRef}
           path={path}
-          owner={owner}
-          repo={repo}
-          headSha={headSha}
+          patch={patch}
+          view="prose"
+          prKey={`${owner}/${repo}#${number}`}
           fileLines={fileLines}
-          hunks={hunks}
-          loading={fileLinesLoading}
+          onAskAi={onAskAi}
+          onPeek={onPeek}
         />
+        <div ref={proseRef}>
+          <MarkdownPreview
+            path={path}
+            owner={owner}
+            repo={repo}
+            headSha={headSha}
+            fileLines={fileLines}
+            hunks={hunks}
+            loading={fileLinesLoading}
+          />
+        </div>
         <div ref={endRef} aria-hidden className="h-px" />
       </div>
     );

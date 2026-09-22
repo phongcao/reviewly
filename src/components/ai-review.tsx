@@ -392,11 +392,11 @@ export function AiReview({ prKey, context, executeAction, files }: Props) {
 
 /** One attached snippet/file on the composer, with a remove affordance. */
 function ContextChip({ refItem, onRemove }: { refItem: PrContextRef; onRemove: () => void }) {
-  const Icon = refItem.kind === "snippet" ? TextQuote : FileCode;
+  const Icon = refItem.kind === "snippet" || refItem.quote ? TextQuote : FileCode;
   const label = refLabel(refItem);
   return (
     <span
-      title={refItem.path}
+      title={refItem.quote ? `${refItem.path}\n\n“${refItem.quote}”` : refItem.path}
       className="inline-flex items-center gap-1 rounded-md bg-primary/15 px-1.5 py-0.5 font-mono text-2xs font-medium text-primary"
     >
       <Icon className="size-3 shrink-0" />

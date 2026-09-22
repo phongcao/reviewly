@@ -1,8 +1,9 @@
 import { GhAttachment, isGhAttachmentUrl } from "@/components/gh-attachment";
 import { safeOpenUrl } from "@/lib/ui";
 import { cn } from "@/lib/utils";
+import type { Element, Root, RootContent } from "hast";
 import { Children, type ComponentPropsWithoutRef, type ReactNode, isValidElement } from "react";
-import ReactMarkdown, { type UrlTransform } from "react-markdown";
+import ReactMarkdown, { type Options, type UrlTransform } from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
@@ -16,6 +17,12 @@ interface Props {
    * left as-authored (react-markdown's own protocol filtering still applies).
    */
   urlTransform?: UrlTransform;
+  /**
+   * Stamp each rendered element with the source lines it came from
+   * (`data-source-start` / `data-source-end`), so a text selection in the
+   * rendered document can be mapped back to the file — see `refFromProse`.
+   */
+  sourceLines?: boolean;
 }
 
 // Allow GitHub-flavored details/summary and the usual rehype-sanitize defaults.
@@ -65,6 +72,30 @@ function MarkdownImage({ src, alt }: ComponentPropsWithoutRef<"img">) {
   return <img src={src} alt={alt ?? ""} />;
 }
 
+/**
+ * Rehype plugin behind `sourceLines`. Runs after sanitize, so the attributes
+ * don't need allow-listing — and survive because hast positions are kept
+ * through both rehype-raw and rehype-sanitize.
+ */
+function rehypeSourceLines() {
+  const walk = (nodes: RootContent[]) => {
+    for (const n of nodes) {
+      if (n.type !== "element") continue;
+      const el = n as Element;
+      if (el.position) {
+        el.properties.dataSourceStart = el.position.start.line;
+        el.properties.dataSourceEnd = el.position.end.line;
+      }
+      walk(el.children);
+    }
+  };
+  return (tree: Root) => walk(tree.children);
+}
+
+type Plugins = NonNullable<Options["rehypePlugins"]>;
+const rehypePlugins: Plugins = [rehypeRaw, [rehypeSanitize, schema]];
+const rehypePluginsWithLines: Plugins = [...rehypePlugins, rehypeSourceLines];
+
 const components = {
   a: ExternalLink,
   img: MarkdownImage,
@@ -77,13 +108,13 @@ const components = {
  * clicks to the OS browser, and proxies GitHub-hosted media through Rust
  * with our auth token so screenshots/videos load.
  */
-export function MarkdownBody({ children, className, urlTransform }: Props) {
+export function MarkdownBody({ children, className, urlTransform, sourceLines }: Props) {
   if (!children) return null;
   return (
     <div className={cn("prose-reviewly", className)}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeRaw, [rehypeSanitize, schema]]}
+        rehypePlugins={sourceLines ? rehypePluginsWithLines : rehypePlugins}
         components={components}
         urlTransform={urlTransform}
       >

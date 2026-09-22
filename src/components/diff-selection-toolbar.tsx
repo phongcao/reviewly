@@ -1,4 +1,10 @@
-import { type PrContextRef, buildSnippet, refFromSelection, refLocation } from "@/lib/ai/attach";
+import {
+  type PrContextRef,
+  buildSnippet,
+  refFromProse,
+  refFromSelection,
+  refLocation,
+} from "@/lib/ai/attach";
 import { attachContext } from "@/lib/ai/attach-bridge";
 import type { ReviewLocation } from "@/lib/review-context";
 import { GitCompare, PanelRight, Sparkles } from "lucide-react";
@@ -9,7 +15,9 @@ interface Props {
   rootRef: RefObject<HTMLDivElement | null>;
   path: string;
   patch: string | null;
-  view: "unified" | "split";
+  /** `prose` = the rendered Markdown preview: no diff rows, so the selection
+   * maps through source positions and carries the highlighted text itself. */
+  view: "unified" | "split" | "prose";
   /** Conversation key, `owner/repo#number`. */
   prKey: string;
   /** HEAD file content, so a range inside an expanded context gap still resolves. */
@@ -58,7 +66,8 @@ export function DiffSelectionToolbar({
       hide();
       return;
     }
-    const ref = refFromSelection(root, path, view, sel);
+    const ref =
+      view === "prose" ? refFromProse(root, path, sel) : refFromSelection(root, path, view, sel);
     if (!ref) {
       hide();
       return;
@@ -124,9 +133,11 @@ export function DiffSelectionToolbar({
   if (!rect || !refRef.current) return null;
   const ref = refRef.current;
   const label =
-    ref.to != null && ref.from != null && ref.to !== ref.from
-      ? `Lines ${ref.from}–${ref.to}`
-      : `Line ${ref.from}`;
+    ref.from == null
+      ? "Selection"
+      : ref.to != null && ref.to !== ref.from
+        ? `Lines ${ref.from}–${ref.to}`
+        : `Line ${ref.from}`;
 
   // Width grew with the second action, so centre against a wider bar and keep
   // the whole thing on screen.
@@ -153,10 +164,21 @@ export function DiffSelectionToolbar({
       <button
         type="button"
         onClick={() => {
-          attachContext(prKey, {
-            ...ref,
-            code: buildSnippet(patch, ref.side ?? "RIGHT", ref.from ?? 0, ref.to ?? 0, fileLines),
-          });
+          attachContext(
+            prKey,
+            ref.from == null
+              ? ref
+              : {
+                  ...ref,
+                  code: buildSnippet(
+                    patch,
+                    ref.side ?? "RIGHT",
+                    ref.from,
+                    ref.to ?? ref.from,
+                    fileLines,
+                  ),
+                },
+          );
           clear();
           onAskAi?.();
         }}

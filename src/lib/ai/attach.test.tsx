@@ -1,4 +1,15 @@
-import { refForFile, refFromLines, refFromSelection, refLocation } from "@/lib/ai/attach";
+import { MarkdownBody } from "@/components/markdown-body";
+import {
+  buildFocusedContext,
+  echoRefs,
+  refForFile,
+  refFromLines,
+  refFromProse,
+  refFromSelection,
+  refLocation,
+} from "@/lib/ai/attach";
+import type { PullFile } from "@/lib/tauri";
+import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it } from "vitest";
 
 /**
@@ -148,5 +159,132 @@ describe("refFromSelection → refLocation", () => {
     const sel = window.getSelection() as Selection;
     sel.removeAllRanges();
     expect(refFromSelection(root, "src/a.ts", "unified", sel)).toBeNull();
+  });
+});
+
+/**
+ * The Markdown-preview path: there are no diff rows in rendered prose, so the
+ * selection maps back through the source positions `MarkdownBody` stamps on
+ * its elements. Rendered for real, so a change in how positions survive
+ * rehype-raw / rehype-sanitize shows up here.
+ */
+function renderProse(md: string, sourceLines = true): HTMLElement {
+  const root = document.createElement("div");
+  root.innerHTML = renderToStaticMarkup(
+    <MarkdownBody sourceLines={sourceLines}>{md}</MarkdownBody>,
+  );
+  document.body.appendChild(root);
+  return root;
+}
+
+/** Select `text` (a substring of one text node) through the end of `endText`. */
+function selectText(root: HTMLElement, text: string, endText = text): Selection {
+  const nodes: Text[] = [];
+  const w = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  for (let n = w.nextNode(); n; n = w.nextNode()) nodes.push(n as Text);
+  const start = nodes.find((n) => n.data.includes(text)) as Text;
+  const end = nodes.find((n) => n.data.includes(endText)) as Text;
+  const range = document.createRange();
+  range.setStart(start, start.data.indexOf(text));
+  range.setEnd(end, end.data.indexOf(endText) + endText.length);
+  const sel = window.getSelection() as Selection;
+  sel.removeAllRanges();
+  sel.addRange(range);
+  return sel;
+}
+
+const README = "# Setup\n\nRun **bun install** first.\nThen start it.\n\n- one\n- two\n";
+
+describe("refFromProse", () => {
+  it("maps a highlight to the source lines it was rendered from, and keeps the text", () => {
+    const root = renderProse(README);
+    const ref = refFromProse(root, "README.md", selectText(root, "one", "two"));
+    expect(ref).toMatchObject({
+      kind: "snippet",
+      path: "README.md",
+      side: "RIGHT",
+      from: 6,
+      to: 7,
+    });
+    expect(ref?.quote).toBe("one\ntwo");
+  });
+
+  it("narrows to the inline element a word sits in", () => {
+    const root = renderProse(README);
+    const ref = refFromProse(root, "README.md", selectText(root, "bun install"));
+    expect(ref?.from).toBe(3);
+    expect(ref?.to).toBe(3);
+  });
+
+  it("doesn't claim a block the range only touches at offset 0", () => {
+    // What a triple-click produces: the range ends at the start of the next block.
+    const root = renderProse(README);
+    const h1 = root.querySelector("h1")?.firstChild as Text;
+    const li = root.querySelector("li")?.firstChild as Text;
+    const range = document.createRange();
+    range.setStart(h1, 0);
+    range.setEnd(li, 0);
+    const sel = window.getSelection() as Selection;
+    sel.removeAllRanges();
+    sel.addRange(range);
+    const ref = refFromProse(root, "README.md", sel);
+    expect(ref?.from).toBe(1);
+    expect(ref?.to).toBe(4);
+  });
+
+  it("still attaches path + quote when the render has no source positions", () => {
+    const root = renderProse(README, false);
+    const ref = refFromProse(root, "README.md", selectText(root, "Then start it."));
+    expect(ref).toMatchObject({ kind: "file", path: "README.md", quote: "Then start it." });
+    expect(ref?.from).toBeUndefined();
+  });
+
+  it("gives two highlights in the same paragraph different ids", () => {
+    const root = renderProse("Alpha beta gamma.\n");
+    const a = refFromProse(root, "a.md", selectText(root, "Alpha"));
+    const b = refFromProse(root, "a.md", selectText(root, "gamma"));
+    expect(a?.id).not.toBe(b?.id);
+  });
+});
+
+describe("quote refs in the prompt", () => {
+  const file = {
+    filename: "README.md",
+    patch: "@@ -1,2 +1,3 @@\n # Setup\n+\n+Run **bun install** first.",
+  } as PullFile;
+
+  it("sends the highlighted text and the source lines behind it", () => {
+    const out = buildFocusedContext(
+      [
+        {
+          id: "q",
+          kind: "snippet",
+          path: "README.md",
+          side: "RIGHT",
+          from: 3,
+          to: 3,
+          quote: "Run bun install first.",
+        },
+      ],
+      [file],
+    );
+    expect(out).toContain("## README.md:3 (text highlighted in the rendered document)");
+    expect(out).toContain("> Run bun install first.");
+    expect(out).toContain("+3\tRun **bun install** first.");
+  });
+
+  it("sends just the quote when there are no lines to show", () => {
+    const out = buildFocusedContext(
+      [{ id: "q", kind: "file", path: "README.md", quote: "Then start it." }],
+      [file],
+    );
+    expect(out).toContain("> Then start it.");
+    expect(out).not.toContain("Source lines");
+  });
+
+  it("echoes the quote into the transcript", () => {
+    expect(echoRefs([{ id: "q", kind: "file", path: "README.md", quote: "Then\nstart it." }])).toBe(
+      "> 📎 `README.md` “Then start it.”",
+    );
   });
 });

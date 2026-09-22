@@ -45,13 +45,17 @@ export function MarkdownPreview({
 }: Props) {
   const source = useMemo(() => {
     if (fileLines && fileLines.length > 0) {
-      return { text: fileLines.join("\n"), complete: true, fromPatch: false };
+      return { text: fileLines.join("\n"), complete: true, fromPatch: false, lineMapped: true };
     }
     // A deleted file has no HEAD blob; show what the patch removed rather
     // than an empty pane.
     const next = sideText(hunks, "new");
-    const src = next.text.trim() ? next : sideText(hunks, "old");
-    return { ...src, fromPatch: true };
+    if (next.text.trim()) {
+      // A complete new side starts at line 1 with no gaps, so its lines ARE
+      // the file's; a partial one has its unchanged stretches squeezed out.
+      return { ...next, fromPatch: true, lineMapped: next.complete };
+    }
+    return { ...sideText(hunks, "old"), fromPatch: true, lineMapped: false };
   }, [fileLines, hunks]);
 
   const ref = useMemo<RepoRef>(
@@ -79,7 +83,13 @@ export function MarkdownPreview({
         </div>
       )}
       {source.text.trim() ? (
-        <MarkdownBody className="max-w-[72ch]" urlTransform={urlTransform}>
+        <MarkdownBody
+          className="max-w-[72ch]"
+          urlTransform={urlTransform}
+          // Only when the rendered text lines up with the file's head line
+          // numbers — otherwise a highlight would claim the wrong lines.
+          sourceLines={source.lineMapped}
+        >
           {source.text}
         </MarkdownBody>
       ) : (
