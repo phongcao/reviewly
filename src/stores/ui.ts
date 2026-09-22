@@ -37,6 +37,11 @@ interface UiState {
   setFocusMode: (v: boolean) => void;
   toggleFocusMode: () => void;
 
+  /** Shrink the PR header and layer briefing to one line each, so the file
+   * tree and diff get the height. */
+  compactChrome: boolean;
+  toggleCompactChrome: () => void;
+
   /** Zoom level. 1 = default. Stored as a multiplier applied to html root font-size. */
   zoom: number;
   setZoom: (z: number) => void;
@@ -97,6 +102,9 @@ export const useUi = create<UiState>()(
       setFocusMode: (focusMode) => set({ focusMode }),
       toggleFocusMode: () => set((s) => ({ focusMode: !s.focusMode })),
 
+      compactChrome: false,
+      toggleCompactChrome: () => set((s) => ({ compactChrome: !s.compactChrome })),
+
       zoom: 1,
       setZoom: (zoom) => set({ zoom }),
       zoomIn: () => set((s) => ({ zoom: snapZoom(s.zoom, 1) })),
@@ -107,7 +115,10 @@ export const useUi = create<UiState>()(
       name: "reviewly.ui",
       storage:
         sqlStorage<
-          Pick<UiState, "diffView" | "diffLayout" | "sidebarCollapsed" | "zoom" | "focusMode">
+          Pick<
+            UiState,
+            "diffView" | "diffLayout" | "sidebarCollapsed" | "zoom" | "focusMode" | "compactChrome"
+          >
         >(),
       // Persist genuine prefs; transient flags (palette/about) stay in memory.
       partialize: (s) => ({
@@ -116,6 +127,7 @@ export const useUi = create<UiState>()(
         sidebarCollapsed: s.sidebarCollapsed,
         zoom: s.zoom,
         focusMode: s.focusMode,
+        compactChrome: s.compactChrome,
       }),
     },
   ),

@@ -73,6 +73,8 @@ const GROUPS: Group[] = [
       { keys: ["c"], label: "Next file with unresolved comments" },
       { keys: ["m"], label: "Toggle rendered Markdown for the current file" },
       { keys: ["\\"], label: "Toggle the review context pane" },
+      { keys: ["t"], label: "Toggle the file tree" },
+      { keys: ["z"], label: "Toggle compact header" },
       { keys: ["⌘", "B"], label: "Toggle unified / split diff" },
       { keys: ["⌘", "F"], label: "Find in diff" },
       { keys: ["⌘", "P"], label: "Filter files" },
