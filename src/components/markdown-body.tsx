@@ -1,9 +1,10 @@
 import { GhAttachment, isGhAttachmentUrl } from "@/components/gh-attachment";
+import { MermaidDiagram } from "@/components/mermaid-diagram";
 import { safeOpenUrl } from "@/lib/ui";
 import { cn } from "@/lib/utils";
 import type { Element, Root, RootContent } from "hast";
 import { Children, type ComponentPropsWithoutRef, type ReactNode, isValidElement } from "react";
-import ReactMarkdown, { type Options, type UrlTransform } from "react-markdown";
+import ReactMarkdown, { type ExtraProps, type Options, type UrlTransform } from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
@@ -72,6 +73,28 @@ function MarkdownImage({ src, alt }: ComponentPropsWithoutRef<"img">) {
   return <img src={src} alt={alt ?? ""} />;
 }
 
+/** The source of a ```mermaid fence, or null for any other `<pre>`. */
+function mermaidSource(pre: Element | undefined): string | null {
+  const code = pre?.children.find((c): c is Element => c.type === "element");
+  if (!code || code.tagName !== "code") return null;
+  const cls = code.properties.className;
+  if (!Array.isArray(cls) || !cls.includes("language-mermaid")) return null;
+  let text = "";
+  for (const c of code.children) if (c.type === "text") text += c.value;
+  return text.trim() ? text : null;
+}
+
+function MarkdownPre({ node, ...rest }: ComponentPropsWithoutRef<"pre"> & ExtraProps) {
+  const diagram = mermaidSource(node);
+  if (diagram != null) {
+    // `rest` carries any data-source-* line stamps, so the diagram still maps
+    // back to its fence for selection → Ask AI.
+    const { children: _code, ...attrs } = rest;
+    return <MermaidDiagram {...attrs} code={diagram} />;
+  }
+  return <pre {...rest} />;
+}
+
 /**
  * Rehype plugin behind `sourceLines`. Runs after sanitize, so the attributes
  * don't need allow-listing — and survive because hast positions are kept
@@ -99,12 +122,14 @@ const rehypePluginsWithLines: Plugins = [...rehypePlugins, rehypeSourceLines];
 const components = {
   a: ExternalLink,
   img: MarkdownImage,
+  pre: MarkdownPre,
 };
 
 /**
  * Render a GitHub-style markdown body (review body, comment, issue) with
  * the project's `.prose-reviewly` theme. Supports embedded HTML like
- * `<details>` blocks, silently drops HTML comments, routes all link
+ * `<details>` blocks, renders ```mermaid fences as diagrams, silently drops
+ * HTML comments, routes all link
  * clicks to the OS browser, and proxies GitHub-hosted media through Rust
  * with our auth token so screenshots/videos load.
  */
