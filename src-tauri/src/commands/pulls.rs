@@ -240,3 +240,39 @@ pub async fn gh_get_file_content(
         .map_err(|e| AppError::Other(format!("base64: {e}")))?;
     String::from_utf8(bytes).map_err(|e| AppError::Other(format!("utf8: {e}")))
 }
+
+/// Fetch a file's raw bytes at `ref` as a `data:<mime>;base64,…` URL, for
+/// previewing binary files (images) that have no text diff. Uses the raw media
+/// type rather than the JSON `content` field, which is empty past 1 MB.
+#[tauri::command]
+pub async fn gh_get_file_data_url(
+    state: State<'_, AppState>,
+    owner: String,
+    repo: String,
+    path: String,
+    r#ref: String,
+) -> AppResult<String> {
+    use base64::Engine;
+    use crate::commands::git::{image_mime, MAX_IMAGE_BYTES};
+
+    let token = creds::require_token()?;
+    let url = format!("https://api.github.com/repos/{owner}/{repo}/contents/{path}");
+    let res = github::auth_request(&state, &token, reqwest::Method::GET, &url)
+        .header("Accept", "application/vnd.github.raw+json")
+        .query(&[("ref", r#ref.as_str())])
+        .send()
+        .await?;
+    let res = crate::clients::check(res).await?;
+    if res.content_length().is_some_and(|n| n > MAX_IMAGE_BYTES) {
+        return Err(AppError::Other("image too large to preview".into()));
+    }
+    let bytes = res.bytes().await?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return Err(AppError::Other("image too large to preview".into()));
+    }
+    Ok(format!(
+        "data:{};base64,{}",
+        image_mime(&path),
+        base64::engine::general_purpose::STANDARD.encode(&bytes)
+    ))
+}

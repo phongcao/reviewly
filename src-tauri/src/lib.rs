@@ -281,6 +281,7 @@ pub fn run() {
             commands::pulls::gh_required_contexts,
             commands::pulls::gh_rerun_check,
             commands::pulls::gh_get_file_content,
+            commands::pulls::gh_get_file_data_url,
             // local git workspace
             commands::git::git_repo_info,
             commands::git::git_clone,
@@ -376,6 +377,8 @@ pub fn run() {
             commands::ai::ai_review,
             commands::ai::ai_review_bg,
             commands::ai::ai_stream,
+            commands::ai::ai_stream_state,
+            commands::ai::ai_stream_claim,
             commands::ai::ai_inflight,
             commands::ai::ai_cancel,
             commands::ai::path_is_dir,

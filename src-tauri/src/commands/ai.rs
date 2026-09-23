@@ -1,8 +1,8 @@
 use crate::error::{AppError, AppResult};
-use crate::state::AppState;
+use crate::state::{AppState, ChatStream};
 use std::process::Stdio;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 
@@ -412,6 +412,9 @@ pub fn ai_cancel(app: AppHandle, state: State<'_, AppState>, key: String) {
     if let Ok(mut s) = state.ai_inflight.lock() {
         s.remove(&key);
     }
+    if let Ok(mut m) = state.ai_streams.lock() {
+        m.remove(&key);
+    }
     if was_running {
         let _ = app.emit(
             "ai:done",
@@ -779,8 +782,12 @@ pub async fn ai_stream(
         }
         set.insert(key.clone());
     }
+    if let Ok(mut m) = state.ai_streams.lock() {
+        m.insert(key.clone(), ChatStream::default());
+    }
     let inflight = state.ai_inflight.clone();
     let tasks = state.ai_tasks.clone();
+    let streams = state.ai_streams.clone();
     let task_key = key.clone();
     let handle = tauri::async_runtime::spawn(async move {
         let result = stream_provider(
@@ -810,12 +817,44 @@ pub async fn ai_stream(
                 "key": task_key, "ok": false, "error": e.to_string(),
             }),
         };
+        // Park the result before announcing it, so a window that mounts after
+        // this event (or had no chat open) can still claim it.
+        if let Ok(mut m) = streams.lock() {
+            m.entry(task_key.clone()).or_default().done = Some(payload.clone());
+        }
         let _ = app.emit("ai:complete", payload);
     });
     if let Ok(mut t) = state.ai_tasks.lock() {
         t.insert(key, handle);
     }
     Ok(())
+}
+
+/// Forward a streamed token to every window, recording it first so a chat
+/// surface that mounts mid-turn can catch up via `ai_stream_state`.
+fn emit_chunk(app: &AppHandle, key: &str, delta: &str) {
+    if let Ok(mut m) = app.state::<AppState>().ai_streams.lock() {
+        if let Some(s) = m.get_mut(key) {
+            s.text.push_str(delta);
+        }
+    }
+    let _ = app.emit("ai:chunk", serde_json::json!({ "key": key, "delta": delta }));
+}
+
+/// The chat turn for `key` that no window has committed yet: still streaming
+/// (`done` is null, `text` is the partial answer) or finished and unclaimed.
+#[tauri::command]
+pub fn ai_stream_state(state: State<'_, AppState>, key: String) -> Option<ChatStream> {
+    state.ai_streams.lock().ok()?.get(&key).cloned()
+}
+
+/// Take the finished turn's `ai:complete` payload. Only the first caller gets
+/// it, so exactly one window appends the answer to the conversation.
+#[tauri::command]
+pub fn ai_stream_claim(state: State<'_, AppState>, key: String) -> Option<serde_json::Value> {
+    let mut m = state.ai_streams.lock().ok()?;
+    m.get(&key)?.done.as_ref()?;
+    m.remove(&key)?.done
 }
 
 /// Returns (full_text, cost_usd). Claude and OpenAI-compatible stream live;
@@ -843,7 +882,7 @@ async fn stream_provider(
             let text = run_provider(other, prompt, cwd, base_url, model, api_key, timeout_secs, None)
                 .await?
                 .text;
-            let _ = app.emit("ai:chunk", serde_json::json!({ "key": key, "delta": text }));
+            emit_chunk(app, key, &text);
             Ok((text, None))
         }
     }
@@ -917,8 +956,7 @@ async fn stream_claude(
                             if let Some(txt) = delta.and_then(|d| d.get("text")).and_then(|t| t.as_str())
                             {
                                 full.push_str(txt);
-                                let _ = app
-                                    .emit("ai:chunk", serde_json::json!({ "key": key, "delta": txt }));
+                                emit_chunk(app, key, txt);
                             }
                         }
                     }
@@ -1037,8 +1075,7 @@ async fn stream_openai(
                 {
                     if !delta.is_empty() {
                         full.push_str(delta);
-                        let _ =
-                            app.emit("ai:chunk", serde_json::json!({ "key": key, "delta": delta }));
+                        emit_chunk(app, key, delta);
                     }
                 }
             }

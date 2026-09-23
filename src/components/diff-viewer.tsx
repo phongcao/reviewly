@@ -2,6 +2,7 @@ import { BehaviorPanel } from "@/components/behavior-panel";
 import { CommentByline } from "@/components/comment-byline";
 import { Composer } from "@/components/composer";
 import { DiffSelectionToolbar } from "@/components/diff-selection-toolbar";
+import { ImagePreview } from "@/components/image-preview";
 import { MarkdownBody } from "@/components/markdown-body";
 import { MarkdownPreview } from "@/components/markdown-preview";
 import { ReactionsBar } from "@/components/reactions-bar";
@@ -12,6 +13,7 @@ import { attachContext } from "@/lib/ai/attach-bridge";
 import { useBehavior } from "@/lib/ai/use-behavior";
 import type { BehaviorDiff } from "@/lib/behavior";
 import { type DiffLine, type Hunk, parseHunkHeader, parsePatch, toSplit } from "@/lib/diff";
+import { isImagePath } from "@/lib/images";
 import { detectLanguage, highlightLine } from "@/lib/lang";
 import { isMarkdownPath } from "@/lib/markdown";
 import type { ReviewLocation } from "@/lib/review-context";
@@ -79,6 +81,12 @@ interface Props {
   onOpenInEditor?: (path: string, line: number) => void;
   /** PR head sha — enables GitHub permalinks for the file/line copy actions. */
   headSha?: string | null;
+  /** PR base sha — the "before" side of an image preview. */
+  baseSha?: string | null;
+  /** GitHub file status (added, removed, modified, renamed, …). */
+  status?: string;
+  /** Pre-rename path, when the file was renamed. */
+  previousPath?: string | null;
   /**
    * Stable per-PR+head-sha key for persisting expanded context gaps so
    * re-opening a file keeps its expansions. Null disables persistence.
@@ -222,6 +230,9 @@ export function DiffViewer({
   onOpenInEditor,
   onPeek,
   headSha,
+  baseSha,
+  status,
+  previousPath,
   viewedKey,
   fileLinesLoading = false,
   onAskAi,
@@ -620,11 +631,14 @@ export function DiffViewer({
   }
 
   const showPreview = isMarkdown && markdownPreview;
+  // Images have no text patch; show the picture instead of the line view.
+  const showImage = hunks.length === 0 && isImagePath(path);
 
   const toolbar = (
     <DiffToolbar
       markdown={isMarkdown}
       preview={showPreview}
+      image={showImage}
       onTogglePreview={() => setMarkdownPreview(!markdownPreview)}
       wrap={diffWrap}
       onToggleWrap={() => setDiffWrap(!diffWrap)}
@@ -671,6 +685,25 @@ export function DiffViewer({
             loading={fileLinesLoading}
           />
         </div>
+        <div ref={endRef} aria-hidden className="h-px" />
+      </div>
+    );
+  }
+
+  if (showImage) {
+    return (
+      <div ref={rootRef}>
+        {toolbar}
+        <ImagePreview
+          key={path}
+          owner={owner}
+          repo={repo}
+          path={path}
+          status={status}
+          previousPath={previousPath}
+          headSha={headSha}
+          baseSha={baseSha}
+        />
         <div ref={endRef} aria-hidden className="h-px" />
       </div>
     );
@@ -928,6 +961,7 @@ function ToolBtn({
 function DiffToolbar({
   markdown,
   preview,
+  image = false,
   onTogglePreview,
   wrap,
   onToggleWrap,
@@ -942,6 +976,8 @@ function DiffToolbar({
 }: {
   markdown: boolean;
   preview: boolean;
+  /** An image preview: no lines, so no wrap/whitespace/comment tools. */
+  image?: boolean;
   onTogglePreview: () => void;
   wrap: boolean;
   onToggleWrap: () => void;
@@ -987,7 +1023,7 @@ function DiffToolbar({
           <MessageSquare className="size-3.5" />
           {commentCount}
         </ToolBtn>
-      ) : (
+      ) : image ? null : (
         <>
           <ToolBtn
             tip={wrap ? "Wrapping long lines" : "Not wrapping (overflow)"}

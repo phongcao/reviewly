@@ -656,6 +656,20 @@
   font-size: inherit;
 }
 
+/* Image previews (ImagePreview): a faint checkerboard so transparent pixels
+ * read as transparent in either theme. */
+.image-checker {
+  --checker: color-mix(in oklch, var(--color-foreground) 6%, transparent);
+  background-color: color-mix(in oklch, var(--color-foreground) 2%, transparent);
+  background-image: conic-gradient(
+    var(--checker) 25%,
+    transparent 0 50%,
+    var(--checker) 0 75%,
+    transparent 0
+  );
+  background-size: 16px 16px;
+}
+
 /* ```mermaid fences (MermaidDiagram). Mermaid sizes the SVG with an inline
  * max-width; keep it centered and let very wide diagrams scroll. */
 .prose-mermaid {

@@ -103,3 +103,15 @@ export const useAiChat = create<State>()(
     },
   ),
 );
+
+/** Resolves once the persisted conversations have loaded from SQLite. Writing
+ * before then would be clobbered by hydration (and persist a near-empty row). */
+export function whenChatHydrated(): Promise<void> {
+  if (useAiChat.persist.hasHydrated()) return Promise.resolve();
+  return new Promise((resolve) => {
+    const unsub = useAiChat.persist.onFinishHydration(() => {
+      unsub();
+      resolve();
+    });
+  });
+}

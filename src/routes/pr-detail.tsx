@@ -45,6 +45,7 @@ import { type ContextOptions, type ReviewContext, buildReviewContext } from "@/l
 import { parsePatch } from "@/lib/diff";
 import { isTestFile } from "@/lib/focus";
 import { relativeTime } from "@/lib/format";
+import { isImagePath } from "@/lib/images";
 import { celebrate } from "@/lib/kite-release";
 import { isMarkdownPath } from "@/lib/markdown";
 import type { ReviewLocation } from "@/lib/review-context";
@@ -886,7 +887,8 @@ export function PRDetailPage() {
         path: current as string,
         ref: headSha as string,
       }),
-    enabled: !!headSha && !!current,
+    // Images are fetched as bytes by the image preview, not as text.
+    enabled: !!headSha && !!current && !isImagePath(current),
     staleTime: 5 * 60_000,
     placeholderData: keepPreviousData,
   });
@@ -1578,6 +1580,9 @@ export function PRDetailPage() {
                       onOpenInEditor={localRepo ? openInEditor : undefined}
                       onPeek={peek}
                       headSha={headSha}
+                      baseSha={detail.data?.base.sha}
+                      status={currentFile.status}
+                      previousPath={currentFile.previous_filename}
                       viewedKey={vk}
                       fileLinesLoading={fileContent.isLoading && fileContent.dataUpdatedAt === 0}
                       onAskAi={() => {
