@@ -21,6 +21,9 @@ interface State {
   /** Collapse del/add pairs that differ only by whitespace. */
   hideWhitespace: boolean;
   setHideWhitespace: (v: boolean) => void;
+  /** Show Markdown files as rendered documents instead of a raw diff. */
+  markdownPreview: boolean;
+  setMarkdownPreview: (v: boolean) => void;
   /** Kick off the guided tour automatically when a PR's review screen opens. */
   autoStartTour: boolean;
   setAutoStartTour: (v: boolean) => void;
@@ -44,6 +47,8 @@ export const useReviewPrefs = create<State>()(
       setDiffWrap: (diffWrap) => set({ diffWrap }),
       hideWhitespace: false,
       setHideWhitespace: (hideWhitespace) => set({ hideWhitespace }),
+      markdownPreview: false,
+      setMarkdownPreview: (markdownPreview) => set({ markdownPreview }),
       autoStartTour: false,
       setAutoStartTour: (autoStartTour) => set({ autoStartTour }),
       defaultSuggestionAction: "add",

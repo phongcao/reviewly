@@ -1,7 +1,10 @@
 import path from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
-import { defineConfig } from "vite";
+// `vitest/config` rather than `vite`: same `defineConfig`, plus the `test`
+// key's types. Vitest reads this file for the `@` alias and the React plugin
+// anyway, so keeping one config avoids the two drifting apart.
+import { defineConfig } from "vitest/config";
 
 const host = process.env.TAURI_DEV_HOST;
 
@@ -27,6 +30,18 @@ export default defineConfig(async () => ({
         },
       },
     },
+  },
+  test: {
+    // Most suites are pure functions and don't need a DOM, but the diff →
+    // context-pane path is built on Range/Selection and the `data-diff-row`
+    // attributes, which only mean anything in one. jsdom implements enough of
+    // both (`containsNode`, `compareBoundaryPoints`) to test it honestly.
+    //
+    // Note jsdom does no layout: every box measures 0×0 and `scrollIntoView` is
+    // a no-op, so anything that depends on real geometry belongs in a manual
+    // pass on a real PR, not here.
+    environment: "jsdom",
+    include: ["src/**/*.test.{ts,tsx}"],
   },
   clearScreen: false,
   server: {

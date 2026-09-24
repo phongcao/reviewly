@@ -7,7 +7,7 @@ import { persist } from "zustand/middleware";
 /** One layer's own tour, as returned by its own AI call. */
 export interface TourBatch {
   plan: GuidedPlan;
-  /** Which AI produced it ("claude" | "codex"). */
+  /** Which AI produced it (an `AiProvider` id). */
   provider: string;
   /** Epoch ms when generated. */
   generatedAt: number;
@@ -92,6 +92,10 @@ interface State {
   focusLayer: (key: string, layerId: string) => void;
   /** The jump happened (or the layer went away) — drop the request. */
   clearFocus: (key: string) => void;
+  /** Merge tours from an exported bundle. Newer `generatedAt` wins per PR, so
+   * re-importing an older bundle can't undo work done since. Returns how many
+   * entries actually landed. */
+  importEntries: (entries: Record<string, DeepTourEntry>) => number;
 }
 
 /** Drop the oldest entries once we exceed the cap. */
@@ -222,6 +226,19 @@ export const useDeepTour = create<State>()(
         const cur = get().byPr[key];
         if (!cur || cur.focusLayerId === layerId) return;
         set({ byPr: { ...get().byPr, [key]: { ...cur, focusLayerId: layerId } } });
+      },
+
+      importEntries: (entries) => {
+        const cur = get().byPr;
+        const next = { ...cur };
+        let added = 0;
+        for (const [key, entry] of Object.entries(entries)) {
+          if (cur[key] && cur[key].generatedAt >= entry.generatedAt) continue;
+          next[key] = entry;
+          added++;
+        }
+        if (added > 0) set({ byPr: evict(next) });
+        return added;
       },
 
       clearFocus: (key) => {

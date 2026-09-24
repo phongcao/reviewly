@@ -1,34 +1,56 @@
+import { BehaviorPanel } from "@/components/behavior-panel";
 import { CommentByline } from "@/components/comment-byline";
 import { Composer } from "@/components/composer";
 import { DiffSelectionToolbar } from "@/components/diff-selection-toolbar";
+import { ImagePreview } from "@/components/image-preview";
 import { MarkdownBody } from "@/components/markdown-body";
+import { MarkdownPreview } from "@/components/markdown-preview";
 import { ReactionsBar } from "@/components/reactions-bar";
 import { ReviewThreadGroup } from "@/components/review-thread";
 import { TooltipFor } from "@/components/tooltip-for";
 import { buildSnippet, refFromLines } from "@/lib/ai/attach";
 import { attachContext } from "@/lib/ai/attach-bridge";
-import { type DiffLine, type Hunk, parsePatch, toSplit } from "@/lib/diff";
+import { useBehavior } from "@/lib/ai/use-behavior";
+import type { BehaviorDiff } from "@/lib/behavior";
+import { type DiffLine, type Hunk, parseHunkHeader, parsePatch, toSplit } from "@/lib/diff";
+import { isImagePath } from "@/lib/images";
 import { detectLanguage, highlightLine } from "@/lib/lang";
-import type { DraftComment, ReviewThread, ReviewThreadGraphQL } from "@/lib/tauri";
+import { isMarkdownPath } from "@/lib/markdown";
+import type { ReviewLocation } from "@/lib/review-context";
+import type { DraftComment, PullFile, ReviewThread, ReviewThreadGraphQL } from "@/lib/tauri";
 import { safeOpenUrl } from "@/lib/ui";
 import { cn } from "@/lib/utils";
+import { useLocalRepos } from "@/stores/local-repos";
 import { useReviewPrefs } from "@/stores/review-prefs";
 import { useViewedFiles } from "@/stores/viewed-files";
 import { diffWordsWithSpace } from "diff";
 import {
+  BookOpenText,
   ChevronDown,
   ChevronUp,
   Copy,
   ExternalLink,
+  GitCompare,
   Link as LinkIcon,
+  MessageSquare,
   MessageSquarePlus,
+  PanelRight,
   Sparkles,
   SquarePen,
   TextQuote,
   UnfoldVertical,
   WrapText,
 } from "lucide-react";
-import { Fragment, createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Fragment,
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { toast } from "sonner";
 
 interface Props {
@@ -59,6 +81,12 @@ interface Props {
   onOpenInEditor?: (path: string, line: number) => void;
   /** PR head sha — enables GitHub permalinks for the file/line copy actions. */
   headSha?: string | null;
+  /** PR base sha — the "before" side of an image preview. */
+  baseSha?: string | null;
+  /** GitHub file status (added, removed, modified, renamed, …). */
+  status?: string;
+  /** Pre-rename path, when the file was renamed. */
+  previousPath?: string | null;
   /**
    * Stable per-PR+head-sha key for persisting expanded context gaps so
    * re-opening a file keeps its expansions. Null disables persistence.
@@ -68,6 +96,8 @@ interface Props {
   fileLinesLoading?: boolean;
   /** Opens (or focuses) the AI chat after code is pinned to it from the diff. */
   onAskAi?: () => void;
+  /** Opens a location in the review context pane, beside the diff. */
+  onPeek?: (loc: ReviewLocation) => void;
 }
 
 interface GapInfo {
@@ -97,6 +127,12 @@ interface ThreadMeta {
   onAskAi?: () => void;
   /** Open this file at a line in the reviewer's editor; absent with no clone. */
   onOpenInEditor?: (line: number) => void;
+  /** Open this file at a line in the context pane, beside the diff. */
+  onPeek?: (line: number) => void;
+  /** Explain the symbol at this hunk as behavior. Absent = feature off. */
+  onExplainBehavior?: (line: number, symbol: string) => void;
+  /** The hunk (by new-file start line) currently waiting on an explanation. */
+  behaviorPending?: number | null;
 }
 const ThreadMetaContext = createContext<ThreadMeta | null>(null);
 
@@ -192,21 +228,106 @@ export function DiffViewer({
   focusLine,
   focusNonce,
   onOpenInEditor,
+  onPeek,
   headSha,
+  baseSha,
+  status,
+  previousPath,
   viewedKey,
   fileLinesLoading = false,
   onAskAi,
 }: Props) {
   const hunks = useMemo(() => parsePatch(patch), [patch]);
+
+  // Behavior explanations requested from this file's diff — by the hunk header
+  // or by a selection. Keyed by the enclosing hunk's new-file start so the
+  // panel renders under the code it describes, and cleared when the file
+  // changes since the answer is about this diff only.
+  const localRepos = useLocalRepos((r) => r.repos);
+  const behaviorCwd = useMemo(
+    () => localRepos.find((r) => r.owner === owner && r.repo === repo)?.path ?? null,
+    [localRepos, owner, repo],
+  );
+  const { explain } = useBehavior(behaviorCwd);
+  // Keyed by path so an answer can't outlive the file it describes when this
+  // viewer is pointed at another one — a render-time guard rather than a reset
+  // effect, so there is no frame where the stale panel is still on screen.
+  const [behavior, setBehavior] = useState<{
+    path: string;
+    anchor: number;
+    diff: BehaviorDiff;
+  } | null>(null);
+  const [pendingHunk, setPendingHunk] = useState<number | null>(null);
+  /** Bring a freshly-rendered panel into view — it may be inserted above the
+   * current scroll position, which would otherwise look like nothing happened. */
+  const revealBehavior = useCallback((el: HTMLDivElement | null) => {
+    el?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, []);
+
+  /** New-file start of the hunk containing `line`, for anchoring the panel. */
+  const hunkAt = useCallback(
+    (line: number): number =>
+      hunks.find((h) => h.lines.some((l) => l.newLine !== null && l.newLine >= line))?.newStart ??
+      hunks[0]?.newStart ??
+      line,
+    [hunks],
+  );
+
+  const runExplain = useCallback(
+    async (line: number, endLine: number | undefined, subject: string | undefined) => {
+      const anchor = hunkAt(line);
+      setPendingHunk(anchor);
+      try {
+        const d = await explain({ path, line, endLine, subject, patch }, `${path}:${line}`);
+        if (d) setBehavior({ path, anchor, diff: d });
+      } finally {
+        setPendingHunk(null);
+      }
+    },
+    [explain, hunkAt, patch, path],
+  );
+
+  const explainHunk = useCallback(
+    (line: number, symbol: string) => void runExplain(line, undefined, symbol || undefined),
+    [runExplain],
+  );
+
+  // A selection carries no symbol name, so the model is told only the range and
+  // works out the enclosing symbol itself — the same job it already does for a
+  // hunk, with one less hint.
+  // Verification needs a PullFile list; inside the viewer we have exactly one
+  // file, which is also the only one its claims may cite.
+  const behaviorFiles = useMemo(() => [{ filename: path, patch } as PullFile], [path, patch]);
+
+  /** Scroll to a new-file line in this diff — same row lookup as `navComment`. */
+  const goToLine = useCallback((line: number) => {
+    const el = rootRef.current?.querySelector<HTMLElement>(`[data-line="${line}"]`);
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+    else toast.info(`Line ${line} isn't rendered in this diff.`);
+  }, []);
+
+  const explainSelection = useCallback(
+    (from: number, to: number) => void runExplain(from, to > from ? to : undefined, undefined),
+    [runExplain],
+  );
   const lang = useMemo(() => detectLanguage(path), [path]);
   const bounds = useMemo(() => hunks.map(hunkBounds), [hunks]);
   const rootRef = useRef<HTMLDivElement>(null);
+  // The rendered Markdown alone — not the file toolbar above it — so selecting
+  // the header's text never offers to attach it.
+  const proseRef = useRef<HTMLDivElement>(null);
 
   // Line-wrapping + whitespace-only collapsing are review-wide prefs.
   const diffWrap = useReviewPrefs((s) => s.diffWrap);
   const setDiffWrap = useReviewPrefs((s) => s.setDiffWrap);
   const hideWhitespace = useReviewPrefs((s) => s.hideWhitespace);
   const setHideWhitespace = useReviewPrefs((s) => s.setHideWhitespace);
+  // Render Markdown files as documents rather than diffs. Review-wide (not
+  // per-file) so a docs-heavy PR is read in one mode instead of re-toggled
+  // twenty times; the toggle only appears on files it applies to.
+  const markdownPreview = useReviewPrefs((s) => s.markdownPreview);
+  const setMarkdownPreview = useReviewPrefs((s) => s.setMarkdownPreview);
+  const isMarkdown = useMemo(() => isMarkdownPath(path), [path]);
 
   // Persisted expanded context gaps for this file (keyed by viewedKey → path).
   const persistedGaps = useViewedFiles((s) =>
@@ -509,8 +630,16 @@ export function DiffViewer({
     }
   }
 
+  const showPreview = isMarkdown && markdownPreview;
+  // Images have no text patch; show the picture instead of the line view.
+  const showImage = hunks.length === 0 && isImagePath(path);
+
   const toolbar = (
     <DiffToolbar
+      markdown={isMarkdown}
+      preview={showPreview}
+      image={showImage}
+      onTogglePreview={() => setMarkdownPreview(!markdownPreview)}
       wrap={diffWrap}
       onToggleWrap={() => setDiffWrap(!diffWrap)}
       hideWhitespace={hideWhitespace}
@@ -523,6 +652,62 @@ export function DiffViewer({
       onOpenGitHub={() => safeOpenUrl(permalink())}
     />
   );
+
+  // Rendered Markdown replaces the rows entirely — the diff's line gutters,
+  // comment popovers and context expanders have nothing to attach to in prose;
+  // only the "Ask AI" selection toolbar carries over. The file toolbar stays
+  // put so one click is always the way back.
+  if (showPreview) {
+    return (
+      <div ref={rootRef}>
+        {toolbar}
+        {/* Prose has no line rows, but it's still what the reviewer is reading:
+            highlight a passage and it pins to the chat as quoted text plus the
+            source lines behind it. */}
+        <DiffSelectionToolbar
+          rootRef={proseRef}
+          path={path}
+          patch={patch}
+          view="prose"
+          prKey={`${owner}/${repo}#${number}`}
+          fileLines={fileLines}
+          onAskAi={onAskAi}
+          onPeek={onPeek}
+        />
+        <div ref={proseRef}>
+          <MarkdownPreview
+            path={path}
+            owner={owner}
+            repo={repo}
+            headSha={headSha}
+            fileLines={fileLines}
+            hunks={hunks}
+            loading={fileLinesLoading}
+          />
+        </div>
+        <div ref={endRef} aria-hidden className="h-px" />
+      </div>
+    );
+  }
+
+  if (showImage) {
+    return (
+      <div ref={rootRef}>
+        {toolbar}
+        <ImagePreview
+          key={path}
+          owner={owner}
+          repo={repo}
+          path={path}
+          status={status}
+          previousPath={previousPath}
+          headSha={headSha}
+          baseSha={baseSha}
+        />
+        <div ref={endRef} aria-hidden className="h-px" />
+      </div>
+    );
+  }
 
   if (hunks.length === 0) {
     // Better null-patch handling: instead of a dead-end message, offer to load
@@ -574,6 +759,9 @@ export function DiffViewer({
               onOpenInEditor: onOpenInEditor
                 ? (line: number) => onOpenInEditor(path, line)
                 : undefined,
+              onPeek: onPeek ? (line: number) => onPeek({ path, line }) : undefined,
+              onExplainBehavior: explainHunk,
+              behaviorPending: pendingHunk,
             }}
           >
             <DiffSelectionToolbar
@@ -584,6 +772,8 @@ export function DiffViewer({
               prKey={`${owner}/${repo}#${number}`}
               fileLines={fileLines}
               onAskAi={onAskAi}
+              onPeek={onPeek}
+              onExplainBehavior={explainSelection}
             />
             <div
               ref={rootRef}
@@ -613,7 +803,23 @@ export function DiffViewer({
 
   return (
     <ThreadMetaContext.Provider
-      value={{ owner, repo, number, reviewThreads, viewerLogin, patch, fileLines, onAskAi }}
+      value={{
+        owner,
+        repo,
+        number,
+        reviewThreads,
+        viewerLogin,
+        patch,
+        fileLines,
+        onAskAi,
+        // Both of these used to be omitted here and supplied only in the
+        // null-patch branch above, so the gutter popover's "Open in editor"
+        // never appeared on an ordinary diff — the one place it matters.
+        onOpenInEditor: onOpenInEditor ? (line: number) => onOpenInEditor(path, line) : undefined,
+        onPeek: onPeek ? (line: number) => onPeek({ path, line }) : undefined,
+        onExplainBehavior: explainHunk,
+        behaviorPending: pendingHunk,
+      }}
     >
       {toolbar}
       <DiffSelectionToolbar
@@ -624,6 +830,8 @@ export function DiffViewer({
         prKey={`${owner}/${repo}#${number}`}
         fileLines={fileLines}
         onAskAi={onAskAi}
+        onPeek={onPeek}
+        onExplainBehavior={explainSelection}
       />
       <div
         ref={rootRef}
@@ -650,6 +858,21 @@ export function DiffViewer({
               onAddComment={onAddComment}
               line={lineCtx}
             />
+            {/* ABOVE the hunk, not after it. A hunk can be hundreds of rows
+                long (a new file is one hunk), so a panel appended after the
+                block lands far below the header the reviewer just clicked —
+                indistinguishable from nothing happening. */}
+            {behavior?.path === path && behavior.anchor === h.newStart && (
+              <div ref={revealBehavior} className="px-3 pt-2 font-sans">
+                <BehaviorPanel
+                  diff={behavior.diff}
+                  path={path}
+                  files={behaviorFiles}
+                  onGoToLine={goToLine}
+                  onClose={() => setBehavior(null)}
+                />
+              </div>
+            )}
             <HunkBlock
               path={path}
               lang={lang}
@@ -729,8 +952,17 @@ function ToolBtn({
   );
 }
 
-/** Top toolbar: wrap toggle, hide-whitespace toggle, comment nav, copy actions. */
+/**
+ * Top toolbar: Markdown preview toggle (Markdown files only), wrap toggle,
+ * hide-whitespace toggle, comment nav, copy actions. In preview mode the
+ * row-level controls drop out — they describe rows that aren't rendered —
+ * leaving the preview toggle, the comment count, and the copy/open actions.
+ */
 function DiffToolbar({
+  markdown,
+  preview,
+  image = false,
+  onTogglePreview,
   wrap,
   onToggleWrap,
   hideWhitespace,
@@ -742,6 +974,11 @@ function DiffToolbar({
   onCopyPermalink,
   onOpenGitHub,
 }: {
+  markdown: boolean;
+  preview: boolean;
+  /** An image preview: no lines, so no wrap/whitespace/comment tools. */
+  image?: boolean;
+  onTogglePreview: () => void;
   wrap: boolean;
   onToggleWrap: () => void;
   hideWhitespace: boolean;
@@ -755,32 +992,67 @@ function DiffToolbar({
 }) {
   return (
     <div className="flex flex-wrap items-center gap-1 border-b border-hairline bg-card/95 px-2 py-1 font-sans">
-      <ToolBtn
-        tip={wrap ? "Wrapping long lines" : "Not wrapping (overflow)"}
-        onClick={onToggleWrap}
-        pressed={wrap}
-        active={wrap}
-      >
-        <WrapText className="size-3.5" />
-        Wrap
-      </ToolBtn>
-      <ToolBtn
-        tip="Collapse changes that differ only in whitespace"
-        onClick={onToggleHideWhitespace}
-        pressed={hideWhitespace}
-        active={hideWhitespace}
-      >
-        <TextQuote className="size-3.5" />
-        Hide whitespace
-      </ToolBtn>
-      <div className="mx-0.5 h-4 w-px bg-border/50" aria-hidden />
-      <ToolBtn tip="Previous comment" onClick={onPrevComment} disabled={commentCount === 0}>
-        <ChevronUp className="size-3.5" />
-      </ToolBtn>
-      <span className="text-xs tabular-nums text-muted-foreground/70">{commentCount}</span>
-      <ToolBtn tip="Next comment" onClick={onNextComment} disabled={commentCount === 0}>
-        <ChevronDown className="size-3.5" />
-      </ToolBtn>
+      {markdown && (
+        <>
+          <ToolBtn
+            tip={
+              preview
+                ? "Showing rendered Markdown — switch back to the raw diff (m)"
+                : "Render this Markdown file as a document (m)"
+            }
+            onClick={onTogglePreview}
+            pressed={preview}
+            active={preview}
+          >
+            <BookOpenText className="size-3.5" />
+            Preview
+          </ToolBtn>
+          <div className="mx-0.5 h-4 w-px bg-border/50" aria-hidden />
+        </>
+      )}
+      {preview ? (
+        <ToolBtn
+          tip={
+            commentCount === 0
+              ? "No inline comments on this file"
+              : "Inline comments live on the diff — switch back to read them"
+          }
+          onClick={onTogglePreview}
+          disabled={commentCount === 0}
+        >
+          <MessageSquare className="size-3.5" />
+          {commentCount}
+        </ToolBtn>
+      ) : image ? null : (
+        <>
+          <ToolBtn
+            tip={wrap ? "Wrapping long lines" : "Not wrapping (overflow)"}
+            onClick={onToggleWrap}
+            pressed={wrap}
+            active={wrap}
+          >
+            <WrapText className="size-3.5" />
+            Wrap
+          </ToolBtn>
+          <ToolBtn
+            tip="Collapse changes that differ only in whitespace"
+            onClick={onToggleHideWhitespace}
+            pressed={hideWhitespace}
+            active={hideWhitespace}
+          >
+            <TextQuote className="size-3.5" />
+            Hide whitespace
+          </ToolBtn>
+          <div className="mx-0.5 h-4 w-px bg-border/50" aria-hidden />
+          <ToolBtn tip="Previous comment" onClick={onPrevComment} disabled={commentCount === 0}>
+            <ChevronUp className="size-3.5" />
+          </ToolBtn>
+          <span className="text-xs tabular-nums text-muted-foreground/70">{commentCount}</span>
+          <ToolBtn tip="Next comment" onClick={onNextComment} disabled={commentCount === 0}>
+            <ChevronDown className="size-3.5" />
+          </ToolBtn>
+        </>
+      )}
       <div className="ml-auto flex items-center gap-1">
         <ToolBtn tip="Copy file path" onClick={onCopyPath}>
           <Copy className="size-3.5" />
@@ -910,20 +1182,24 @@ function GapExpander({
   );
 }
 
-function parseHunkHeader(text: string): { range: string; symbol: string } {
-  const m = text.match(/^(@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@)\s?(.*)$/);
-  if (!m) return { range: text, symbol: "" };
-  return { range: m[1], symbol: m[2] };
-}
-
 /** Sticky breadcrumb shown at the top of each hunk — keeps the enclosing
- * symbol in view while you scroll through the changes. */
+ * symbol in view while you scroll through the changes.
+ *
+ * Also the per-hunk entry point for a behavior explanation: the `@@ … @@`
+ * suffix is git's own guess at the enclosing symbol, which is a free, exact
+ * anchor with no parser of our own. The button is revealed on hover rather than
+ * always drawn — a always-visible button on every hunk of a 120-file PR turns
+ * "explain this" into the default way to read the diff, which is the one thing
+ * this feature must not become. */
 function HunkHeaderBar({ text, gutter }: { text: string; gutter?: string }) {
-  const { range, symbol } = parseHunkHeader(text);
+  const { range, symbol, newStart } = parseHunkHeader(text);
+  const meta = useContext(ThreadMetaContext);
+  const explain = meta?.onExplainBehavior;
+  const busy = meta?.behaviorPending === newStart;
   return (
-    <div className="sticky top-0 z-10 flex border-y border-hairline bg-card/95 backdrop-blur-md">
+    <div className="group/hunk sticky top-0 z-10 flex items-center border-y border-hairline bg-card/95 backdrop-blur-md">
       {gutter && <span className={cn("shrink-0", gutter)} />}
-      <pre className="flex-1 select-text truncate px-3 py-1 text-xs">
+      <pre className="min-w-0 flex-1 select-text truncate px-3 py-1 text-xs">
         {symbol ? (
           <>
             <span className="text-muted-foreground/45">{range} </span>
@@ -933,6 +1209,23 @@ function HunkHeaderBar({ text, gutter }: { text: string; gutter?: string }) {
           <span className="text-muted-foreground/80">{range}</span>
         )}
       </pre>
+      {explain && newStart > 0 && (
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => explain(newStart, symbol)}
+          title={symbol ? `Explain the behavior of ${symbol}` : "Explain this hunk's behavior"}
+          className={cn(
+            "mr-2 inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 font-sans text-2xs text-muted-foreground transition-opacity hover:bg-foreground/8 hover:text-foreground disabled:opacity-50",
+            busy
+              ? "opacity-100"
+              : "opacity-0 focus-visible:opacity-100 group-hover/hunk:opacity-100",
+          )}
+        >
+          <GitCompare className="size-3" />
+          {busy ? "Explaining…" : "Behavior"}
+        </button>
+      )}
     </div>
   );
 }
@@ -1579,6 +1872,19 @@ function CommentPopover({
               >
                 <Sparkles className="size-3" />
                 Ask AI
+              </button>
+            )}
+            {meta?.onPeek && (
+              <button
+                type="button"
+                onClick={() => {
+                  meta.onPeek?.(r.from);
+                  ui.close();
+                }}
+                className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-2xs font-medium text-muted-foreground/70 transition-colors hover:bg-primary/10 hover:text-primary"
+              >
+                <PanelRight className="size-3" />
+                Open in context
               </button>
             )}
             {meta?.onOpenInEditor && (

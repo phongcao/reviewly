@@ -45,7 +45,10 @@ import { type ContextOptions, type ReviewContext, buildReviewContext } from "@/l
 import { parsePatch } from "@/lib/diff";
 import { isTestFile } from "@/lib/focus";
 import { relativeTime } from "@/lib/format";
+import { isImagePath } from "@/lib/images";
 import { celebrate } from "@/lib/kite-release";
+import { isMarkdownPath } from "@/lib/markdown";
+import type { ReviewLocation } from "@/lib/review-context";
 import type {
   ActionsJob,
   ActionsStep,
@@ -83,6 +86,8 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  ChevronsDownUp,
+  ChevronsUpDown,
   Code2,
   Columns2,
   Copy,
@@ -95,6 +100,7 @@ import {
   Layers,
   MessageSquare,
   OctagonX,
+  PanelLeft,
   PanelRight,
   Pencil,
   Pin,
@@ -116,6 +122,7 @@ import {
   useRef,
   useState,
 } from "react";
+import type { ImperativePanelHandle } from "react-resizable-panels";
 import { toast } from "sonner";
 
 type DetailTab = "files" | "conversation" | "commits" | "checks";
@@ -185,6 +192,8 @@ export function PRDetailPage() {
   const diffLayout = useUi((s) => s.diffLayout);
   const focusMode = useUi((s) => s.focusMode);
   const toggleFocus = useUi((s) => s.toggleFocusMode);
+  const compactChrome = useUi((s) => s.compactChrome);
+  const toggleCompactChrome = useUi((s) => s.toggleCompactChrome);
   // The string key the per-PR view store (and review-draft store) is keyed by.
   const prViewKey = `${owner}/${repo}#${number}`;
   // Persist + restore the active tab per PR (item 16). Lazy init reads the
@@ -226,6 +235,11 @@ export function PRDetailPage() {
   const [editingTitle, setEditingTitle] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [guidedScrolled, setGuidedScrolled] = useState(false);
+  // The file-tree pane collapses to zero width; its size (collapsed or not) is
+  // persisted by the panel group's autoSaveId, so this only mirrors it for the
+  // toolbar button.
+  const treePanelRef = useRef<ImperativePanelHandle>(null);
+  const [treeCollapsed, setTreeCollapsed] = useState(false);
 
   // Jump from a pending review comment (in the submit dialog) to its file+line.
   const jumpToDraftComment = (c: { path: string; line?: number | null }) => {
@@ -492,7 +506,17 @@ export function PRDetailPage() {
   const setLastEditorTargetId = useEditorPrefs((s) => s.setLastTargetId);
   const contextOpen = useReviewContext((s) => s.open);
   const toggleContext = useReviewContext((s) => s.toggle);
+  const navigateContext = useReviewContext((s) => s.navigate);
   const changedPaths = useMemo(() => fileList.map((f) => f.filename), [fileList]);
+
+  // Open a place in the context pane. `navigate` reveals the pane itself, so a
+  // peek from a closed pane is still one interaction. Deliberately does not
+  // touch `current`, the scroll position, or viewed state — the diff must stay
+  // exactly where the reviewer left it.
+  const peek = useCallback(
+    (loc: ReviewLocation) => navigateContext(prViewKey, loc),
+    [navigateContext, prViewKey],
+  );
 
   // Hand a diff line off to the reviewer's editor, opened on that exact line.
   // Only offered when a clone is mapped — there is nothing on disk to open
@@ -647,11 +671,29 @@ export function PRDetailPage() {
         // Toggle "viewed" for the current file (item 37).
         e.preventDefault();
         if (vk && cur) setViewedFile(vk, cur, !viewedMap?.[cur]);
+      } else if (e.key === "m") {
+        // Rendered Markdown / raw diff. Only meaningful on a Markdown file, so
+        // the key stays free everywhere else.
+        if (!isMarkdownPath(cur)) return;
+        e.preventDefault();
+        const prefs = useReviewPrefs.getState();
+        prefs.setMarkdownPreview(!prefs.markdownPreview);
       } else if (e.key === "\\") {
         // Show/hide the review context pane. `\` is unclaimed, sits next to the
         // bracket keys that already move between files, and needs no chord.
         e.preventDefault();
         useReviewContext.getState().toggle();
+      } else if (e.key === "z") {
+        // Compact header: title + tabs on one line, layer briefing on one line.
+        e.preventDefault();
+        useUi.getState().toggleCompactChrome();
+      } else if (e.key === "t") {
+        // Show/hide the file tree for a full-width diff. No tree in guided view.
+        const tree = treePanelRef.current;
+        if (!tree) return;
+        e.preventDefault();
+        if (tree.isCollapsed()) tree.expand();
+        else tree.collapse();
       }
     }
     window.addEventListener("keydown", onKey);
@@ -675,6 +717,8 @@ export function PRDetailPage() {
         setTab("files");
         setFindOpen(false);
         requestAnimationFrame(() => {
+          // The filter lives in the tree pane — open it if it's collapsed.
+          if (treePanelRef.current?.isCollapsed()) treePanelRef.current.expand();
           fileFilterRef.current?.focus();
           fileFilterRef.current?.select();
         });
@@ -843,7 +887,8 @@ export function PRDetailPage() {
         path: current as string,
         ref: headSha as string,
       }),
-    enabled: !!headSha && !!current,
+    // Images are fetched as bytes by the image preview, not as text.
+    enabled: !!headSha && !!current && !isImagePath(current),
     staleTime: 5 * 60_000,
     placeholderData: keepPreviousData,
   });
@@ -959,7 +1004,9 @@ export function PRDetailPage() {
 
   const d = detail.data;
   const pinned = isPinned("pr", `${owner}/${repo}#${number}`);
-  const compactGuidedHeader = tab === "files" && view === "guided" && guidedScrolled;
+  // The header folds to one line on demand (`z`), or on its own once the
+  // guided tour is scrolled.
+  const compactHeader = tab === "files" && (compactChrome || (view === "guided" && guidedScrolled));
 
   return (
     <div className="relative flex h-full flex-col">
@@ -967,14 +1014,14 @@ export function PRDetailPage() {
       <header
         className={cn(
           "flex flex-col border-b border-hairline px-6 transition-[gap,padding] duration-300 ease-out motion-reduce:transition-none",
-          compactGuidedHeader ? "gap-y-2 py-2.5" : "gap-y-3 py-4",
+          compactHeader ? "gap-y-2 py-2.5" : "gap-y-3 py-4",
         )}
       >
         <div className="flex items-start gap-3">
           <GitPullRequest
             className={cn(
               "shrink-0 transition-all duration-300 ease-out motion-reduce:transition-none",
-              compactGuidedHeader ? "mt-0.5 size-4" : "mt-1 size-5",
+              compactHeader ? "mt-0.5 size-4" : "mt-1 size-5",
               d.merged
                 ? "text-purple-400"
                 : d.state === "closed"
@@ -1008,7 +1055,7 @@ export function PRDetailPage() {
                   <h1
                     className={cn(
                       "truncate font-semibold tracking-tight text-foreground transition-[font-size,line-height] duration-300 ease-out motion-reduce:transition-none",
-                      compactGuidedHeader ? "text-sm leading-5" : "text-xl",
+                      compactHeader ? "text-sm leading-5" : "text-xl",
                     )}
                   >
                     {d.title}
@@ -1035,11 +1082,11 @@ export function PRDetailPage() {
             <div
               className={cn(
                 "overflow-hidden transition-[max-height,opacity,transform,margin] duration-300 ease-out motion-reduce:transition-none",
-                compactGuidedHeader
+                compactHeader
                   ? "pointer-events-none mt-0 max-h-0 -translate-y-1 opacity-0"
                   : "mt-1 max-h-24 translate-y-0 opacity-100",
               )}
-              aria-hidden={compactGuidedHeader}
+              aria-hidden={compactHeader}
             >
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
                 <span className="inline-flex items-center gap-1.5">
@@ -1074,8 +1121,7 @@ export function PRDetailPage() {
                     </TooltipFor>
                   </>
                 )}
-              </div>
-              <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                <span className="text-muted-foreground/60">·</span>
                 <LabelPicker
                   owner={owner}
                   repo={repo}
@@ -1271,6 +1317,29 @@ export function PRDetailPage() {
                   </button>
                 </TooltipFor>
               )}
+              {view !== "guided" && (
+                <TooltipFor label="File tree" shortcut="t">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const tree = treePanelRef.current;
+                      if (!tree) return;
+                      if (tree.isCollapsed()) tree.expand();
+                      else tree.collapse();
+                    }}
+                    aria-label="Toggle file tree"
+                    aria-pressed={!treeCollapsed}
+                    className={cn(
+                      "flex size-6 items-center justify-center rounded transition-colors",
+                      !treeCollapsed
+                        ? "bg-foreground/[0.08] text-foreground"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    <PanelLeft className="size-3.5" />
+                  </button>
+                </TooltipFor>
+              )}
               <div className="inline-flex h-7 items-center rounded-lg bg-foreground/[0.05] p-0.5">
                 <TooltipFor label="Unified diff" shortcut="⌘B">
                   <button
@@ -1355,6 +1424,21 @@ export function PRDetailPage() {
                   </button>
                 </TooltipFor>
               )}
+              <TooltipFor label={compactChrome ? "Expand header" : "Compact header"} shortcut="z">
+                <button
+                  type="button"
+                  onClick={toggleCompactChrome}
+                  aria-label="Compact header"
+                  aria-pressed={compactChrome}
+                  className="flex size-6 items-center justify-center rounded text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  {compactChrome ? (
+                    <ChevronsUpDown className="size-3.5" />
+                  ) : (
+                    <ChevronsDownUp className="size-3.5" />
+                  )}
+                </button>
+              </TooltipFor>
             </div>
           )}
         </div>
@@ -1403,6 +1487,7 @@ export function PRDetailPage() {
             files={fileList}
             headSha={headSha}
             viewedKey={vk}
+            activeFile={current}
             onSelectFile={setActiveFile}
             onOpenGuided={() => setView("guided")}
           />
@@ -1414,7 +1499,17 @@ export function PRDetailPage() {
             className="flex-1 min-h-0"
             autoSaveId="pr-files-panes"
           >
-            <ResizablePanel id="tree" order={1} defaultSize={22} minSize={15}>
+            <ResizablePanel
+              ref={treePanelRef}
+              id="tree"
+              order={1}
+              defaultSize={22}
+              minSize={15}
+              collapsible
+              collapsedSize={0}
+              onCollapse={() => setTreeCollapsed(true)}
+              onExpand={() => setTreeCollapsed(false)}
+            >
               <div className="flex h-full flex-col">
                 <div className="border-b border-hairline p-1.5">
                   <input
@@ -1483,7 +1578,11 @@ export function PRDetailPage() {
                       focusLine={focusLine}
                       focusNonce={focusNonce}
                       onOpenInEditor={localRepo ? openInEditor : undefined}
+                      onPeek={peek}
                       headSha={headSha}
+                      baseSha={detail.data?.base.sha}
+                      status={currentFile.status}
+                      previousPath={currentFile.previous_filename}
                       viewedKey={vk}
                       fileLinesLoading={fileContent.isLoading && fileContent.dataUpdatedAt === 0}
                       onAskAi={() => {

@@ -6,6 +6,7 @@ import { type ContextOptions, type ReviewContext, buildLayerContext } from "@/li
 import { buildLayeredSystem } from "@/lib/ai/prompts";
 import { useAiAvailable } from "@/lib/ai/use-ai-available";
 import { useDeepTourRunner } from "@/lib/ai/use-deep-tour";
+import { relativeTime } from "@/lib/format";
 import {
   type LayerPlan,
   type LayerStats,
@@ -22,23 +23,32 @@ import {
 import type { PullFile } from "@/lib/tauri";
 import { invoke } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
-import { PROVIDER_LABEL, aiInvokeArgs, useAiProvider } from "@/stores/ai";
+import {
+  type AiProvider,
+  EFFORT_SHORT,
+  PROVIDER_LABEL,
+  aiInvokeArgs,
+  useAiProvider,
+} from "@/stores/ai";
 import { useDeepTour } from "@/stores/deep-tour";
 import { useDeepTourGen } from "@/stores/deep-tour-gen";
-import { useLayers } from "@/stores/layers";
+import { type LayersEntry, useLayers } from "@/stores/layers";
 import { useLayersGen } from "@/stores/layers-gen";
 import { useReviewPrefs } from "@/stores/review-prefs";
+import { useUi } from "@/stores/ui";
 import { useViewedFiles } from "@/stores/viewed-files";
 import {
   AlertTriangle,
   Check,
+  ChevronDown,
+  ChevronUp,
   Compass,
   Layers,
   RefreshCw,
   SplitSquareVertical,
   X,
 } from "lucide-react";
-import { type ReactNode, useCallback, useEffect, useMemo } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 /** Everything the review screen needs to scope itself to one layer. */
@@ -168,6 +178,9 @@ interface BarProps {
   files: PullFile[];
   headSha?: string;
   viewedKey: string | null;
+  /** The file open in the diff pane — a compact briefing stays unfolded until
+   * the reviewer moves past the file a layer opened on. */
+  activeFile: string | null;
   /** Open a file in the diff pane (used when moving between layers). */
   onSelectFile: (path: string) => void;
   /** Rebuild the review context for a subset of the PR's files — a per-layer
@@ -200,6 +213,24 @@ export function LayerBar(props: BarProps) {
   // A layer already toured, or one being toured right now.
   const touredLayers = useDeepTour((s) => s.byPr[prKey]?.byLayer);
   const tourGen = useDeepTourGen((s) => s.byPr[prKey]);
+  const compact = useUi((s) => s.compactChrome);
+  const toggleCompact = useUi((s) => s.toggleCompactChrome);
+
+  // In compact mode, entering a layer still unfolds its briefing — that's the
+  // moment it's worth reading — until the reviewer moves on to another file.
+  const activeId = scope.active?.id;
+  const prevLayerId = useRef(activeId);
+  const [peek, setPeek] = useState<{ layerId: string; file: string | null } | null>(null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: only a layer change starts a peek, with the file it opened on
+  useEffect(() => {
+    if (activeId && prevLayerId.current && activeId !== prevLayerId.current) {
+      setPeek({ layerId: activeId, file: props.activeFile });
+    }
+    prevLayerId.current = activeId;
+  }, [activeId]);
+  // Toggling compact mode is an explicit choice; drop any peek in flight.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reset on toggle only
+  useEffect(() => setPeek(null), [compact]);
 
   // Recover the "planning" state when a background run for this PR is still
   // going after navigating away or refreshing (the Rust task outlives both).
@@ -335,22 +366,149 @@ export function LayerBar(props: BarProps) {
   // The plan stopped describing this PR: everything ended up in the catch-all.
   const unusable = isPlanStale(plan);
 
+  const expanded = !compact || (peek?.layerId === active?.id && peek?.file === props.activeFile);
+
+  const tourButton = (size: "xs" | "sm") =>
+    active &&
+    available === true &&
+    props.onOpenGuided && (
+      <Button
+        size={size}
+        variant="outline"
+        disabled={
+          !!tourGen?.running.includes(active.id) ||
+          !!tourGen?.queued.some((j) => j.layerId === active.id)
+        }
+        onClick={() => {
+          // Already toured: just go read it rather than paying for the
+          // same call twice.
+          if (!touredLayers?.[active.id]) runDeepTour([active.id]);
+          // Either way this is an explicit "take me to THIS layer" —
+          // the tour jumps to its first stop, now or once it lands.
+          // Set after `runDeepTour`, which may have restarted the entry
+          // (and with it, dropped any pending request).
+          useDeepTour.getState().focusLayer(prKey, active.id);
+          props.onOpenGuided?.();
+        }}
+      >
+        <Compass className="size-3.5" />
+        {touredLayers?.[active.id] ? "Read tour" : "Tour this layer"}
+      </Button>
+    );
+
+  const completeButton = (size: "xs" | "sm") => (
+    <Button size={size} variant={activeStats.done ? "outline" : "default"} onClick={completeLayer}>
+      {activeStats.done ? "Next layer" : "Mark layer reviewed"}
+    </Button>
+  );
+
+  const briefingToggle = (
+    <TooltipFor label={expanded ? "Compact header" : "Expand header"} shortcut="z">
+      <Button
+        size="icon-xs"
+        variant="ghost"
+        aria-label={expanded ? "Collapse layer briefing" : "Expand layer briefing"}
+        aria-expanded={expanded}
+        // Folding a peeked briefing just ends the peek; otherwise this is the
+        // same switch as `z`.
+        onClick={() => (compact && expanded ? setPeek(null) : toggleCompact())}
+      >
+        {expanded ? <ChevronUp className="size-3.5" /> : <ChevronDown className="size-3.5" />}
+      </Button>
+    </TooltipFor>
+  );
+
+  const layerChip = active && (
+    <>
+      <h3 className="max-w-[16rem] truncate text-xs font-medium text-foreground">{active.title}</h3>
+      <span
+        className={cn("shrink-0 rounded px-1.5 py-px text-3xs font-medium", RISK_CHIP[active.risk])}
+      >
+        {RISK_LABEL[active.risk]}
+      </span>
+      <span className="shrink-0 text-2xs tabular-nums text-muted-foreground">
+        {activeStats.files} file{activeStats.files === 1 ? "" : "s"}
+        {" · "}
+        <span className="text-success">+{activeStats.additions}</span>{" "}
+        <span className="text-destructive">−{activeStats.deletions}</span>
+      </span>
+    </>
+  );
+
   return (
     <Shell>
-      <div className="flex items-center gap-2.5">
-        <Layers className="size-3.5 shrink-0 text-muted-foreground" />
-        <span className="text-xs font-medium text-foreground">Layered review</span>
-        <span className="text-xs text-muted-foreground">
-          Layer {index + 1} of {plan.layers.length}
-          {remaining === 0 ? " · all read" : ` · ${remaining} left`}
-          {entry?.source === "structure" ? " · structural split" : ""}
-        </span>
-        <div className="ml-auto flex shrink-0 items-center gap-1.5">
+      {/* Stepper — the whole PR at a glance, and the way to move between slices. */}
+      <div className="flex items-center gap-2">
+        <TooltipFor
+          label={`Layered review · layer ${index + 1} of ${plan.layers.length}${
+            entry?.source === "structure" ? " · structural split" : ""
+          }`}
+        >
+          <span className="flex shrink-0 cursor-default items-center gap-1.5 text-xs text-muted-foreground">
+            <Layers className="size-3.5" />
+            <span className="tabular-nums">
+              {index + 1}/{plan.layers.length}
+              {remaining === 0 ? " · all read" : ` · ${remaining} left`}
+            </span>
+          </span>
+        </TooltipFor>
+        <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto py-0.5">
+          {plan.layers.map((layer, i) => {
+            const s = stats[i];
+            const isActive = i === index;
+            return (
+              <button
+                key={layer.id}
+                type="button"
+                onClick={() => enterLayer(layer)}
+                aria-current={isActive ? "step" : undefined}
+                title={`${layer.title} · ${RISK_LABEL[layer.risk]} · ${s.viewed}/${s.files} reviewed`}
+                className={cn(
+                  "flex shrink-0 items-center gap-1.5 rounded-md px-1.5 py-1 text-xs transition-colors",
+                  isActive
+                    ? "bg-foreground/[0.08] text-foreground"
+                    : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+                )}
+              >
+                <span
+                  className={cn(
+                    "flex size-4 shrink-0 items-center justify-center rounded-full text-3xs tabular-nums",
+                    s.done
+                      ? "bg-success/15 text-success"
+                      : isActive
+                        ? "bg-primary text-primary-foreground"
+                        : "bg-foreground/[0.08] text-muted-foreground",
+                  )}
+                >
+                  {s.done ? <Check className="size-2.5" /> : i + 1}
+                </span>
+                <span className="max-w-[11rem] truncate">{layer.title}</span>
+                {RISK_DOT[layer.risk] && (
+                  <span
+                    className={cn("size-1.5 shrink-0 rounded-full", RISK_DOT[layer.risk])}
+                    aria-hidden
+                  />
+                )}
+                <span className="shrink-0 tabular-nums text-muted-foreground/70">
+                  {s.viewed}/{s.files}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
           {entry?.source === "structure" && canUseAi && (
             <TooltipFor label="Replace the structural split with a semantic one">
               <Button size="xs" variant="ghost" onClick={planWithAi}>
                 Plan with {aiName}
               </Button>
+            </TooltipFor>
+          )}
+          {entry && entry.source !== "structure" && (
+            <TooltipFor label={planByline(entry).full}>
+              <span className="max-w-40 shrink-0 cursor-default truncate text-2xs text-muted-foreground/70">
+                {planByline(entry).short}
+              </span>
             </TooltipFor>
           )}
           <TooltipFor label="Split this PR again">
@@ -384,128 +542,74 @@ export function LayerBar(props: BarProps) {
         </div>
       )}
 
-      {/* Stepper — the whole PR at a glance, and the way to move between slices. */}
-      <div className="-mx-1 mt-2 flex items-center gap-0.5 overflow-x-auto px-1 pb-0.5">
-        {plan.layers.map((layer, i) => {
-          const s = stats[i];
-          const isActive = i === index;
-          return (
-            <button
-              key={layer.id}
-              type="button"
-              onClick={() => enterLayer(layer)}
-              aria-current={isActive ? "step" : undefined}
-              title={`${layer.title} · ${RISK_LABEL[layer.risk]} · ${s.viewed}/${s.files} reviewed`}
-              className={cn(
-                "flex shrink-0 items-center gap-1.5 rounded-md px-1.5 py-1 text-xs transition-colors",
-                isActive
-                  ? "bg-foreground/[0.08] text-foreground"
-                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+      {/* Briefing for the layer in front of the reviewer — one line when compact. */}
+      {active &&
+        (expanded ? (
+          <div className="mt-2 flex items-start gap-3">
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">{layerChip}</div>
+              {active.intent && (
+                <p className="mt-1 line-clamp-2 text-sm leading-6 text-muted-foreground">
+                  {active.intent}
+                </p>
               )}
-            >
-              <span
-                className={cn(
-                  "flex size-4 shrink-0 items-center justify-center rounded-full text-3xs tabular-nums",
-                  s.done
-                    ? "bg-success/15 text-success"
-                    : isActive
-                      ? "bg-primary text-primary-foreground"
-                      : "bg-foreground/[0.08] text-muted-foreground",
-                )}
-              >
-                {s.done ? <Check className="size-2.5" /> : i + 1}
-              </span>
-              <span className="max-w-[11rem] truncate">{layer.title}</span>
-              {RISK_DOT[layer.risk] && (
-                <span
-                  className={cn("size-1.5 shrink-0 rounded-full", RISK_DOT[layer.risk])}
-                  aria-hidden
-                />
+              {active.focus.length > 0 && (
+                <ul className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
+                  {active.focus.map((f) => (
+                    <li
+                      key={f}
+                      className="flex items-center gap-1.5 text-xs leading-5 text-muted-foreground"
+                    >
+                      <span className="size-1 shrink-0 rounded-full bg-muted-foreground/50" />
+                      {f}
+                    </li>
+                  ))}
+                </ul>
               )}
-              <span className="shrink-0 tabular-nums text-muted-foreground/70">
-                {s.viewed}/{s.files}
-              </span>
-            </button>
-          );
-        })}
-      </div>
-
-      {/* Briefing for the layer in front of the reviewer. */}
-      {active && (
-        <div className="mt-2 flex items-start gap-3">
-          <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-2">
-              <h3 className="truncate text-xs font-medium text-foreground">{active.title}</h3>
-              <span
-                className={cn("rounded px-1.5 py-px text-3xs font-medium", RISK_CHIP[active.risk])}
-              >
-                {RISK_LABEL[active.risk]}
-              </span>
-              <span className="text-2xs tabular-nums text-muted-foreground">
-                {activeStats.files} file{activeStats.files === 1 ? "" : "s"}
-                {" · "}
-                <span className="text-success">+{activeStats.additions}</span>{" "}
-                <span className="text-destructive">−{activeStats.deletions}</span>
-              </span>
             </div>
-            {active.intent && (
-              <p className="mt-1 line-clamp-2 text-sm leading-6 text-muted-foreground">
-                {active.intent}
-              </p>
-            )}
-            {active.focus.length > 0 && (
-              <ul className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
-                {active.focus.map((f) => (
-                  <li
-                    key={f}
-                    className="flex items-center gap-1.5 text-xs leading-5 text-muted-foreground"
-                  >
-                    <span className="size-1 shrink-0 rounded-full bg-muted-foreground/50" />
-                    {f}
-                  </li>
-                ))}
-              </ul>
-            )}
+            <div className="flex shrink-0 items-center gap-1.5">
+              {tourButton("sm")}
+              {completeButton("sm")}
+              {briefingToggle}
+            </div>
           </div>
-          <div className="flex shrink-0 items-center gap-1.5">
-            {available === true && props.onOpenGuided && (
-              <Button
-                size="sm"
-                variant="outline"
-                disabled={
-                  !!tourGen?.running.includes(active.id) ||
-                  !!tourGen?.queued.some((j) => j.layerId === active.id)
-                }
-                onClick={() => {
-                  // Already toured: just go read it rather than paying for the
-                  // same call twice.
-                  if (!touredLayers?.[active.id]) runDeepTour([active.id]);
-                  // Either way this is an explicit "take me to THIS layer" —
-                  // the tour jumps to its first stop, now or once it lands.
-                  // Set after `runDeepTour`, which may have restarted the entry
-                  // (and with it, dropped any pending request).
-                  useDeepTour.getState().focusLayer(prKey, active.id);
-                  props.onOpenGuided?.();
-                }}
-              >
-                <Compass className="size-3.5" />
-                {touredLayers?.[active.id] ? "Read tour" : "Tour this layer"}
-              </Button>
-            )}
-            <Button
-              size="sm"
-              variant={activeStats.done ? "outline" : "default"}
-              onClick={completeLayer}
+        ) : (
+          <div className="mt-1.5 flex items-center gap-2">
+            {layerChip}
+            <span
+              className="min-w-0 flex-1 truncate text-xs text-muted-foreground"
+              title={active.intent || undefined}
             >
-              {activeStats.done ? "Next layer" : "Mark layer reviewed"}
-            </Button>
+              {active.intent}
+            </span>
+            <div className="flex shrink-0 items-center gap-1.5">
+              {tourButton("xs")}
+              {completeButton("xs")}
+              {briefingToggle}
+            </div>
           </div>
-        </div>
-      )}
+        ))}
     </Shell>
   );
 }
 
 function Shell({ children }: { children: ReactNode }) {
   return <div className="border-b border-hairline px-5 py-2.5">{children}</div>;
+}
+
+/** Who made an AI plan, for the layer bar: a terse "opus-5-5 · high" (the
+ *  `claude-` prefix and a `[1m]` context tag dropped to fit) and the full
+ *  story for its tooltip. Effort shows as "default" when none was sent — the
+ *  CLI's own setting applied. Plans from before this was recorded have no
+ *  model, so they show the provider instead. */
+function planByline(entry: LayersEntry): { short: string; full: string } {
+  const who = PROVIDER_LABEL[entry.source as AiProvider] ?? entry.source;
+  const effort = entry.effort ? (EFFORT_SHORT[entry.effort] ?? entry.effort) : "default";
+  const model = entry.model?.replace(/^claude-/, "").replace(/\[.*\]$/, "");
+  return {
+    short: `${model ?? who} · ${effort}`,
+    full: `Planned by ${who}${entry.model ? ` · ${entry.model}` : ""} · ${
+      entry.effort ? `${entry.effort} effort` : "default effort"
+    } · ${relativeTime(entry.generatedAt)}`,
+  };
 }

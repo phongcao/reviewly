@@ -137,19 +137,11 @@ pub async fn read_file(path: String) -> AppResult<String> {
     String::from_utf8(bytes).map_err(|_| AppError::Other("file is not valid UTF-8".into()))
 }
 
-const MAX_IMAGE_BYTES: u64 = 16_000_000;
+pub(crate) const MAX_IMAGE_BYTES: u64 = 16_000_000;
 
-/// Read a small image file and return it as a `data:<mime>;base64,…` URL the UI
-/// can drop straight into an `<img src>`. The text `read_file` rejects these
-/// (null bytes) — this is the image-preview path. MIME is inferred from the
-/// extension; unknown types fall back to octet-stream.
-#[tauri::command]
-pub async fn read_file_data_url(path: String) -> AppResult<String> {
-    let meta = std::fs::metadata(&path).map_err(|e| AppError::Other(format!("stat: {e}")))?;
-    if meta.len() > MAX_IMAGE_BYTES {
-        return Err(AppError::Other("image too large to preview".into()));
-    }
-    let mime = match std::path::Path::new(&path)
+/// Image MIME type from a path's extension; unknown types → octet-stream.
+pub(crate) fn image_mime(path: &str) -> &'static str {
+    match std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase)
@@ -164,7 +156,20 @@ pub async fn read_file_data_url(path: String) -> AppResult<String> {
         Some("avif") => "image/avif",
         Some("ico") => "image/x-icon",
         _ => "application/octet-stream",
-    };
+    }
+}
+
+/// Read a small image file and return it as a `data:<mime>;base64,…` URL the UI
+/// can drop straight into an `<img src>`. The text `read_file` rejects these
+/// (null bytes) — this is the image-preview path. MIME is inferred from the
+/// extension; unknown types fall back to octet-stream.
+#[tauri::command]
+pub async fn read_file_data_url(path: String) -> AppResult<String> {
+    let meta = std::fs::metadata(&path).map_err(|e| AppError::Other(format!("stat: {e}")))?;
+    if meta.len() > MAX_IMAGE_BYTES {
+        return Err(AppError::Other("image too large to preview".into()));
+    }
+    let mime = image_mime(&path);
     let bytes = std::fs::read(&path).map_err(|e| AppError::Other(format!("read: {e}")))?;
     Ok(format!(
         "data:{mime};base64,{}",

@@ -15,11 +15,23 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { UserHoverCard } from "@/components/user-hover-card";
+import {
+  BundleError,
+  type BundleStats,
+  applyBundle,
+  bundleFilename,
+  bundleStats,
+  collectBundle,
+  readBundle,
+  writeBundle,
+} from "@/lib/review-data";
 import { invoke } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import {
+  type AiEffort,
   type AiProvider,
   CLI_PROVIDERS,
+  EFFORT_PROVIDERS,
   MODEL_SUGGESTIONS,
   PROVIDER_LABEL,
   useAiProvider,
@@ -27,16 +39,22 @@ import {
 import { LANDING_OPTIONS, useAppBehavior } from "@/stores/app-behavior";
 import { ACCENTS, useAppearance } from "@/stores/appearance";
 import { useAuth } from "@/stores/auth";
+import { useDeepTour } from "@/stores/deep-tour";
+import { useGuided } from "@/stores/guided";
+import { useLayers } from "@/stores/layers";
 import { NOTIF_REASONS, useNotifSettings } from "@/stores/notif-settings";
 import { useReviewPrefs } from "@/stores/review-prefs";
 import { useTheme } from "@/stores/theme";
 import { useUi } from "@/stores/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   Bell,
   Check,
   Compass,
+  Download,
   Eye,
+  FolderDown,
   GitCommitHorizontal,
   GitMerge,
   Github,
@@ -51,8 +69,9 @@ import {
   Sparkles,
   SquareTerminal,
   Star,
+  Upload,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 type Activity = {
@@ -198,6 +217,7 @@ export function SettingsPage() {
 
               {provider === "openai" ? <OpenAiConfig /> : <CliModelConfig provider={provider} />}
 
+              {EFFORT_PROVIDERS.includes(provider) && <AiEffortConfig provider={provider} />}
               <AiTimeoutConfig />
 
               <AiInstructions />
@@ -209,6 +229,7 @@ export function SettingsPage() {
           <GuidedTourSection />
           <NotificationsSection />
           <BehaviorSection />
+          <ReviewDataSection />
         </div>
       </ScrollArea>
     </div>
@@ -403,6 +424,8 @@ function CodeReviewSection() {
   const setDiffWrap = useReviewPrefs((s) => s.setDiffWrap);
   const hideWhitespace = useReviewPrefs((s) => s.hideWhitespace);
   const setHideWhitespace = useReviewPrefs((s) => s.setHideWhitespace);
+  const markdownPreview = useReviewPrefs((s) => s.markdownPreview);
+  const setMarkdownPreview = useReviewPrefs((s) => s.setMarkdownPreview);
   const diffView = useUi((s) => s.diffView);
   const setDiffView = useUi((s) => s.setDiffView);
   const focusMode = useUi((s) => s.focusMode);
@@ -474,6 +497,12 @@ function CodeReviewSection() {
           description="Collapse lines that differ only by whitespace when reading a diff."
           checked={hideWhitespace}
           onChange={setHideWhitespace}
+        />
+        <SettingToggle
+          label="Render Markdown files"
+          description="Open .md files as rendered documents instead of a raw diff. Toggle per file with the Preview button or m."
+          checked={markdownPreview}
+          onChange={setMarkdownPreview}
         />
       </Card>
     </CollapsibleSection>
@@ -730,6 +759,15 @@ const PROVIDERS: ProviderMeta[] = [
     install: "npm i -g @google/gemini-cli",
   },
   {
+    id: "copilot",
+    label: "GitHub Copilot",
+    blurb: "GitHub CLI · your Copilot plan",
+    icon: Github,
+    tint: "text-foreground",
+    tile: "bg-foreground/8",
+    install: "npm i -g @github/copilot",
+  },
+  {
     id: "openai",
     label: "OpenAI-compatible",
     blurb: "Ollama · OpenRouter · DeepSeek",
@@ -911,6 +949,54 @@ function OpenAiField({
   );
 }
 
+const EFFORT_OPTIONS: { value: string; label: string }[] = [
+  { value: "default", label: "Default" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "Extra high" },
+  { value: "max", label: "Max" },
+];
+
+/** Reasoning effort for the providers that take one (`--effort` for Claude,
+ *  `--reasoning-effort` for Copilot). "Default" sends nothing, so the CLI's own
+ *  setting applies. */
+function AiEffortConfig({ provider }: { provider: AiProvider }) {
+  const name = PROVIDER_LABEL[provider];
+  const effortLabel = (label: string) => (label === "Default" ? `${name} default` : label);
+  const effort = useAiProvider((s) => s.claudeEffort);
+  const setEffort = useAiProvider((s) => s.setClaudeEffort);
+  const value = effort ?? "default";
+  return (
+    <div className="mt-4 flex items-center justify-between gap-4 border-t border-hairline pt-4">
+      <div className="min-w-0">
+        <p className="text-xs font-medium text-foreground">Effort</p>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          How hard {name} thinks before answering. Higher is slower and costs more, but plans and
+          reviews are more careful.
+        </p>
+      </div>
+      <Select
+        value={value}
+        onValueChange={(v) => v && setEffort(v === "default" ? null : (v as AiEffort))}
+      >
+        <SelectTrigger size="sm" className="w-36 text-xs text-foreground">
+          <SelectValue>
+            {(v) => effortLabel(EFFORT_OPTIONS.find((o) => o.value === v)?.label ?? String(v))}
+          </SelectValue>
+        </SelectTrigger>
+        <SelectContent>
+          {EFFORT_OPTIONS.map((o) => (
+            <SelectItem key={o.value} value={o.value} className="text-xs">
+              {effortLabel(o.label)}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
 const TIMEOUT_OPTIONS: { value: string; label: string }[] = [
   { value: "auto", label: "Automatic" },
   { value: "180", label: "3 minutes" },
@@ -989,4 +1075,152 @@ function CliModelConfig({ provider }: { provider: AiProvider }) {
       </p>
     </div>
   );
+}
+
+/**
+ * Export / import the review data a PR accumulates — deep tours above all.
+ *
+ * Reviewly stores this locally and only locally, so the tours a reviewer paid
+ * AI tokens and wall-clock for are stranded on one machine. This makes them
+ * portable without asking anyone to copy a SQLite file around: a JSON bundle
+ * grouped by PR, merged on the way in.
+ */
+function ReviewDataSection() {
+  const [busy, setBusy] = useState<"export" | "import" | null>(null);
+  const stats = useLiveBundleStats();
+
+  async function exportData() {
+    setBusy("export");
+    try {
+      const bundle = await collectBundle();
+      if (Object.keys(bundle.prs).length === 0) {
+        toast.info("Nothing to export yet — review a PR first.");
+        return;
+      }
+      const path = await save({
+        title: "Export review data",
+        defaultPath: bundleFilename(),
+        filters: [{ name: "Reviewly review data", extensions: ["json"] }],
+      });
+      if (!path) return;
+      await writeBundle(path, bundle);
+      const s = bundleStats(bundle);
+      toast.success(`Exported ${countLabel(s)} to ${basename(path)}`);
+    } catch (e) {
+      toast.error(`Export failed — ${String(e)}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function importData() {
+    setBusy("import");
+    try {
+      const picked = await open({
+        title: "Import review data",
+        multiple: false,
+        filters: [{ name: "Reviewly review data", extensions: ["json"] }],
+      });
+      if (!picked || typeof picked !== "string") return;
+      const bundle = await readBundle(picked);
+      const r = applyBundle(bundle);
+      const landed = r.deepTours + r.guidedTours + r.layerPlans + r.viewedKeys;
+      if (landed === 0) {
+        toast.info("Already up to date — nothing in that bundle was newer.");
+        return;
+      }
+      const parts = [
+        r.deepTours && `${r.deepTours} deep ${plural(r.deepTours, "tour")}`,
+        r.guidedTours && `${r.guidedTours} guided ${plural(r.guidedTours, "tour")}`,
+        r.layerPlans && `${r.layerPlans} layer ${plural(r.layerPlans, "plan")}`,
+        r.viewedKeys && `viewed marks for ${r.viewedKeys} ${plural(r.viewedKeys, "PR")}`,
+      ].filter((p): p is string => !!p);
+      toast.success(`Imported ${parts.join(", ")}`, {
+        description: r.skipped > 0 ? `${r.skipped} kept — the local copy was newer.` : undefined,
+      });
+    } catch (e) {
+      const msg = e instanceof BundleError ? e.message : String(e);
+      toast.error(`Import failed — ${msg}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <CollapsibleSection id="review-data" title="Review data" icon={FolderDown}>
+      <Card className="space-y-4">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <p className="text-xs font-medium text-foreground">Deep tours and layer plans</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              {stats.prs === 0
+                ? "No review data stored yet."
+                : `${countLabel(stats)} stored across ${stats.prs} ${plural(stats.prs, "PR")}.`}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 border-t border-hairline pt-4">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={exportData}
+            disabled={busy !== null || stats.prs === 0}
+          >
+            <Upload className="size-3.5" strokeWidth={1.5} />
+            {busy === "export" ? "Exporting…" : "Export…"}
+          </Button>
+          <Button size="sm" variant="outline" onClick={importData} disabled={busy !== null}>
+            <Download className="size-3.5" strokeWidth={1.5} />
+            {busy === "import" ? "Importing…" : "Import…"}
+          </Button>
+          <p className="ml-auto text-2xs text-muted-foreground">
+            Import merges — a newer local tour is never overwritten.
+          </p>
+        </div>
+
+        <p className="text-xs text-muted-foreground">
+          Carry tours you've already generated to another machine instead of paying for them twice.
+          A tour whose PR has new commits since still imports, and shows as stale.
+        </p>
+      </Card>
+    </CollapsibleSection>
+  );
+}
+
+function plural(n: number, word: string): string {
+  return n === 1 ? word : `${word}s`;
+}
+
+/** Last path segment, for the toast. Split on both separators — the save dialog
+ * hands back backslashes on Windows. */
+function basename(path: string): string {
+  return path.split(/[/\\]/).pop() ?? path;
+}
+
+/** "3 deep tours (214 stops)" — the stop count is what makes the size real. */
+function countLabel(s: BundleStats): string {
+  const head = `${s.deepTours} deep ${plural(s.deepTours, "tour")}`;
+  return s.deepStops > 0 ? `${head} (${s.deepStops} ${plural(s.deepStops, "stop")})` : head;
+}
+
+/** Live counts straight off the stores, so the line updates as tours land. */
+function useLiveBundleStats(): BundleStats {
+  const deep = useDeepTour((s) => s.byPr);
+  const layers = useLayers((s) => s.byPr);
+  const guided = useGuided((s) => s.byPr);
+  return useMemo(() => {
+    const keys = new Set([...Object.keys(deep), ...Object.keys(layers), ...Object.keys(guided)]);
+    return {
+      prs: keys.size,
+      deepTours: Object.keys(deep).length,
+      guidedTours: Object.keys(guided).length,
+      layerPlans: Object.keys(layers).length,
+      deepStops: Object.values(deep).reduce(
+        (n, e) =>
+          n + Object.values(e.byLayer ?? {}).reduce((m, b) => m + (b.plan?.steps?.length ?? 0), 0),
+        0,
+      ),
+    };
+  }, [deep, layers, guided]);
 }

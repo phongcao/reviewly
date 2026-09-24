@@ -10,7 +10,7 @@ import { CHAT_SYSTEM } from "@/lib/ai/prompts";
 import { type PullFile, invoke } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import { PROVIDER_LABEL, aiInvokeArgs, useAiProvider } from "@/stores/ai";
-import { type ChatMessage, useAiChat } from "@/stores/ai-chat";
+import { type ChatMessage, useAiChat, whenChatHydrated } from "@/stores/ai-chat";
 import { useLocalRepos } from "@/stores/local-repos";
 import { useReviewPrefs } from "@/stores/review-prefs";
 import { listen } from "@tauri-apps/api/event";
@@ -43,6 +43,14 @@ interface Props {
   // not here, because this panel unmounts when the chat is collapsed — and the
   // bridge has to keep listening so edits made in a detached chat window still
   // reach this window's store.
+}
+
+/** `ai:complete` payload — also what `ai_stream_claim` hands back. */
+interface StreamComplete {
+  key: string;
+  ok: boolean;
+  output?: string;
+  error?: string;
 }
 
 const EMPTY: ChatMessage[] = [];
@@ -88,34 +96,61 @@ export function AiReview({ prKey, context, executeAction, files }: Props) {
 
   // Stream tokens (ai:chunk) + completion (ai:complete) for THIS PR. Chunks
   // accumulate live; on complete we commit the full text to the store.
+  //
+  // The turn lives in the backend, not in this component: the panel unmounts
+  // when collapsed or popped out mid-answer, and the pop-out window's panel
+  // didn't start the turn. So on mount we adopt whatever is in flight, and the
+  // answer is committed by whichever surface claims it first (exactly once).
   useEffect(() => {
-    const unlistens: Array<() => void> = [];
     let alive = true;
-    const track = (p: Promise<() => void>) => {
-      p.then((u) => (alive ? unlistens.push(u) : u()));
+    const commit = async () => {
+      const p = await invoke<StreamComplete | null>("ai_stream_claim", { key: prKey }).catch(
+        () => null,
+      );
+      if (!p) return; // another window (or a Stop) already took it
+      append(prKey, {
+        role: "assistant",
+        content: p.ok ? (p.output ?? "") : `⚠️ ${p.error ?? "AI failed"}`,
+      });
     };
-    track(
+    // Set when a turn ends while we're still looking up what to adopt, so a
+    // stale "still running" snapshot can't leave the panel stuck on "thinking".
+    let completed = false;
+    const listening = Promise.all([
       listen<{ key: string; delta: string }>("ai:chunk", (e) => {
         if (e.payload.key !== prKey || !streamingRef.current) return;
         setStreamText((t) => t + e.payload.delta);
       }),
-    );
-    track(
-      listen<{ key: string; ok: boolean; output?: string; error?: string }>("ai:complete", (e) => {
-        if (e.payload.key !== prKey || !streamingRef.current) return;
-        const p = e.payload;
-        append(prKey, {
-          role: "assistant",
-          content: p.ok ? (p.output ?? "") : `⚠️ ${p.error ?? "AI failed"}`,
-        });
+      listen<StreamComplete>("ai:complete", (e) => {
+        if (e.payload.key !== prKey) return;
+        completed = true;
         streamingRef.current = false;
         setStreaming(false);
         setStreamText("");
+        void commit();
       }),
-    );
+    ]);
+    listening.then(async () => {
+      // Appending before hydration would be overwritten when it lands.
+      await whenChatHydrated();
+      const s = await invoke<{ text: string; done: StreamComplete | null } | null>(
+        "ai_stream_state",
+        { key: prKey },
+      ).catch(() => null);
+      if (!alive || !s || completed || streamingRef.current) return;
+      if (s.done) {
+        void commit();
+      } else {
+        streamingRef.current = true;
+        setStreaming(true);
+        setStreamText(s.text);
+      }
+    });
     return () => {
       alive = false;
-      for (const u of unlistens) u();
+      listening.then((us) => {
+        for (const u of us) u();
+      });
     };
   }, [prKey, append]);
 
@@ -392,11 +427,11 @@ export function AiReview({ prKey, context, executeAction, files }: Props) {
 
 /** One attached snippet/file on the composer, with a remove affordance. */
 function ContextChip({ refItem, onRemove }: { refItem: PrContextRef; onRemove: () => void }) {
-  const Icon = refItem.kind === "snippet" ? TextQuote : FileCode;
+  const Icon = refItem.kind === "snippet" || refItem.quote ? TextQuote : FileCode;
   const label = refLabel(refItem);
   return (
     <span
-      title={refItem.path}
+      title={refItem.quote ? `${refItem.path}\n\n“${refItem.quote}”` : refItem.path}
       className="inline-flex items-center gap-1 rounded-md bg-primary/15 px-1.5 py-0.5 font-mono text-2xs font-medium text-primary"
     >
       <Icon className="size-3 shrink-0" />

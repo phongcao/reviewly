@@ -656,6 +656,82 @@
   font-size: inherit;
 }
 
+/* Image previews (ImagePreview): a faint checkerboard so transparent pixels
+ * read as transparent in either theme. */
+.image-checker {
+  --checker: color-mix(in oklch, var(--color-foreground) 6%, transparent);
+  background-color: color-mix(in oklch, var(--color-foreground) 2%, transparent);
+  background-image: conic-gradient(
+    var(--checker) 25%,
+    transparent 0 50%,
+    var(--checker) 0 75%,
+    transparent 0
+  );
+  background-size: 16px 16px;
+}
+
+/* ```mermaid fences (MermaidDiagram). Mermaid sizes the SVG with an inline
+ * max-width; keep it centered and let very wide diagrams scroll. */
+.prose-mermaid {
+  margin: 0.5rem 0;
+  padding: 0.85rem;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: color-mix(in oklch, var(--color-card) 60%, transparent);
+  overflow-x: auto;
+  text-align: center;
+  /* Mermaid measures labels outside the page, so undo the text tweaks
+     `.prose-reviewly` would otherwise inherit — they reflow labels past the
+     boxes mermaid sized for them. */
+  line-height: normal;
+  letter-spacing: normal;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+.prose-mermaid svg {
+  display: inline-block;
+  height: auto;
+}
+/* Labels are measured before they're in the page, so real text (emoji
+   especially) can come out a few px wider than its box — let it spill
+   rather than clip the last word of a subgraph title. */
+.prose-mermaid foreignObject {
+  overflow: visible;
+}
+/* Label text takes the label's color, not `.prose-reviewly`'s p/b colors —
+   mermaid wraps every label in a <p>. */
+.prose-mermaid p,
+.prose-mermaid b,
+.prose-mermaid strong {
+  color: inherit;
+}
+.prose-mermaid b,
+.prose-mermaid strong {
+  font-weight: bold;
+}
+.prose-mermaid.is-loading {
+  font-size: 0.75rem;
+  color: var(--color-muted-foreground);
+}
+.prose-mermaid-error {
+  margin: 0.5rem 0;
+}
+.prose-mermaid-error-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+  font-size: 0.75rem;
+  color: var(--color-warning);
+}
+.prose-mermaid-error-detail {
+  margin-top: 0.35rem;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--color-muted-foreground);
+  white-space: pre-wrap;
+}
+
 .prose-reviewly ul,
 .prose-reviewly ol {
   padding-left: 1.4rem;
@@ -699,14 +775,28 @@
   border-radius: 0 6px 6px 0;
 }
 
+/* The frame owns the border so a table wider than the pane scrolls inside it
+   rather than being clipped by the rounded corners. */
+.prose-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+}
 .prose-reviewly table {
   width: 100%;
   border-collapse: separate;
   border-spacing: 0;
   font-size: 0.75rem;
-  border: 1px solid var(--color-border);
-  border-radius: 8px;
-  overflow: hidden;
+}
+/* `anywhere`/`break-word` (inherited from `.prose-reviewly` and inline code)
+   shrink a cell's min-content width to one character, so auto table layout
+   crushes short columns into a letter per line ("M/et/ho/d"). In cells, only
+   break at word boundaries; the frame scrolls if the words don't fit. */
+.prose-reviewly th,
+.prose-reviewly td,
+.prose-reviewly :is(th, td) code {
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 .prose-reviewly thead {
   background: color-mix(in oklch, var(--color-card) 70%, transparent);

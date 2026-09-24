@@ -3,6 +3,7 @@ pub mod ai;
 pub mod app;
 pub mod attachments;
 pub mod auth;
+pub mod backup;
 pub mod comments;
 pub mod git;
 pub mod notifications;

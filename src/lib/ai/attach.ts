@@ -1,4 +1,5 @@
 import { parsePatch } from "@/lib/diff";
+import type { ReviewLocation } from "@/lib/review-context";
 import type { PullFile } from "@/lib/tauri";
 
 /**
@@ -6,6 +7,13 @@ import type { PullFile } from "@/lib/tauri";
  * diff, or a whole file picked with `@`. These ride along with the question as
  * a "# Focused context" block so the model knows exactly what's being asked
  * about, instead of guessing from the whole-PR diff.
+ *
+ * A `PrContextRef` is an *attachment*, not a place: it carries a side, a range
+ * and captured code because the model needs all three. Where the reviewer is
+ * *looking* is `ReviewLocation` (`@/lib/review-context`), which is deliberately
+ * just a path and a line. The two meet at `refLocation` below — one canonical
+ * location type, projected onto from here, rather than a second one defined
+ * alongside it.
  */
 
 export type ContextSide = "LEFT" | "RIGHT";
@@ -27,6 +35,13 @@ export interface PrContextRef {
    * reproduce (expanded-context rows).
    */
   code?: string;
+  /**
+   * Text the reviewer highlighted in a *rendered* view (the Markdown preview),
+   * as displayed. Unlike `code` this IS persisted: rendered prose can't be
+   * re-derived from the patch, and it's what the reviewer was actually looking
+   * at. The line range, when known, is the source span that text came from.
+   */
+  quote?: string;
 }
 
 /** Shape the composer's `@` autocomplete consumes (see ui/textarea.tsx). */
@@ -41,6 +56,8 @@ const SNIPPET_CHARS = 6_000;
 const FILE_CHARS = 8_000;
 const FOCUS_BUDGET = 12_000;
 const MAX_SNIPPET_LINES = 400;
+/** Cap on a highlighted prose quote — it's persisted, unlike `code`. */
+const QUOTE_CHARS = 2_000;
 /** Unchanged lines shown either side of an attached range, for orientation. */
 const CTX = 3;
 
@@ -68,6 +85,21 @@ export function refForFile(path: string): PrContextRef {
   return { id: `file:${path}`, kind: "file", path };
 }
 
+/**
+ * Project an attachment onto the place it points at, for handing to the review
+ * context pane.
+ *
+ * A whole-file ref has no line, and a snippet anchors on the first line of its
+ * range: the pane shows the file from the top of the region the reviewer picked
+ * out, which is where they were already reading. The `side` is dropped on
+ * purpose — the pane renders the file at the PR head, where LEFT line numbers
+ * don't address anything.
+ */
+export function refLocation(ref: PrContextRef): ReviewLocation {
+  if (ref.kind === "file" || ref.side === "LEFT") return { path: ref.path };
+  return ref.from != null ? { path: ref.path, line: ref.from } : { path: ref.path };
+}
+
 /** `foo.ts:120-134`, `foo.ts:120`, or plain `foo.ts` for a whole-file ref. */
 export function refLabel(ref: PrContextRef): string {
   const base = ref.path.split("/").pop() || ref.path;
@@ -84,7 +116,15 @@ export function refLabel(ref: PrContextRef): string {
  * on later turns, keeping the model oriented after the focused block is gone.
  */
 export function echoRefs(refs: PrContextRef[]): string {
-  return refs.map((r) => `> 📎 \`${refPathLabel(r)}\``).join("\n");
+  return refs
+    .map((r) => {
+      const base = `> 📎 \`${refPathLabel(r)}\``;
+      if (!r.quote) return base;
+      // One line of the quote is enough to keep later turns oriented.
+      const flat = r.quote.replace(/\s+/g, " ");
+      return `${base} “${flat.length > 120 ? `${flat.slice(0, 120)}…` : flat}”`;
+    })
+    .join("\n");
 }
 
 /** Full-path variant of `refLabel`, for the prompt and the transcript echo. */
@@ -186,6 +226,79 @@ export function refFromSelection(
   return refFromLines(path, side, Math.min(...nums), Math.max(...nums));
 }
 
+/** Short, stable hash — two different highlights in one paragraph are two refs. */
+function hash(text: string): string {
+  let h = 5381;
+  for (let i = 0; i < text.length; i++) h = ((h << 5) + h + text.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36);
+}
+
+/**
+ * Map a text selection inside rendered Markdown back to the file and, when the
+ * render carries source positions (`data-source-start` / `data-source-end`,
+ * stamped by `MarkdownBody`'s `sourceLines`), the source lines it came from.
+ *
+ * Walks the selected *text nodes* rather than the endpoint elements: a
+ * triple-click ends the range at offset 0 of the next block, which would
+ * otherwise claim a paragraph the reviewer never highlighted. Each text node
+ * resolves to its nearest positioned ancestor, so a word in a `<strong>` maps
+ * to its own line rather than its whole paragraph.
+ *
+ * Without positions (a preview built from a partial patch, whose lines don't
+ * line up with the file) this still returns a ref — path plus quote — because
+ * "this file, this text" is most of what the model needs.
+ */
+export function refFromProse(
+  root: HTMLElement,
+  path: string,
+  sel: Selection | null,
+): PrContextRef | null {
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+  if (!root.contains(sel.anchorNode) && !root.contains(sel.focusNode)) return null;
+  const range = sel.getRangeAt(0);
+
+  let from = Number.POSITIVE_INFINITY;
+  let to = Number.NEGATIVE_INFINITY;
+  let any = false;
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  for (let n = walker.nextNode(); n; n = walker.nextNode()) {
+    const text = n as Text;
+    if (!range.intersectsNode(text)) continue;
+    const s = text === range.startContainer ? range.startOffset : 0;
+    const e = text === range.endContainer ? range.endOffset : text.length;
+    if (!text.data.slice(s, e).trim()) continue;
+    any = true;
+    const el = text.parentElement?.closest<HTMLElement>("[data-source-start]");
+    const a = num(el?.dataset.sourceStart);
+    const b = num(el?.dataset.sourceEnd);
+    if (a == null || b == null || !root.contains(el ?? null)) continue;
+    from = Math.min(from, a);
+    to = Math.max(to, b);
+  }
+  if (!any) return null;
+
+  const raw = sel
+    .toString()
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (!raw) return null;
+  const quote = raw.length <= QUOTE_CHARS ? raw : `${raw.slice(0, QUOTE_CHARS)}…`;
+  const tag = hash(quote);
+
+  if (Number.isFinite(from)) {
+    return {
+      id: `quote:${path}:${from}-${to}:${tag}`,
+      kind: "snippet",
+      path,
+      side: "RIGHT",
+      from,
+      to,
+      quote,
+    };
+  }
+  return { id: `quote:${path}:${tag}`, kind: "file", path, quote };
+}
+
 /* ───────────────────── snippet text ───────────────────── */
 
 function prefixFor(kind: string): string {
@@ -279,6 +392,16 @@ export function buildFocusedContext(refs: PrContextRef[], files: PullFile[]): st
     const file = files.find((f) => f.filename === ref.path);
     let body: string;
     let heading: string;
+    if (ref.quote != null) {
+      const block = quoteBlock(ref, file);
+      if (block.length > budget) {
+        dropped++;
+        continue;
+      }
+      budget -= block.length;
+      blocks.push(block);
+      continue;
+    }
     if (ref.kind === "file") {
       heading = `## ${ref.path} (whole file)`;
       // Worth repeating even though it's in the PR diff below: that diff is
@@ -305,6 +428,25 @@ export function buildFocusedContext(refs: PrContextRef[], files: PullFile[]): st
   const head =
     "# Focused context\nThe reviewer explicitly attached the region(s) below. Anchor your answer here — the full PR diff further down is background only.";
   return `${head}\n\n${blocks.join("\n\n")}${note}`;
+}
+
+/**
+ * A highlight from the rendered document: the text as the reviewer saw it,
+ * then the source lines behind it when they can still be recovered — from the
+ * patch, or from what was captured at attach time for an unchanged region.
+ */
+function quoteBlock(ref: PrContextRef, file: PullFile | undefined): string {
+  const quoted = (ref.quote ?? "")
+    .split("\n")
+    .map((l) => (l ? `> ${l}` : ">"))
+    .join("\n");
+  let out = `## ${refPathLabel(ref)} (text highlighted in the rendered document)\n${quoted}`;
+  if (ref.from != null && ref.to != null) {
+    let src = buildSnippet(file?.patch, "RIGHT", ref.from, ref.to);
+    if (src.startsWith("(this range isn't present")) src = ref.code ?? "";
+    if (src) out += `\n\nSource lines:\n\`\`\`diff\n${src}\n\`\`\``;
+  }
+  return out;
 }
 
 /* ───────────────────── `@` path search ───────────────────── */

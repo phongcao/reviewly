@@ -111,17 +111,22 @@ export function buildLayeredSystem(o: { layers: CountBand; size: PrSize }): stri
 A layer is a set of changed files that share ONE idea, so a reviewer can hold it in their head and finish it before moving on. "Same idea" — not "same folder". The migration and the model it backs belong together even in different directories; two unrelated features under src/ do not belong together just because they're both under src/.
 
 ## The order is the point
-Order layers so each one is understandable using only what came before it:
-1. Foundations first — schema / migrations / data model, then the types and contracts written against them.
-2. Then the logic that uses those foundations, then the surface that exposes it (API, routes, commands), then the UI that consumes it.
-3. Then tests, then config / CI, then generated files and lockfiles LAST — they're skimmed, not read.
-A reviewer landing on layer 3 should never have to say "wait, what is this type?" — that type should have been layer 1. When two layers are independent, put the riskier one first.
+Order layers so each one is understandable using only what came before it. Follow these positions as written rather than reordering by taste — the same PR should always read in the same order:
+1. Design context — ADRs, RFCs, design and architecture docs that say what is being built and why. They make every later layer faster to follow. Only when the PR contains such docs; never make this layer out of code.
+2. Foundations — schema / migrations / data model, then the types and contracts written against them.
+3. The logic that uses those foundations, then the surface that exposes it (API, routes, commands), then the UI that consumes it.
+4. Tests — what the code above claims to guarantee.
+5. Config / CI.
+6. User-facing docs — the top-level README, setup and usage guides, changelogs. Read once the code is known, so the reviewer can check them against it.
+7. Generated files and lockfiles LAST — they're skimmed, not read.
+A reviewer landing on layer 3 should never have to say "wait, what is this type?" — that type should have been an earlier layer. Skip any position the PR has nothing for. When two layers sit at the same position and are independent, put the riskier one first.
 
 ## Rules you cannot break
 - EVERY changed file appears in EXACTLY ONE layer. Not zero, not two. The complete list is given to you under "## Complete file list" — use it as your checklist and account for every entry.
 - Copy paths VERBATIM from that list. Never invent, abbreviate, re-case, or glob a path; never write "src/**" or "the rest of the components". If a path isn't in the list, it doesn't exist.
 - ${o.layers.min} to ${o.layers.max} layers for a PR this size (${o.size.files} changed files). Aim near the top of that range on a big PR. A layer of one important file is fine; twenty tiny layers is not a layering, and neither is one layer holding everything.
 - Group the noise: lockfiles, snapshots, and generated output all go in ONE trailing layer, never scattered.
+- Sort docs by what they say, not where they live: a doc that records a decision or explains the design is design context (position 1); one that tells someone how to set up, run, or use the system is user-facing (position 6). The one exception is a README sitting beside the code it documents (e.g. \`db/README.md\`) — it joins that code's layer.
 
 ## Fields
 - "title": 2-4 words naming the idea, not the folder ("Token refresh", "Rate-limit middleware" — not "src/auth changes").
@@ -133,6 +138,93 @@ A reviewer landing on layer 3 should never have to say "wait, what is this type?
 Return ONLY a single JSON object — no prose, no markdown fence. Shape:
 {"summary":"one sentence: what this PR does","strategy":"1-2 sentences: why the layers are in this order","layers":[{"title":"short name for the idea","intent":"what this layer changes and why it's read here","focus":["concrete thing to check"],"risk":"low"|"medium"|"high","files":["path/from/the/list.ts"]}]}
 Return the JSON object only.`;
+}
+
+/**
+ * Behavioral before/after for ONE changed symbol, asked on demand from a tour
+ * stop.
+ *
+ * The hard part isn't producing a summary — it's stopping the model from
+ * narrating the diff back ("adds a check", "refactors the loop"), which tells
+ * the reviewer nothing they couldn't see. So the prompt asks for two lists of
+ * what the code DOES, in execution order, and makes the change list a
+ * consequence of the difference between them rather than a separate act of
+ * summarizing.
+ *
+ * `refactor_only` is offered explicitly and without penalty. A model that feels
+ * obliged to find a behavioral change will invent one, and "nothing observable
+ * changed" is both the most common truth in a large PR and the most useful
+ * thing a reviewer can be told.
+ */
+export function buildBehaviorPrompt(o: {
+  path: string;
+  line: number;
+  endLine?: number;
+  /**
+   * What the reviewer pointed at: a tour stop's title, or the symbol git names
+   * in the hunk header. Absent when they simply selected lines — the location
+   * alone is then the whole of the request, which is why this is optional
+   * rather than faked with a placeholder the model would try to interpret.
+   */
+  subject?: string;
+  /** The file's unified diff, so this works with no clone present. */
+  patch: string;
+  /** True when a local checkout is available to read beyond the diff. */
+  clone: boolean;
+}): string {
+  const loc = `${o.path}:${o.line}${o.endLine ? `-${o.endLine}` : ""}`;
+  const subject = o.subject?.trim()
+    ? `${loc} — the reviewer is looking at "${o.subject.trim()}".`
+    : `${loc} — the lines the reviewer selected.`;
+  return `You are explaining ONE changed symbol to a code reviewer as BEHAVIOR, not as a description of the edit.
+
+## The symbol
+${subject} Work out which function / method / class / route contains that range and describe THAT symbol. If the range spans several, describe the one carrying the changed lines. If nothing encloses it — a module docstring, imports, or top-level statements — describe the MODULE as the symbol.
+
+## What to produce
+Two lists of what the code DOES, as a reader would execute it:
+- "before": the behavior of the OLD version, one step per bullet, in execution order.
+- "after": the behavior of the NEW version, same form.
+Then "changes": what actually differs, derived by comparing your two lists.
+
+Keep the two lists PARALLEL: the same steps, in the same order, worded IDENTICALLY where the behavior didn't change. They are shown side by side, so an unchanged step must read the same on both sides or the reader cannot tell what moved. Add or drop a bullet only where a step genuinely appeared or disappeared.
+
+A symbol added by this diff has an empty "before". A symbol deleted by it has an empty "after".
+
+## Rules that make this useful
+- Describe BEHAVIOR, never the edit. "Items where \`quantity <= 0\` no longer contribute to the total" — not "adds a continue statement", "updates the loop", "improves handling".
+- PRESERVE the things that carry meaning, verbatim from the code: identifiers, conditions, thresholds, error types, routes, state values, config keys, retry/timeout values. "Retry delay becomes \`2^attempt * 500ms\`, capped at \`30s\`" beats "retries now back off".
+- Every bullet must be supported by code you can actually see${o.clone ? " (read the file — you have a checkout)" : " in the diff below"}. Do not infer behavior you cannot point at. If the symbol calls something you can't see, describe the call, not what you imagine it does.
+- Only put a name in backticks if it appears verbatim in the code you read. Never invent a symbol to make a sentence read better.
+- Keep each bullet to ONE clause of at most ~20 words. Split a compound step into two bullets rather than writing a paragraph.
+- How many: 3-7 bullets for a function or method, up to 12 for a whole module or class. Fewer if the symbol is small. If you need more than that, you are listing lines rather than describing behavior — group them.
+
+## Classifying each change
+- "new_guard" — a condition now rejects / skips input that previously went through.
+- "behavior_added" / "behavior_removed" — the code now does, or no longer does, something observable.
+- "ordering_change" — same steps, different order, and the order matters.
+- "contract_change" — signature, return shape, or an API/route surface changed.
+- "error_change" — what is raised, caught, retried, or swallowed changed.
+- "refactor_only" — the code was reorganized and you can detect NO observable difference in input/output, side effects, or errors.
+
+If the whole change is behavior-preserving, say so: emit "before" and "after" that match and a single "refactor_only" change. That is a complete, correct, useful answer — do not manufacture a behavioral difference to seem thorough.
+
+## Anchoring — every change must be checkable
+Each entry in "changes" carries "ranges": the lines in the diff that PROVE it, as NEW-file line numbers (the \`+\` side of the \`@@\` header). A reviewer clicks these to land on the code, and a statement nobody can check is worth less than no statement.
+- Cite the lines that actually demonstrate the change — the added guard, the new call, the removed branch. Prefer \`+\` lines; for something the diff REMOVES, cite the new-file line where it used to be.
+- Use "endLine" when the evidence spans several lines. One to three ranges per change is normal.
+- Never invent a line number. If you genuinely cannot point at one, return an empty "ranges" rather than a guess — a guess is worse than an admission.
+
+## Output
+Return ONLY a single JSON object — no prose, no markdown fence:
+{"symbol":"Name.of.symbol","before":["…"],"after":["…"],"changes":[{"type":"new_guard","text":"…","ranges":[{"line":142,"endLine":153}]}]}
+
+"symbol" is the BARE NAME only — \`calculate_price\`, \`JobWorker.run\`, \`POST /documents\`, or the module name. Never a sentence, never a parenthetical explanation; it is rendered as a heading.
+
+# The file's diff
+\`\`\`diff
+${o.patch}
+\`\`\``;
 }
 
 /** Free-form review-chat system prompt — supports the <action> post protocol. */
