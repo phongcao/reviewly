@@ -775,14 +775,28 @@
   border-radius: 0 6px 6px 0;
 }
 
+/* The frame owns the border so a table wider than the pane scrolls inside it
+   rather than being clipped by the rounded corners. */
+.prose-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+}
 .prose-reviewly table {
   width: 100%;
   border-collapse: separate;
   border-spacing: 0;
   font-size: 0.75rem;
-  border: 1px solid var(--color-border);
-  border-radius: 8px;
-  overflow: hidden;
+}
+/* `anywhere`/`break-word` (inherited from `.prose-reviewly` and inline code)
+   shrink a cell's min-content width to one character, so auto table layout
+   crushes short columns into a letter per line ("M/et/ho/d"). In cells, only
+   break at word boundaries; the frame scrolls if the words don't fit. */
+.prose-reviewly th,
+.prose-reviewly td,
+.prose-reviewly :is(th, td) code {
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 .prose-reviewly thead {
   background: color-mix(in oklch, var(--color-card) 70%, transparent);

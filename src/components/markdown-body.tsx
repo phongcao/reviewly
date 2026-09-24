@@ -95,6 +95,15 @@ function MarkdownPre({ node, ...rest }: ComponentPropsWithoutRef<"pre"> & ExtraP
   return <pre {...rest} />;
 }
 
+/** Wide tables scroll inside their own frame instead of squeezing columns. */
+function MarkdownTable({ node: _node, ...rest }: ComponentPropsWithoutRef<"table"> & ExtraProps) {
+  return (
+    <div className="prose-table-wrap">
+      <table {...rest} />
+    </div>
+  );
+}
+
 /**
  * Rehype plugin behind `sourceLines`. Runs after sanitize, so the attributes
  * don't need allow-listing — and survive because hast positions are kept
@@ -123,6 +132,7 @@ const components = {
   a: ExternalLink,
   img: MarkdownImage,
   pre: MarkdownPre,
+  table: MarkdownTable,
 };
 
 /**
