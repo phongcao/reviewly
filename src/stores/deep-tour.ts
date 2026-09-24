@@ -7,7 +7,7 @@ import { persist } from "zustand/middleware";
 /** One layer's own tour, as returned by its own AI call. */
 export interface TourBatch {
   plan: GuidedPlan;
-  /** Which AI produced it ("claude" | "codex"). */
+  /** Which AI produced it (an `AiProvider` id). */
   provider: string;
   /** Epoch ms when generated. */
   generatedAt: number;

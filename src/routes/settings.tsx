@@ -31,6 +31,7 @@ import {
   type AiEffort,
   type AiProvider,
   CLI_PROVIDERS,
+  EFFORT_PROVIDERS,
   MODEL_SUGGESTIONS,
   PROVIDER_LABEL,
   useAiProvider,
@@ -216,7 +217,7 @@ export function SettingsPage() {
 
               {provider === "openai" ? <OpenAiConfig /> : <CliModelConfig provider={provider} />}
 
-              {provider === "claude" && <AiEffortConfig />}
+              {EFFORT_PROVIDERS.includes(provider) && <AiEffortConfig provider={provider} />}
               <AiTimeoutConfig />
 
               <AiInstructions />
@@ -758,6 +759,15 @@ const PROVIDERS: ProviderMeta[] = [
     install: "npm i -g @google/gemini-cli",
   },
   {
+    id: "copilot",
+    label: "GitHub Copilot",
+    blurb: "GitHub CLI · your Copilot plan",
+    icon: Github,
+    tint: "text-foreground",
+    tile: "bg-foreground/8",
+    install: "npm i -g @github/copilot",
+  },
+  {
     id: "openai",
     label: "OpenAI-compatible",
     blurb: "Ollama · OpenRouter · DeepSeek",
@@ -940,7 +950,7 @@ function OpenAiField({
 }
 
 const EFFORT_OPTIONS: { value: string; label: string }[] = [
-  { value: "default", label: "Claude default" },
+  { value: "default", label: "Default" },
   { value: "low", label: "Low" },
   { value: "medium", label: "Medium" },
   { value: "high", label: "High" },
@@ -948,9 +958,12 @@ const EFFORT_OPTIONS: { value: string; label: string }[] = [
   { value: "max", label: "Max" },
 ];
 
-/** Reasoning effort for Claude runs, sent as `--effort`. "Claude default"
- *  sends nothing, so the CLI's own setting applies. */
-function AiEffortConfig() {
+/** Reasoning effort for the providers that take one (`--effort` for Claude,
+ *  `--reasoning-effort` for Copilot). "Default" sends nothing, so the CLI's own
+ *  setting applies. */
+function AiEffortConfig({ provider }: { provider: AiProvider }) {
+  const name = PROVIDER_LABEL[provider];
+  const effortLabel = (label: string) => (label === "Default" ? `${name} default` : label);
   const effort = useAiProvider((s) => s.claudeEffort);
   const setEffort = useAiProvider((s) => s.setClaudeEffort);
   const value = effort ?? "default";
@@ -959,7 +972,7 @@ function AiEffortConfig() {
       <div className="min-w-0">
         <p className="text-xs font-medium text-foreground">Effort</p>
         <p className="mt-0.5 text-xs text-muted-foreground">
-          How hard Claude thinks before answering. Higher is slower and costs more, but plans and
+          How hard {name} thinks before answering. Higher is slower and costs more, but plans and
           reviews are more careful.
         </p>
       </div>
@@ -969,13 +982,13 @@ function AiEffortConfig() {
       >
         <SelectTrigger size="sm" className="w-36 text-xs text-foreground">
           <SelectValue>
-            {(v) => EFFORT_OPTIONS.find((o) => o.value === v)?.label ?? String(v)}
+            {(v) => effortLabel(EFFORT_OPTIONS.find((o) => o.value === v)?.label ?? String(v))}
           </SelectValue>
         </SelectTrigger>
         <SelectContent>
           {EFFORT_OPTIONS.map((o) => (
             <SelectItem key={o.value} value={o.value} className="text-xs">
-              {o.label}
+              {effortLabel(o.label)}
             </SelectItem>
           ))}
         </SelectContent>

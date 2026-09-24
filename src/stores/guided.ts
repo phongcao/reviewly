@@ -8,7 +8,7 @@ export interface GuidedEntry {
   plan: GuidedPlan;
   /** Head SHA the plan was generated against (staleness check). */
   headSha: string;
-  /** Which AI produced it ("claude" | "codex"). */
+  /** Which AI produced it (an `AiProvider` id). */
   provider: string;
   /** Epoch ms when generated. */
   generatedAt: number;

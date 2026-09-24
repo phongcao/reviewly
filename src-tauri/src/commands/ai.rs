@@ -42,6 +42,7 @@ fn provider_bin(provider: &str) -> &str {
     match provider {
         "codex" => "codex",
         "gemini" => "gemini",
+        "copilot" => "copilot",
         _ => "claude",
     }
 }
@@ -71,6 +72,7 @@ async fn run_provider(
         "codex" => run_codex(prompt, cwd, model.as_deref(), timeout_secs).await?,
         "gemini" => run_gemini(prompt, cwd, model.as_deref(), timeout_secs).await?,
         "openai" => run_openai_compatible(prompt, base_url, model, api_key, timeout_secs).await?,
+        "copilot" => return run_copilot(prompt, cwd, model.as_deref(), timeout_secs, effort).await,
         _ => return run_claude(prompt, cwd, model.as_deref(), timeout_secs, effort).await,
     };
     Ok(AiRun { text, model: asked })
@@ -160,8 +162,9 @@ fn add_model(cmd: &mut Command, flag: &str, model: Option<&str>) {
     }
 }
 
-/// Levels `claude --effort` accepts. Anything else is dropped rather than
-/// passed through, so a stale setting can't fail every run.
+/// Levels `claude --effort` (and `copilot --reasoning-effort`) accept. Anything
+/// else is dropped rather than passed through, so a stale setting can't fail
+/// every run.
 const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 /// The effort level to actually send: a known level, or `None` for the CLI's
@@ -229,7 +232,8 @@ fn cli_error(name: &str, code: &str, stderr: &str) -> AppError {
             || low.contains("unknown")
             || low.contains("invalid")
             || low.contains("does not exist")
-            || low.contains("not supported"))
+            || low.contains("not supported")
+            || low.contains("not available"))
     {
         format!("The model set in Settings → AI review isn't valid for {name}.")
     } else if (low.contains("context") && low.contains("length"))
@@ -354,7 +358,8 @@ pub async fn ai_review_bg(
     let head_sha = head_sha.unwrap_or_default();
     let task_key = key.clone();
     let handle = tauri::async_runtime::spawn(async move {
-        // Only Claude takes an effort level; don't report one the run never used.
+        // Only Claude and Copilot take an effort level; don't report one the run
+        // never used.
         let effort = match provider.as_str() {
             "codex" | "gemini" | "openai" => None,
             _ => effort_level(effort.as_deref()).map(String::from),
@@ -679,6 +684,244 @@ async fn run_gemini(
     Ok(out)
 }
 
+/// Copilot's built-in tools that only read: open a file, ripgrep, and glob.
+const COPILOT_READ_TOOLS: [&str; 3] = ["view", "rg", "glob"];
+
+/// A tool name Copilot doesn't have. `--available-tools` with only this leaves
+/// the model with no tools at all; an empty `--available-tools=` would instead
+/// be ignored and expose every tool, shell and edits included.
+const COPILOT_NO_TOOLS: &str = "reviewly_no_tools";
+
+/// `copilot` in non-interactive JSONL mode, locked down for review. The prompt
+/// goes over stdin (with no `-p`, piped stdin is the prompt), so a large PR
+/// context can't hit the OS arg-length limit. Non-interactive runs need
+/// `--allow-all-tools`, so `--available-tools` is what keeps them read-only:
+/// the repo tools when the PR's clone is present, none otherwise. The clone's
+/// own AGENTS.md, skills, MCP servers and hooks are kept out of the run, as is
+/// the user's `COPILOT_ALLOW_ALL=true`, which would trust (and load) them.
+fn copilot_command(
+    cwd: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+    stream: bool,
+) -> Command {
+    let mut cmd = cli_command("copilot");
+    cmd.env_remove("COPILOT_ALLOW_ALL")
+        .arg("--output-format")
+        .arg("json")
+        .arg("--stream")
+        .arg(if stream { "on" } else { "off" })
+        .arg("--no-custom-instructions")
+        .arg("--disable-builtin-mcps")
+        .arg("--no-auto-update")
+        .arg("--no-ask-user")
+        .arg("--allow-all-tools")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    add_model(&mut cmd, "--model", model);
+    if let Some(e) = effort_level(effort) {
+        cmd.arg("--reasoning-effort").arg(e);
+    }
+    // Last: the flag takes every value up to the next option.
+    cmd.arg("--available-tools");
+    if has_repo(cwd) {
+        cmd.args(COPILOT_READ_TOOLS);
+    } else {
+        cmd.arg(COPILOT_NO_TOOLS);
+    }
+    apply_cwd(&mut cmd, cwd);
+    cmd
+}
+
+/// What a Copilot `--output-format json` run said, fed one stdout line at a
+/// time: the text streamed so far, the final answer, and the model that gave
+/// it. A run that reads the repo says something before each tool call too, so
+/// the answer is the message marked `final_answer` (else the last one), not
+/// everything that streamed.
+#[derive(Default)]
+struct CopilotRun {
+    streamed: String,
+    delta_msg: Option<String>,
+    answer: Option<String>,
+    final_seen: bool,
+    model: Option<String>,
+    /// Non-JSON stdout lines, kept to explain a run that produced nothing.
+    noise: String,
+}
+
+impl CopilotRun {
+    /// Take one stdout line; returns the text to stream, if it carried any.
+    fn feed(&mut self, line: &str) -> Option<String> {
+        let line = line.trim();
+        if line.is_empty() {
+            return None;
+        }
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            if self.noise.len() < 1000 {
+                self.noise.push_str(line);
+                self.noise.push('\n');
+            }
+            return None;
+        };
+        let data = v.get("data");
+        let field = |k: &str| data.and_then(|d| d.get(k)).and_then(serde_json::Value::as_str);
+        match v.get("type").and_then(serde_json::Value::as_str) {
+            Some("assistant.message_delta") => {
+                let delta = field("deltaContent").filter(|d| !d.is_empty())?;
+                // A new message after a tool call: keep it off the last line.
+                let msg = field("messageId").map(String::from);
+                let mut out = String::new();
+                if msg != self.delta_msg && !self.streamed.is_empty() {
+                    out.push_str("\n\n");
+                }
+                self.delta_msg = msg;
+                out.push_str(delta);
+                self.streamed.push_str(&out);
+                Some(out)
+            }
+            Some("assistant.message") => {
+                if let Some(m) = field("model") {
+                    self.model = Some(m.to_string());
+                }
+                let content = field("content").map(str::trim).filter(|c| !c.is_empty())?;
+                let is_final = field("phase") == Some("final_answer");
+                if is_final || !self.final_seen {
+                    self.answer = Some(content.to_string());
+                }
+                self.final_seen |= is_final;
+                None
+            }
+            Some("model.call_start") => {
+                if self.model.is_none() {
+                    self.model = field("model").map(String::from);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn text(&self) -> String {
+        self.answer.clone().unwrap_or_else(|| self.streamed.trim().to_string())
+    }
+
+    /// Why the run failed, in the CLI's words: stderr, else stdout that wasn't
+    /// an event. The events themselves would trip `cli_error`'s "model" check.
+    fn detail(&self, stderr: &[u8]) -> String {
+        let err = String::from_utf8_lossy(stderr).trim().to_string();
+        if err.is_empty() {
+            self.noise.trim().to_string()
+        } else {
+            err
+        }
+    }
+}
+
+/// GitHub Copilot CLI, one-shot. Runs inside the PR clone when present so it
+/// can read the repo, read-only (see `copilot_command`).
+async fn run_copilot(
+    prompt: &str,
+    cwd: Option<&str>,
+    model: Option<&str>,
+    timeout_secs: Option<u64>,
+    effort: Option<&str>,
+) -> AppResult<AiRun> {
+    let mut child = copilot_command(cwd, model, effort, false)
+        .spawn()
+        .map_err(|e| AppError::Other(format!("failed to spawn copilot: {e}")))?;
+    feed_stdin(&mut child, prompt);
+    let timeout = resolve_timeout(timeout_secs, run_timeout(cwd));
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(res) => res.map_err(|e| AppError::Other(format!("wait copilot: {e}")))?,
+        Err(_) => {
+            return Err(AppError::Other(format!(
+                "Copilot took longer than {}s and was stopped. Try again, or pick a smaller PR.",
+                timeout.as_secs()
+            )))
+        }
+    };
+    let mut run = CopilotRun::default();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        run.feed(line);
+    }
+    let text = run.text();
+    if !output.status.success() || text.is_empty() {
+        return Err(cli_error("copilot", &exit_code(&output.status), &run.detail(&output.stderr)));
+    }
+    let asked = model.map(str::trim).filter(|m| !m.is_empty()).map(String::from);
+    Ok(AiRun { text, model: run.model.or(asked) })
+}
+
+/// GitHub Copilot CLI, streamed: `assistant.message_delta` events become
+/// `ai:chunk`s, and the final answer replaces them when the turn completes.
+async fn stream_copilot(
+    app: &AppHandle,
+    key: &str,
+    prompt: &str,
+    cwd: Option<&str>,
+    model: Option<&str>,
+    timeout_secs: Option<u64>,
+    effort: Option<&str>,
+) -> AppResult<(String, Option<f64>)> {
+    let mut child = copilot_command(cwd, model, effort, true)
+        .spawn()
+        .map_err(|e| AppError::Other(format!("failed to spawn copilot: {e}")))?;
+    feed_stdin(&mut child, prompt);
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::Other("copilot: no stdout".into()))?;
+    // Drained alongside stdout so a chatty stderr can't fill its pipe and
+    // stall the run; kept to explain a failure.
+    let stderr = child.stderr.take().map(|mut s| {
+        tauri::async_runtime::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf).await;
+            buf
+        })
+    });
+    let mut lines = BufReader::new(stdout).lines();
+    let mut run = CopilotRun::default();
+
+    let read = async {
+        while let Some(line) = lines
+            .next_line()
+            .await
+            .map_err(|e| AppError::Other(format!("read copilot: {e}")))?
+        {
+            if let Some(delta) = run.feed(&line) {
+                emit_chunk(app, key, &delta);
+            }
+        }
+        Ok::<(), AppError>(())
+    };
+
+    let cap = resolve_timeout(timeout_secs, AI_TIMEOUT);
+    match tokio::time::timeout(cap, read).await {
+        Ok(r) => r?,
+        Err(_) => {
+            return Err(AppError::Other(format!(
+                "Copilot took longer than {}s and was stopped. Try again, or pick a smaller PR.",
+                cap.as_secs()
+            )))
+        }
+    }
+    let status = child.wait().await.ok();
+    let text = run.text();
+    if text.is_empty() {
+        let err = match stderr {
+            Some(h) => h.await.unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let code = status.map(|s| exit_code(&s)).unwrap_or_else(|| "?".to_string());
+        return Err(cli_error("copilot", &code, &run.detail(&err)));
+    }
+    Ok((text, None))
+}
+
 /// Any OpenAI-compatible chat endpoint: Ollama / LM Studio (local), OpenRouter,
 /// DeepSeek, Groq, etc. Pure HTTP — no CLI, no repo access (reasons over the
 /// embedded diff only). `base_url` is the API root (…/v1); the key is optional.
@@ -857,9 +1100,9 @@ pub fn ai_stream_claim(state: State<'_, AppState>, key: String) -> Option<serde_
     m.remove(&key)?.done
 }
 
-/// Returns (full_text, cost_usd). Claude and OpenAI-compatible stream live;
-/// codex/gemini have no clean token stream, so they run once and the whole
-/// result is emitted as a single chunk.
+/// Returns (full_text, cost_usd). Claude, Copilot and OpenAI-compatible stream
+/// live; codex/gemini have no clean token stream, so they run once and the
+/// whole result is emitted as a single chunk.
 #[allow(clippy::too_many_arguments)]
 async fn stream_provider(
     app: &AppHandle,
@@ -878,6 +1121,9 @@ async fn stream_provider(
             stream_claude(app, key, prompt, cwd, model.as_deref(), timeout_secs, effort).await
         }
         "openai" => stream_openai(app, key, prompt, base_url, model, api_key, timeout_secs).await,
+        "copilot" => {
+            stream_copilot(app, key, prompt, cwd, model.as_deref(), timeout_secs, effort).await
+        }
         other => {
             let text = run_provider(other, prompt, cwd, base_url, model, api_key, timeout_secs, None)
                 .await?
@@ -1122,6 +1368,59 @@ mod tests {
     fn non_json_stdout_is_not_parsed() {
         assert!(parse_claude_json("plain answer").is_none());
         assert!(parse_claude_json(r#"{"layers":[]}"#).is_none());
+    }
+
+    /// Feed a whole Copilot JSONL stdout, returning what streamed.
+    fn feed_all(run: &mut CopilotRun, out: &str) -> String {
+        out.lines().filter_map(|l| run.feed(l)).collect()
+    }
+
+    #[test]
+    fn copilot_final_answer_wins_over_commentary() {
+        // Trimmed from a real `copilot --output-format json` run that read a
+        // file: a commentary message before the tool call, then the answer.
+        let out = r#"{"type":"session.tools_updated","data":{"model":"gpt-5.6-sol"},"ephemeral":true}
+{"type":"model.call_start","data":{"turnId":"0","model":"gpt-5.6-sol"},"ephemeral":true}
+{"type":"assistant.reasoning_delta","data":{"deltaContent":"thinking"},"ephemeral":true}
+{"type":"assistant.message_delta","data":{"messageId":"m1","deltaContent":"I'll inspect it."},"ephemeral":true}
+{"type":"assistant.message","data":{"messageId":"m1","model":"gpt-5.6-sol","content":"I'll inspect it.","phase":"commentary","toolRequests":[{"name":"view"}]}}
+{"type":"tool.execution_start","data":{"toolName":"view"}}
+{"type":"assistant.message_delta","data":{"messageId":"m2","deltaContent":"{\"ok\":"},"ephemeral":true}
+{"type":"assistant.message_delta","data":{"messageId":"m2","deltaContent":"true}"},"ephemeral":true}
+{"type":"assistant.message","data":{"messageId":"m2","model":"gpt-5.6-sol","content":"{\"ok\":true}","phase":"final_answer"}}
+{"type":"result","exitCode":0,"usage":{"premiumRequests":1}}"#;
+        let mut run = CopilotRun::default();
+        let streamed = feed_all(&mut run, out);
+        assert_eq!(streamed, "I'll inspect it.\n\n{\"ok\":true}");
+        assert_eq!(run.text(), "{\"ok\":true}");
+        assert_eq!(run.model.as_deref(), Some("gpt-5.6-sol"));
+    }
+
+    #[test]
+    fn copilot_without_phase_takes_the_last_message() {
+        let out = r#"{"type":"assistant.message","data":{"messageId":"a","content":"first"}}
+{"type":"assistant.message","data":{"messageId":"b","content":" last "}}"#;
+        let mut run = CopilotRun::default();
+        assert_eq!(feed_all(&mut run, out), "");
+        assert_eq!(run.text(), "last");
+        assert_eq!(run.model, None);
+    }
+
+    #[test]
+    fn copilot_failure_explained_by_stderr_else_plain_stdout() {
+        // A bad `--model` prints to stderr and leaves stdout with MCP events.
+        let out = r#"{"type":"session.mcp_server_status_changed","data":{"serverName":"x","status":"pending"}}"#;
+        let mut run = CopilotRun::default();
+        feed_all(&mut run, out);
+        assert_eq!(run.text(), "");
+        let err = b"Error: Model \"nope\" from --model flag is not available.\n";
+        assert_eq!(run.detail(err), "Error: Model \"nope\" from --model flag is not available.");
+        let msg = cli_error("copilot", "1", &run.detail(err)).to_string();
+        assert!(msg.contains("isn't valid for copilot"), "{msg}");
+
+        let mut run = CopilotRun::default();
+        feed_all(&mut run, "Not signed in\n{\"type\":\"result\",\"exitCode\":1}");
+        assert_eq!(run.detail(b""), "Not signed in");
     }
 
     #[test]

@@ -32,7 +32,7 @@ import { heuristicLayers, reconcileLayers } from "@/lib/layers";
 import type { DraftComment, PullFile } from "@/lib/tauri";
 import { invoke } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
-import { PROVIDER_LABEL, aiInvokeArgs, useAiProvider } from "@/stores/ai";
+import { type AiProvider, PROVIDER_LABEL, aiInvokeArgs, useAiProvider } from "@/stores/ai";
 import { type DeepTourEntry, useDeepTour } from "@/stores/deep-tour";
 import { useDeepTourGen } from "@/stores/deep-tour-gen";
 import { useGuided } from "@/stores/guided";
@@ -1157,7 +1157,7 @@ function Tour({
 }: {
   prKey: string;
   plan: GuidedPlan;
-  /** Which AI produced the tour ("claude" | "codex"). */
+  /** Which AI produced the tour (an `AiProvider` id). */
   provider: string;
   /** Epoch ms the tour was generated. */
   generatedAt: number;
@@ -1754,7 +1754,7 @@ function Tour({
         <div className="px-5 pt-2">
           <div className="flex items-center gap-2">
             <p className="min-w-0 truncate text-xs text-muted-foreground/70">
-              Toured by {provider === "codex" ? "Codex" : "Claude"} ·{" "}
+              Toured by {PROVIDER_LABEL[provider as AiProvider] ?? provider} ·{" "}
               {relativeTime(new Date(generatedAt).toISOString())}
             </p>
             {(verdict || suggestionIdxs.length > 0) && (
