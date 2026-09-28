@@ -48,6 +48,7 @@ import { relativeTime } from "@/lib/format";
 import { isImagePath } from "@/lib/images";
 import { celebrate } from "@/lib/kite-release";
 import { isMarkdownPath } from "@/lib/markdown";
+import { type NavEntry, useNavHistory } from "@/lib/nav-history";
 import type { ReviewLocation } from "@/lib/review-context";
 import type {
   ActionsJob,
@@ -80,6 +81,7 @@ import { useViewedFiles, viewedKey } from "@/stores/viewed-files";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useBlocker, useNavigate, useParams } from "@tanstack/react-router";
 import {
+  ArrowLeft,
   ArrowRight,
   Check,
   CheckCheck,
@@ -500,6 +502,35 @@ export function PRDetailPage() {
       : (scopedFiles[0]?.filename ?? null)
     : (activeFile ?? fileList[0]?.filename ?? null);
   const currentFile = fileList.find((f) => f.filename === current) ?? null;
+
+  // Back / forward between the tour and the files it links to (and any other
+  // file you open). Only once a file has been picked — the first-file fallback
+  // before the resume point loads isn't somewhere you went.
+  const nav = useNavHistory(
+    prViewKey,
+    tab !== "files"
+      ? null
+      : view === "guided"
+        ? { view, file: null }
+        : activeFile && current
+          ? { view, file: current }
+          : null,
+    useCallback(
+      (e: NavEntry) => {
+        if (e.file) setActiveFile(e.file);
+        // Between files, keep the layout you're in; only crossing into or out
+        // of the tour changes the view.
+        const now = useUi.getState().diffView;
+        if (e.view === "guided" || now === "guided") setView(e.view);
+      },
+      [setView],
+    ),
+  );
+  // Read by the mount-once ⌘-chord listener below.
+  const navRef = useRef(nav);
+  navRef.current = nav;
+  const tabRef = useRef(tab);
+  tabRef.current = tab;
   // Review context pane — surrounding code beside the diff. Never feeds the
   // viewed-files store: reading a dependency isn't reviewing a change.
   const lastEditorTargetId = useEditorPrefs((s) => s.lastTargetId);
@@ -708,7 +739,14 @@ export function PRDetailPage() {
     function onKey(e: KeyboardEvent) {
       if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
       const k = e.key.toLowerCase();
-      if (k === "f") {
+      if (k === "[" || k === "]") {
+        // Back / forward (⌘[ / ⌘]), like a browser. Files tab only — that's
+        // where the history lives.
+        if (tabRef.current !== "files") return;
+        e.preventDefault();
+        if (k === "[") navRef.current.back();
+        else navRef.current.forward();
+      } else if (k === "f") {
         e.preventDefault();
         setTab("files");
         setFindOpen(true);
@@ -1264,6 +1302,30 @@ export function PRDetailPage() {
 
           {tab === "files" && (
             <div className="ml-auto flex items-center gap-2">
+              <div className="flex items-center">
+                <TooltipFor label="Back" shortcut="⌘[">
+                  <button
+                    type="button"
+                    onClick={nav.back}
+                    disabled={!nav.canBack}
+                    aria-label="Back"
+                    className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-foreground/[0.05] hover:text-foreground disabled:pointer-events-none disabled:opacity-35"
+                  >
+                    <ArrowLeft className="size-3.5" />
+                  </button>
+                </TooltipFor>
+                <TooltipFor label="Forward" shortcut="⌘]">
+                  <button
+                    type="button"
+                    onClick={nav.forward}
+                    disabled={!nav.canForward}
+                    aria-label="Forward"
+                    className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-foreground/[0.05] hover:text-foreground disabled:pointer-events-none disabled:opacity-35"
+                  >
+                    <ArrowRight className="size-3.5" />
+                  </button>
+                </TooltipFor>
+              </div>
               {(d.additions ?? d.deletions) != null && (
                 <TooltipFor
                   label={

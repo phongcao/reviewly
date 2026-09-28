@@ -68,6 +68,8 @@ const GROUPS: Group[] = [
     items: [
       { keys: ["]"], label: "Next file" },
       { keys: ["["], label: "Previous file" },
+      { keys: ["⌘", "["], label: "Back (e.g. from a file to the tour stop that linked it)" },
+      { keys: ["⌘", "]"], label: "Forward" },
       { keys: ["n"], label: "Mark viewed & jump to next file" },
       { keys: ["v"], label: "Toggle viewed for the current file" },
       { keys: ["c"], label: "Next file with unresolved comments" },

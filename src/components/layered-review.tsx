@@ -323,6 +323,24 @@ export function LayerBar(props: BarProps) {
     );
   }
 
+  // One file can only ever be one layer, and a one-layer plan isn't a split —
+  // don't offer a run that is guaranteed to come back "failed".
+  if (!scope.plan && files.length < 2) {
+    return (
+      <Shell>
+        <div className="flex items-center gap-3">
+          <Layers className="size-3.5 shrink-0 text-muted-foreground" />
+          <div className="min-w-0">
+            <p className="text-xs font-medium text-foreground">Nothing to split</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              This PR changes a single file — read it as-is; layers need at least two files.
+            </p>
+          </div>
+        </div>
+      </Shell>
+    );
+  }
+
   if (!scope.plan) {
     return (
       <Shell>

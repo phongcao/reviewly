@@ -58,9 +58,13 @@ export function useLayersEvents() {
           const h = hint(output ?? "");
           gen.fail(
             prKey,
-            h
-              ? `The AI didn't return a usable split — it said: “${h}”`
-              : "The AI didn't return a usable split. Try again, or split by structure.",
+            // A well-formed plan that `parseLayers` still rejected kept everything
+            // in one layer — echoing its JSON back as the "reason" says nothing.
+            /"layers"\s*:/.test(output ?? "")
+              ? "The AI kept the whole PR in one layer — it may be small enough to read as-is. Try again, or split by structure."
+              : h
+                ? `The AI didn't return a usable split — it said: “${h}”`
+                : "The AI didn't return a usable split. Try again, or split by structure.",
           );
           toast.error(`Layering failed · ${ref}`);
           return;

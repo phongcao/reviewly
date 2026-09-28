@@ -1499,6 +1499,18 @@ function Tour({
     return () => window.removeEventListener("keydown", onKey);
   }, [active, plan.steps, openStep, move, dismiss]);
 
+  // Coming back to the tour (Back from a file a stop linked to, or the view
+  // toggle) resumes on the stop you left. `active` is seeded from the resume
+  // point, but the pane mounts scrolled to the top, and the scroll sync below
+  // would otherwise read that as "on the first stop" and overwrite it. Runs
+  // before that effect, so the jump is already held when it first measures.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: once, on mount
+  useEffect(() => {
+    if (active === visible[0]) return;
+    beginJump(active);
+    stepRefs.current[active]?.scrollIntoView({ block: "start" });
+  }, []);
+
   // The active (colored) step is exactly the one whose sticky header is pinned
   // at the top: the last visible section that has scrolled to/above the top
   // edge. This keeps the highlight in lock-step with the stuck header.
