@@ -1,10 +1,13 @@
 import { BehaviorPanel } from "@/components/behavior-panel";
 import { Composer } from "@/components/composer";
+import { DiffSelectionToolbar } from "@/components/diff-selection-toolbar";
 import { IconButton } from "@/components/icon-button";
 import { KiteLoader } from "@/components/kite-loader";
 import { MarkdownBody } from "@/components/markdown-body";
+import { TooltipFor } from "@/components/tooltip-for";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { refFromStopNote } from "@/lib/ai/attach";
 import { STEP_CAP_SINGLE, shouldFanOut, stepBudget } from "@/lib/ai/budget";
 import type { ContextOptions, ReviewContext } from "@/lib/ai/context";
 import { CLONE_ABSENT_CLAUSE, buildGuidedSystem } from "@/lib/ai/prompts";
@@ -95,6 +98,8 @@ interface Props {
   onOpenFile: (path: string, line?: number) => void;
   /** Report whether the guided reading pane has scrolled past its intro. */
   onScrolledChange?: (scrolled: boolean) => void;
+  /** Opens (or focuses) the chat once a highlighted passage is attached. */
+  onAskAi?: () => void;
 }
 
 const KIND: Record<
@@ -234,6 +239,7 @@ export function GuidedReview({
   onPostComment,
   onOpenFile,
   onScrolledChange,
+  onAskAi,
 }: Props) {
   const provider = useAiProvider((s) => s.provider);
   const { available } = useAiAvailable();
@@ -401,6 +407,7 @@ export function GuidedReview({
         onPostComment={onPostComment}
         onOpenFile={onOpenFile}
         onScrolledChange={onScrolledChange}
+        onAskAi={onAskAi}
       />
     );
   }
@@ -447,6 +454,7 @@ export function GuidedReview({
       onPostComment={onPostComment}
       onOpenFile={onOpenFile}
       onScrolledChange={onScrolledChange}
+      onAskAi={onAskAi}
     />
   );
 }
@@ -474,6 +482,7 @@ function DeepTour({
   onPostComment,
   onOpenFile,
   onScrolledChange,
+  onAskAi,
 }: {
   prKey: string;
   entry: DeepTourEntry | undefined;
@@ -491,6 +500,7 @@ function DeepTour({
   onPostComment?: (c: { path: string; line: number; body: string }) => Promise<void>;
   onOpenFile: (path: string, line?: number) => void;
   onScrolledChange?: (scrolled: boolean) => void;
+  onAskAi?: () => void;
 }) {
   const gen = useDeepTourGen((s) => s.byPr[prKey]);
   const dismissStep = useDeepTour((s) => s.dismiss);
@@ -687,6 +697,7 @@ function DeepTour({
           onPostComment={onPostComment}
           onOpenFile={onOpenFile}
           onScrolledChange={onScrolledChange}
+          onAskAi={onAskAi}
         />
       </div>
     </div>
@@ -1154,6 +1165,7 @@ function Tour({
   onPostComment,
   onOpenFile,
   onScrolledChange,
+  onAskAi,
 }: {
   prKey: string;
   plan: GuidedPlan;
@@ -1184,6 +1196,8 @@ function Tour({
   onPostComment?: (c: { path: string; line: number; body: string }) => Promise<void>;
   onOpenFile: (path: string, line?: number) => void;
   onScrolledChange?: (scrolled: boolean) => void;
+  /** Opens the chat after a stop's text or code is attached to it. */
+  onAskAi?: () => void;
 }) {
   const total = plan.steps.length;
   // A "clean bill of health" tour: a summary + verdict but nothing to walk
@@ -1257,6 +1271,8 @@ function Tour({
     }
     onOpenFile(path, line);
   });
+  // Page-level inline arrow, so it goes through `useEvent` like the rest.
+  const askAi = useEvent(() => onAskAi?.());
   const [active, setActive] = useState(() => Math.max(0, Math.min(progress.lastActive, total - 1)));
   const [posted, setPosted] = useState<Set<number>>(new Set());
   const [filter, setFilter] = useState<StepKind | null>(null);
@@ -2023,6 +2039,8 @@ function Tour({
                 onExplainBehavior={explainBehavior}
                 onDismiss={dismiss}
                 onOpenFile={openStep}
+                prKey={prKey}
+                onAskAi={askAi}
               />
             );
             // A merged deep tour is one list of stops drawn from many layers.
@@ -2242,6 +2260,8 @@ const Step = memo(function Step({
   onExplainBehavior,
   onDismiss,
   onOpenFile,
+  prKey,
+  onAskAi,
 }: {
   setRef: (index: number, el: HTMLElement | null) => void;
   step: GuidedStep;
@@ -2260,6 +2280,9 @@ const Step = memo(function Step({
   onExplainBehavior?: (step: GuidedStep) => Promise<BehaviorDiff | null>;
   onDismiss?: (index: number) => void;
   onOpenFile: (path: string, line?: number) => void;
+  /** Conversation key, `owner/repo#number` — where highlights are attached. */
+  prKey: string;
+  onAskAi: () => void;
 }) {
   const kind = KIND[step.kind] ?? KIND.orient;
   const sectionRef = useCallback((el: HTMLElement | null) => setRef(index, el), [setRef, index]);
@@ -2283,6 +2306,19 @@ const Step = memo(function Step({
   // when the tour was generated could outlive the diff it describes. Only a
   // downgrade is surfaced; annotating every well-anchored stop would be noise.
   const evidence = useMemo(() => verifyStep(step, files, corpus), [step, files, corpus]);
+
+  // Highlight → "Ask AI", as in the diff: code in the snippet pins its lines;
+  // text in the commentary pins the passage as a claim about the stop's anchor.
+  const codeRef = useRef<HTMLDivElement>(null);
+  const noteRef = useRef<HTMLDivElement>(null);
+  const patch = useMemo(
+    () => files.find((f) => f.filename === step.path)?.patch ?? null,
+    [files, step.path],
+  );
+  const resolveNote = useCallback(
+    (root: HTMLElement, sel: Selection) => refFromStopNote(root, step, sel),
+    [step],
+  );
 
   async function runCheck() {
     if (!onCheckAI || checking) return;
@@ -2347,16 +2383,30 @@ const Step = memo(function Step({
         <h3 className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
           {step.title}
         </h3>
-        <button
-          type="button"
-          onClick={() => onOpenFile(step.path, step.line)}
-          aria-label={`Open ${step.path} in the diff`}
-          className="inline-flex shrink-0 items-center gap-1.5 font-mono text-xs text-muted-foreground transition-colors hover:text-foreground"
-        >
-          <FileCode className="size-3.5" />
-          {step.path.split("/").pop()}:{step.line}
-          {step.endLine ? `-${step.endLine}` : ""}
-        </button>
+        {/* Full path, not just the basename — `__init__.py` or `README.md`
+            can exist in several folders. The directory gives way first when
+            the header is tight; hover shows all of it. */}
+        <TooltipFor label={`Open ${step.path} in the diff`} align="end">
+          <button
+            type="button"
+            onClick={() => onOpenFile(step.path, step.line)}
+            aria-label={`Open ${step.path} in the diff`}
+            className="group/path inline-flex min-w-0 max-w-[50%] items-center gap-1.5 font-mono text-xs text-muted-foreground transition-colors hover:text-foreground"
+          >
+            <FileCode className="size-3.5 shrink-0" />
+            <span className="flex min-w-0">
+              {step.path.includes("/") && (
+                <span className="min-w-0 truncate text-muted-foreground/60 group-hover/path:text-muted-foreground">
+                  {step.path.slice(0, step.path.lastIndexOf("/") + 1)}
+                </span>
+              )}
+              <span className="shrink-0">
+                {step.path.split("/").pop()}:{step.line}
+                {step.endLine ? `-${step.endLine}` : ""}
+              </span>
+            </span>
+          </button>
+        </TooltipFor>
         {dismiss && (
           <IconButton
             label="Dismiss this stop"
@@ -2383,12 +2433,31 @@ const Step = memo(function Step({
             </span>
           </div>
         )}
-        <div>
+        <div ref={codeRef}>
           <InlineDiff files={files} path={step.path} line={step.line} endLine={step.endLine} />
         </div>
+        <DiffSelectionToolbar
+          rootRef={codeRef}
+          path={step.path}
+          patch={patch}
+          view="unified"
+          prKey={prKey}
+          onAskAi={onAskAi}
+        />
 
         {step.detail && (
-          <MarkdownBody className="mt-3 text-foreground/90">{step.detail}</MarkdownBody>
+          <div ref={noteRef} className="mt-3">
+            <MarkdownBody className="text-foreground/90">{step.detail}</MarkdownBody>
+            <DiffSelectionToolbar
+              rootRef={noteRef}
+              path={step.path}
+              patch={patch}
+              view="prose"
+              resolve={resolveNote}
+              prKey={prKey}
+              onAskAi={onAskAi}
+            />
+          </div>
         )}
 
         <div className="mt-3 flex flex-wrap items-center gap-2">
@@ -2569,13 +2638,22 @@ function InlineDiff({
 
   const inRange = (nl: number | null | undefined) => nl != null && nl >= lo && nl <= hi;
   return (
-    <div className="overflow-x-auto rounded-lg border border-border/40 bg-card/60 py-1 font-mono text-xs leading-[1.5]">
+    <div
+      data-selectable
+      className="overflow-x-auto rounded-lg border border-border/40 bg-card/60 py-1 font-mono text-xs leading-[1.5]"
+    >
       {window.map(({ line: l, html }, i) => {
         const num = l.newLine ?? l.oldLine;
         const hit = inRange(l.newLine);
         return (
           <div
             key={i}
+            // Selection → "Ask AI" reads the line range off these, as in the
+            // diff viewer (see lib/ai/attach).
+            data-diff-row=""
+            data-side={l.newLine != null ? "RIGHT" : "LEFT"}
+            data-new-line={l.newLine ?? undefined}
+            data-old-line={l.oldLine ?? undefined}
             // One continuous neutral bar marks the focused range — no per-line box.
             className={cn(
               "flex border-l-2 border-transparent",
@@ -2589,7 +2667,7 @@ function InlineDiff({
             </span>
             <span
               className={cn(
-                "w-3 shrink-0 text-center",
+                "w-3 shrink-0 select-none text-center",
                 l.kind === "add" && "text-success/80",
                 l.kind === "del" && "text-destructive/80",
               )}

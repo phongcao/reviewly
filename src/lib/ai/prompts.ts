@@ -245,6 +245,20 @@ Rules:
 - When a "# Focused context" section is present, it is the reviewer pointing at specific code. Answer about THAT region first and cite its line numbers; treat the full PR diff as supporting background, and never reply with a general PR summary. Its line numbers are new-file lines (unless marked "old file") and are valid inline_comment targets.
 - The user confirms every action before it is posted, so describe what you propose; don't claim you already did it.`;
 
+/** Appended to CHAT_SYSTEM — the chat has to be told which case it's in, or it
+ * answers off a truncated diff even when the whole repo is right there. */
+export function chatCheckoutClause(clone: boolean): string {
+  return clone
+    ? `
+
+# Local checkout
+You are running inside a local checkout of this repository and can Read / Grep it. The "# Pull request" diff below is budget-limited and may be truncated: when the answer depends on code you can't see there — a function body, a caller, a type, a config — open the file and read it rather than saying you couldn't. Name the files you read. The checkout may not be at the PR's exact head commit: if a file contradicts the diff, trust the diff and say the checkout looks out of date.`
+    : `
+
+# No local checkout
+There is no clone of this repository available: you can see ONLY the pull-request metadata and the diff below, which may be truncated. When the answer depends on code you can't see, say exactly what you couldn't see — never guess at it — and mention that linking the repository in Reviewly's Repositories tab would let you read it.`;
+}
+
 /** Commit-message draft prompt — prepended to the staged diff. */
 export const COMMIT_PROMPT =
   "Write a single git commit message for the staged diff below. Conventional-commits style: a concise imperative subject under 72 chars, optionally a short body explaining why. Return ONLY the message — no quotes, no fences, no preamble.\n\n";

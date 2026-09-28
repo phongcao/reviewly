@@ -30,6 +30,7 @@ import {
   ChevronUp,
   Copy,
   ExternalLink,
+  FileCode,
   GitCompare,
   Link as LinkIcon,
   MessageSquare,
@@ -636,6 +637,8 @@ export function DiffViewer({
 
   const toolbar = (
     <DiffToolbar
+      path={path}
+      previousPath={previousPath}
       markdown={isMarkdown}
       preview={showPreview}
       image={showImage}
@@ -959,6 +962,8 @@ function ToolBtn({
  * leaving the preview toggle, the comment count, and the copy/open actions.
  */
 function DiffToolbar({
+  path,
+  previousPath,
   markdown,
   preview,
   image = false,
@@ -974,6 +979,8 @@ function DiffToolbar({
   onCopyPermalink,
   onOpenGitHub,
 }: {
+  path: string;
+  previousPath?: string | null;
   markdown: boolean;
   preview: boolean;
   /** An image preview: no lines, so no wrap/whitespace/comment tools. */
@@ -992,6 +999,8 @@ function DiffToolbar({
 }) {
   return (
     <div className="flex flex-wrap items-center gap-1 border-b border-hairline bg-card/95 px-2 py-1 font-sans">
+      <FilePathLabel path={path} previousPath={previousPath} />
+      <div className="mx-0.5 h-4 w-px bg-border/50" aria-hidden />
       {markdown && (
         <>
           <ToolBtn
@@ -1065,6 +1074,29 @@ function DiffToolbar({
         </ToolBtn>
       </div>
     </div>
+  );
+}
+
+/**
+ * The open file's full path — directory muted, basename emphasized. Folders can
+ * repeat a filename (`__init__.py`, `README.md`), so the basename alone doesn't
+ * say which file this is. The directory truncates first; hover for all of it.
+ */
+function FilePathLabel({ path, previousPath }: { path: string; previousPath?: string | null }) {
+  const slash = path.lastIndexOf("/");
+  const dir = slash >= 0 ? path.slice(0, slash + 1) : "";
+  const base = path.slice(slash + 1);
+  const renamed = previousPath && previousPath !== path;
+  return (
+    <TooltipFor label={renamed ? `${previousPath} → ${path}` : path} align="start">
+      <span className="flex min-w-0 flex-1 basis-40 items-center gap-1.5 px-1 font-mono text-xs">
+        <FileCode className="size-3.5 shrink-0 text-muted-foreground" />
+        <span className="flex min-w-0">
+          {dir && <span className="min-w-0 truncate text-muted-foreground">{dir}</span>}
+          <span className="shrink-0 text-foreground">{base}</span>
+        </span>
+      </span>
+    </TooltipFor>
   );
 }
 

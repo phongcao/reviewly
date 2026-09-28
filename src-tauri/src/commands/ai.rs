@@ -1157,6 +1157,11 @@ async fn stream_claude(
         .kill_on_drop(true);
     add_model(&mut cmd, "--model", model);
     add_effort(&mut cmd, effort);
+    // Same read-only repo access as run_claude: the chat should be able to
+    // open what the (budget-limited) diff leaves out.
+    if has_repo(cwd) {
+        cmd.arg("--allowedTools").arg("Read Grep Glob LS");
+    }
     apply_cwd(&mut cmd, cwd);
     let mut child = cmd
         .spawn()

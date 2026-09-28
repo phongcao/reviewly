@@ -42,6 +42,12 @@ export interface PrContextRef {
    * at. The line range, when known, is the source span that text came from.
    */
   quote?: string;
+  /**
+   * Title of the tour stop the `quote` was highlighted in. When set, the quote
+   * is the AI tour's own commentary about `path:from-to` — a claim about that
+   * code, not text from the file — and the prompt frames it that way.
+   */
+  stop?: string;
 }
 
 /** Shape the composer's `@` autocomplete consumes (see ui/textarea.tsx). */
@@ -60,6 +66,8 @@ const MAX_SNIPPET_LINES = 400;
 const QUOTE_CHARS = 2_000;
 /** Unchanged lines shown either side of an attached range, for orientation. */
 const CTX = 3;
+/** What `buildSnippet` returns for a range it can't find in the patch. */
+const NOT_IN_DIFF = "(this range isn't present in the file's diff)";
 
 /* ───────────────────── refs ───────────────────── */
 
@@ -118,7 +126,8 @@ export function refLabel(ref: PrContextRef): string {
 export function echoRefs(refs: PrContextRef[]): string {
   return refs
     .map((r) => {
-      const base = `> 📎 \`${refPathLabel(r)}\``;
+      const at = `> 📎 \`${refPathLabel(r)}\``;
+      const base = r.stop ? `${at} (tour stop “${r.stop}”)` : at;
       if (!r.quote) return base;
       // One line of the quote is enough to keep later turns oriented.
       const flat = r.quote.replace(/\s+/g, " ");
@@ -299,6 +308,56 @@ export function refFromProse(
   return { id: `quote:${path}:${tag}`, kind: "file", path, quote };
 }
 
+/** The highlighted text, cut to the part inside `root` and capped for storage. */
+function quoteIn(root: HTMLElement, range: Range): string | null {
+  const inside = document.createRange();
+  inside.selectNodeContents(root);
+  const clamped = range.cloneRange();
+  try {
+    if (clamped.compareBoundaryPoints(Range.START_TO_START, inside) < 0) {
+      clamped.setStart(inside.startContainer, inside.startOffset);
+    }
+    if (clamped.compareBoundaryPoints(Range.END_TO_END, inside) > 0) {
+      clamped.setEnd(inside.endContainer, inside.endOffset);
+    }
+  } catch {
+    return null;
+  }
+  const raw = clamped
+    .toString()
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (!raw) return null;
+  return raw.length <= QUOTE_CHARS ? raw : `${raw.slice(0, QUOTE_CHARS)}…`;
+}
+
+/**
+ * Map a text selection inside a tour stop's commentary to a ref. The text is
+ * the AI's, not the file's, so there are no source positions to walk: the range
+ * is the stop's own anchor, and `stop` marks the quote as a claim about it.
+ */
+export function refFromStopNote(
+  root: HTMLElement,
+  stop: { path: string; line: number; endLine?: number; title: string },
+  sel: Selection | null,
+): PrContextRef | null {
+  if (!sel || sel.isCollapsed || sel.rangeCount === 0) return null;
+  if (!root.contains(sel.anchorNode) && !root.contains(sel.focusNode)) return null;
+  const quote = quoteIn(root, sel.getRangeAt(0));
+  if (!quote) return null;
+  const to = stop.endLine && stop.endLine >= stop.line ? stop.endLine : stop.line;
+  return {
+    id: `stop:${stop.path}:${stop.line}-${to}:${hash(stop.title)}:${hash(quote)}`,
+    kind: "snippet",
+    path: stop.path,
+    side: "RIGHT",
+    from: stop.line,
+    to,
+    quote,
+    stop: stop.title,
+  };
+}
+
 /* ───────────────────── snippet text ───────────────────── */
 
 function prefixFor(kind: string): string {
@@ -346,7 +405,7 @@ export function buildSnippet(
       const slice = fileLines.slice(from - 1, Math.min(to, fileLines.length));
       return cap(slice.map((t, i) => ` ${from + i}\t${t}`).join("\n"));
     }
-    return "(this range isn't present in the file's diff)";
+    return NOT_IN_DIFF;
   }
 
   let lo = first;
@@ -413,7 +472,7 @@ export function buildFocusedContext(refs: PrContextRef[], files: PullFile[]): st
       body = buildSnippet(file?.patch, ref.side ?? "RIGHT", ref.from ?? 0, ref.to ?? 0);
       // Re-derivation failed (an expanded-context range isn't in the patch) —
       // fall back to whatever was captured when the reviewer attached it.
-      if (ref.code && body.startsWith("(this range isn't present")) body = ref.code;
+      if (ref.code && body.startsWith(NOT_IN_DIFF)) body = ref.code;
     }
     const block = `${heading}\n\`\`\`diff\n${body}\n\`\`\``;
     if (block.length > budget) {
@@ -440,11 +499,17 @@ function quoteBlock(ref: PrContextRef, file: PullFile | undefined): string {
     .split("\n")
     .map((l) => (l ? `> ${l}` : ">"))
     .join("\n");
-  let out = `## ${refPathLabel(ref)} (text highlighted in the rendered document)\n${quoted}`;
+  let out = ref.stop
+    ? `## ${refPathLabel(ref)} (passage highlighted in the AI tour stop “${ref.stop}”)\nThis is the tour's commentary about the code below, not the code itself — treat it as a claim to check against the diff, not as established fact.\n${quoted}`
+    : `## ${refPathLabel(ref)} (text highlighted in the rendered document)\n${quoted}`;
   if (ref.from != null && ref.to != null) {
     let src = buildSnippet(file?.patch, "RIGHT", ref.from, ref.to);
-    if (src.startsWith("(this range isn't present")) src = ref.code ?? "";
-    if (src) out += `\n\nSource lines:\n\`\`\`diff\n${src}\n\`\`\``;
+    if (src.startsWith(NOT_IN_DIFF)) src = ref.code ?? "";
+    // The captured fallback can be the same "not in the diff" note.
+    if (src && !src.startsWith(NOT_IN_DIFF)) {
+      const label = ref.stop ? "Code the stop is anchored to" : "Source lines";
+      out += `\n\n${label}:\n\`\`\`diff\n${src}\n\`\`\``;
+    }
   }
   return out;
 }

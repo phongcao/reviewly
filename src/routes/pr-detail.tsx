@@ -1474,6 +1474,9 @@ export function PRDetailPage() {
               setView("unified");
             }}
             onScrolledChange={setGuidedScrolled}
+            onAskAi={() => {
+              void revealChat();
+            }}
           />
         )}
 

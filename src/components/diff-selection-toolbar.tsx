@@ -18,6 +18,9 @@ interface Props {
   /** `prose` = the rendered Markdown preview: no diff rows, so the selection
    * maps through source positions and carries the highlighted text itself. */
   view: "unified" | "split" | "prose";
+  /** Custom selection → ref mapping, for text that isn't the file itself (a
+   * tour stop's commentary). Replaces the `view`-based mapping when given. */
+  resolve?: (root: HTMLElement, sel: Selection) => PrContextRef | null;
   /** Conversation key, `owner/repo#number`. */
   prKey: string;
   /** HEAD file content, so a range inside an expanded context gap still resolves. */
@@ -45,6 +48,7 @@ export function DiffSelectionToolbar({
   path,
   patch,
   view,
+  resolve,
   prKey,
   fileLines,
   onAskAi,
@@ -66,15 +70,18 @@ export function DiffSelectionToolbar({
       hide();
       return;
     }
-    const ref =
-      view === "prose" ? refFromProse(root, path, sel) : refFromSelection(root, path, view, sel);
+    const ref = resolve
+      ? resolve(root, sel)
+      : view === "prose"
+        ? refFromProse(root, path, sel)
+        : refFromSelection(root, path, view, sel);
     if (!ref) {
       hide();
       return;
     }
     refRef.current = ref;
     setRect(sel.getRangeAt(0).getBoundingClientRect());
-  }, [rootRef, path, view, hide]);
+  }, [rootRef, path, view, resolve, hide]);
 
   // Capture the selection after the browser has finalized it.
   useEffect(() => {
@@ -132,8 +139,9 @@ export function DiffSelectionToolbar({
 
   if (!rect || !refRef.current) return null;
   const ref = refRef.current;
-  const label =
-    ref.from == null
+  const label = ref.stop
+    ? "Tour note"
+    : ref.from == null
       ? "Selection"
       : ref.to != null && ref.to !== ref.from
         ? `Lines ${ref.from}–${ref.to}`

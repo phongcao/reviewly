@@ -6,6 +6,7 @@ import {
   refFromLines,
   refFromProse,
   refFromSelection,
+  refFromStopNote,
   refLocation,
 } from "@/lib/ai/attach";
 import type { PullFile } from "@/lib/tauri";
@@ -286,5 +287,95 @@ describe("quote refs in the prompt", () => {
     expect(echoRefs([{ id: "q", kind: "file", path: "README.md", quote: "Then\nstart it." }])).toBe(
       "> 📎 `README.md` “Then start it.”",
     );
+  });
+});
+
+describe("tour stop notes", () => {
+  const stop = { path: "a.ts", line: 3, endLine: 4, title: "Deploy from the request path" };
+  const file = {
+    filename: "a.ts",
+    patch: "@@ -1,2 +1,4 @@\n const a = 1;\n const b = 2;\n+deploy();\n+analyze();",
+  } as PullFile;
+
+  it("anchors a highlight to the stop's range and keeps the text + stop title", () => {
+    const root = renderProse("The processor runs `deploy` and then analyzes.\n", false);
+    const ref = refFromStopNote(root, stop, selectText(root, "The processor runs"));
+    expect(ref).toMatchObject({
+      kind: "snippet",
+      path: "a.ts",
+      side: "RIGHT",
+      from: 3,
+      to: 4,
+      quote: "The processor runs",
+      stop: "Deploy from the request path",
+    });
+  });
+
+  it("keeps only the part of a selection inside the note", () => {
+    const outside = document.createElement("p");
+    outside.textContent = "Suggested comment";
+    const root = renderProse("Edge label is wrong.\n", false);
+    document.body.appendChild(outside);
+    const range = document.createRange();
+    range.setStart(root.querySelector("p")?.firstChild as Text, 5);
+    range.setEnd(outside.firstChild as Text, 9);
+    const sel = window.getSelection() as Selection;
+    sel.removeAllRanges();
+    sel.addRange(range);
+    expect(refFromStopNote(root, stop, sel)?.quote).toBe("label is wrong.");
+  });
+
+  it("frames the quote as the tour's claim, with the code it's anchored to", () => {
+    const ref = refFromStopNote(
+      renderProse("Runs deploy.\n", false),
+      stop,
+      selectText(document.body, "Runs deploy."),
+    );
+    const out = buildFocusedContext([ref as NonNullable<typeof ref>], [file]);
+    expect(out).toContain(
+      "## a.ts:3-4 (passage highlighted in the AI tour stop “Deploy from the request path”)",
+    );
+    expect(out).toContain("claim to check against the diff");
+    expect(out).toContain("> Runs deploy.");
+    expect(out).toContain("Code the stop is anchored to:");
+    expect(out).toContain("+3\tdeploy();");
+  });
+
+  it("leaves out the code block when the stop's anchor isn't in the diff", () => {
+    const out = buildFocusedContext(
+      [
+        {
+          id: "s",
+          kind: "snippet",
+          path: "a.ts",
+          side: "RIGHT",
+          from: 90,
+          to: 90,
+          quote: "Runs deploy.",
+          stop: "Off the diff",
+          code: "(this range isn't present in the file's diff)",
+        },
+      ],
+      [file],
+    );
+    expect(out).toContain("> Runs deploy.");
+    expect(out).not.toContain("anchored to");
+    expect(out).not.toContain("isn't present");
+  });
+
+  it("names the stop in the transcript echo", () => {
+    expect(
+      echoRefs([
+        {
+          id: "s",
+          kind: "snippet",
+          path: "a.ts",
+          from: 3,
+          to: 4,
+          quote: "Runs deploy.",
+          stop: "Deploy",
+        },
+      ]),
+    ).toBe("> 📎 `a.ts:3-4` (tour stop “Deploy”) “Runs deploy.”");
   });
 });

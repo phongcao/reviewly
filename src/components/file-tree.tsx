@@ -247,6 +247,21 @@ export function FileTree({
     if (expanded.length) setFolderCollapsedBulk(viewedKey, expanded, false);
   }
 
+  function expandFolders(paths: string[]) {
+    if (!viewedKey) return;
+    if (hasPersisted) {
+      setFolderCollapsedBulk(viewedKey, paths, false);
+      return;
+    }
+    // Same materialization as `toggle` — the default set, minus these.
+    const open = new Set(paths);
+    setFolderCollapsedBulk(
+      viewedKey,
+      [...defaultCollapsed].filter((p) => !open.has(p)),
+      true,
+    );
+  }
+
   function collapseAll() {
     if (viewedKey) setFolderCollapsedBulk(viewedKey, allFolderPaths, true);
   }
@@ -267,11 +282,32 @@ export function FileTree({
   const [focusIdx, setFocusIdx] = useState<number | null>(null);
   const activeRowRef = useRef<HTMLLIElement>(null);
 
-  // Auto-scroll the active file row into view when the selection changes.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: scroll on active change
+  // Reveal the active file when the selection changes (or the tree mounts).
+  // A file opened from elsewhere — a tour stop, a comment — can sit under a
+  // collapsed folder or be hidden by focus mode, which leaves it open in the
+  // diff but invisible here. Unhide it, expand its ancestors, then scroll to
+  // it; each step re-runs this effect until the row is rendered. Done once per
+  // selection, so collapsing the folder afterwards sticks.
+  const revealedRef = useRef<string | null>(null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `isCollapsed`/`expandFolders` are derived from collapsedMap/hasPersisted, which ARE the deps
   useEffect(() => {
+    if (!active || revealedRef.current === active) return;
+    if (
+      focusMode &&
+      !showHidden &&
+      classified.some((c) => c.file.filename === active && c.reason !== null)
+    ) {
+      setShowHidden(true);
+      return;
+    }
+    const closed = allFolderPaths.filter((p) => active.startsWith(`${p}/`) && isCollapsed(p));
+    if (closed.length && viewedKey) {
+      expandFolders(closed);
+      return;
+    }
     activeRowRef.current?.scrollIntoView({ block: "nearest" });
-  }, [active]);
+    revealedRef.current = active;
+  }, [active, classified, focusMode, showHidden, allFolderPaths, collapsedMap, hasPersisted]);
 
   const effectiveToggleViewed =
     onToggleViewed ??
