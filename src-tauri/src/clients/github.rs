@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use reqwest::Response;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
@@ -203,10 +204,52 @@ pub async fn viewer(state: &AppState, token: &str) -> AppResult<Viewer> {
     Ok(res.json().await?)
 }
 
-/// GitHub's Search API is capped at ~30 req/min and punishes bursts with a
-/// secondary (abuse) limit. We funnel every search through a small concurrency
-/// gate (kills the burst) and retry on 403/429, waiting for the reset window.
-static SEARCH_GATE: Semaphore = Semaphore::const_new(5);
+/// GitHub's Search API is capped at ~30 req/min and punishes bursts — and
+/// concurrency in particular — with a secondary (abuse) limit. We funnel every
+/// search through a narrow gate, and on a rate-limit response pause *all*
+/// searches for the reset window rather than retrying into the throttle.
+static SEARCH_GATE: Semaphore = Semaphore::const_new(2);
+
+/// Unix seconds until which searches are paused after a rate-limit hit (0 =
+/// not paused), and consecutive header-less hits, for exponential backoff.
+static SEARCH_PAUSED_UNTIL: AtomicU64 = AtomicU64::new(0);
+static SEARCH_STRIKES: AtomicU32 = AtomicU32::new(0);
+
+/// A secondary limit without `Retry-After` means "wait at least a minute, then
+/// back off exponentially" per GitHub's docs; cap the pause at 15 minutes.
+const SECONDARY_MIN_WAIT: u64 = 60;
+const SECONDARY_MAX_WAIT: u64 = 15 * 60;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Pause length for the `strikes`-th consecutive header-less secondary limit.
+fn secondary_backoff(strikes: u32) -> u64 {
+    SECONDARY_MIN_WAIT
+        .saturating_mul(1u64 << strikes.min(8))
+        .min(SECONDARY_MAX_WAIT)
+}
+
+/// Seconds left in the current search pause, if any. The poller checks this to
+/// skip its search steps instead of piling requests onto an active throttle.
+pub fn search_paused_for() -> Option<u64> {
+    let left = SEARCH_PAUSED_UNTIL.load(Ordering::Relaxed).saturating_sub(unix_now());
+    (left > 0).then_some(left)
+}
+
+fn pause_searches(secs: u64) {
+    SEARCH_PAUSED_UNTIL.fetch_max(unix_now() + secs, Ordering::Relaxed);
+}
+
+/// Whether a 403/429 is a rate limit (primary or secondary) rather than a
+/// plain permission error, which must not trigger a pause.
+fn is_rate_limited(code: u16, header_wait: Option<u64>, body: &str) -> bool {
+    code == 429 || header_wait.is_some() || body.to_ascii_lowercase().contains("rate limit")
+}
 
 /// Seconds to wait before retrying a rate-limited response: prefer `Retry-After`,
 /// fall back to `X-RateLimit-Reset` when the remaining quota is 0.
@@ -225,11 +268,7 @@ fn rate_limit_wait(res: &Response) -> Option<u64> {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.trim().parse::<u64>().ok())
         {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            return Some(reset.saturating_sub(now).saturating_add(1));
+            return Some(reset.saturating_sub(unix_now()).saturating_add(1));
         }
     }
     None
@@ -261,6 +300,11 @@ async fn search_get(
     if let Some(v) = state.cache_get(&key, SEARCH_TTL) {
         return Ok(v);
     }
+    // While throttled, serve the last known result (however stale) rather than
+    // sending another request that would only extend the penalty.
+    if let Some(secs) = search_paused_for() {
+        return state.cache_value(&key).ok_or(AppError::RateLimited(secs));
+    }
 
     let url = format!("{API}{path}");
     // Conditional request: a 304 returns our cached body and does NOT count
@@ -288,16 +332,29 @@ async fn search_get(
                 .map(String::from);
             let v: serde_json::Value = res.json().await?;
             state.cache_put_etag(key, v.clone(), new_etag);
+            SEARCH_STRIKES.store(0, Ordering::Relaxed);
             return Ok(v);
         }
         let code = res.status().as_u16();
-        if (code == 403 || code == 429) && attempt < 3 {
-            let wait = rate_limit_wait(&res).unwrap_or(1u64 << attempt).clamp(1, 60);
-            tokio::time::sleep(Duration::from_secs(wait)).await;
-            attempt += 1;
-            continue;
-        }
+        let header_wait = rate_limit_wait(&res);
         let body = res.text().await.unwrap_or_default();
+        if (code == 403 || code == 429) && is_rate_limited(code, header_wait, &body) {
+            let wait = match header_wait {
+                Some(w) => w.max(1),
+                None => secondary_backoff(SEARCH_STRIKES.fetch_add(1, Ordering::Relaxed)),
+            };
+            pause_searches(wait);
+            // A short, server-stated wait (the primary limit's reset window) is
+            // worth sitting out once; a header-less secondary limit is not.
+            if header_wait.is_some() && wait <= 60 && attempt < 1 {
+                tracing::debug!("github search rate-limited; retrying in {wait}s");
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                attempt += 1;
+                continue;
+            }
+            tracing::warn!("github search rate-limited ({code}); pausing searches for {wait}s");
+            return Err(AppError::RateLimited(wait));
+        }
         return Err(AppError::Upstream { status: code, body });
     }
 }
@@ -865,4 +922,27 @@ pub async fn rerun_check_run(
         status: status.as_u16(),
         body,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secondary_backoff_doubles_from_a_minute_and_caps() {
+        assert_eq!(secondary_backoff(0), 60);
+        assert_eq!(secondary_backoff(1), 120);
+        assert_eq!(secondary_backoff(3), 480);
+        assert_eq!(secondary_backoff(4), SECONDARY_MAX_WAIT);
+        assert_eq!(secondary_backoff(u32::MAX), SECONDARY_MAX_WAIT);
+    }
+
+    #[test]
+    fn only_rate_limit_403s_count_as_throttling() {
+        let secondary = r#"{"message":"You have exceeded a secondary rate limit."}"#;
+        assert!(is_rate_limited(403, None, secondary));
+        assert!(is_rate_limited(403, Some(30), ""));
+        assert!(is_rate_limited(429, None, ""));
+        assert!(!is_rate_limited(403, None, r#"{"message":"Resource not accessible"}"#));
+    }
 }
