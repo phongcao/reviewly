@@ -273,6 +273,32 @@
   mask-image: radial-gradient(closest-side at 50% 40%, #000 0%, transparent 76%);
 }
 
+/* Base UI's ScrollArea rewrites these four on its viewport on EVERY scroll
+   event (for the optional edge fade). Unregistered custom properties inherit,
+   so each write restyled every element inside the scroller — the whole diff,
+   down to each Prism token — while scrolling. Registered as non-inheriting,
+   they only change the viewport itself, the one element that reads them. */
+@property --scroll-area-overflow-x-start {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@property --scroll-area-overflow-x-end {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@property --scroll-area-overflow-y-start {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@property --scroll-area-overflow-y-end {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+
 @layer base {
   *,
   *::before,

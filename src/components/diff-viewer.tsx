@@ -12,7 +12,16 @@ import { buildSnippet, refFromLines } from "@/lib/ai/attach";
 import { attachContext } from "@/lib/ai/attach-bridge";
 import { useBehavior } from "@/lib/ai/use-behavior";
 import type { BehaviorDiff } from "@/lib/behavior";
-import { type DiffLine, type Hunk, parseHunkHeader, parsePatch, toSplit } from "@/lib/diff";
+import {
+  type DiffLine,
+  type Hunk,
+  hasLineEndingChanges,
+  ignoreLineEndings,
+  parseHunkHeader,
+  parsePatch,
+  sharedRatio,
+  toSplit,
+} from "@/lib/diff";
 import { isImagePath } from "@/lib/images";
 import { detectLanguage, highlightLine } from "@/lib/lang";
 import { isMarkdownPath } from "@/lib/markdown";
@@ -29,6 +38,7 @@ import {
   ChevronDown,
   ChevronUp,
   Copy,
+  CornerDownLeft,
   ExternalLink,
   FileCode,
   GitCompare,
@@ -150,7 +160,7 @@ interface LineRenderCtx {
   /**
    * Approx. monospace characters that fit on one visual line of the code
    * column, or 0 when unknown. Only used to size off-screen hunks (see
-   * `estimateHunkHeight`) — never to lay out real rows.
+   * `estimateRowsHeight`) — never to lay out real rows.
    */
   charsPerLine: number;
 }
@@ -323,6 +333,12 @@ export function DiffViewer({
   const setDiffWrap = useReviewPrefs((s) => s.setDiffWrap);
   const hideWhitespace = useReviewPrefs((s) => s.hideWhitespace);
   const setHideWhitespace = useReviewPrefs((s) => s.setHideWhitespace);
+  // CRLF <-> LF noise: review-wide like the above, but the toggle only shows on
+  // files whose diff actually has line-ending-only changes.
+  const ignoreEolPref = useReviewPrefs((s) => s.ignoreLineEndings);
+  const setIgnoreEol = useReviewPrefs((s) => s.setIgnoreLineEndings);
+  const hasEolChanges = useMemo(() => hasLineEndingChanges(hunks), [hunks]);
+  const ignoreEol = ignoreEolPref && hasEolChanges;
   // Render Markdown files as documents rather than diffs. Review-wide (not
   // per-file) so a docs-heavy PR is read in one mode instead of re-toggled
   // twenty times; the toggle only appears on files it applies to.
@@ -338,7 +354,7 @@ export function DiffViewer({
 
   // Width of the code column in monospace characters, remeasured when the pane
   // resizes. Feeds the off-screen hunk size estimate only (see
-  // `estimateHunkHeight`); rows themselves are always laid out by the browser.
+  // `estimateRowsHeight`); rows themselves are always laid out by the browser.
   const charsPerLine = useCodeColumnChars(rootRef);
 
   const lineCtx: LineRenderCtx = { wrap: diffWrap, charsPerLine };
@@ -647,6 +663,9 @@ export function DiffViewer({
       onToggleWrap={() => setDiffWrap(!diffWrap)}
       hideWhitespace={hideWhitespace}
       onToggleHideWhitespace={() => setHideWhitespace(!hideWhitespace)}
+      eolChanges={hasEolChanges}
+      ignoreEol={ignoreEol}
+      onToggleIgnoreEol={() => setIgnoreEol(!ignoreEolPref)}
       commentCount={commentLines.length}
       onPrevComment={() => navComment(-1)}
       onNextComment={() => navComment(1)}
@@ -885,6 +904,7 @@ export function DiffViewer({
               ui={ui}
               onAddComment={onAddComment}
               hideWhitespace={hideWhitespace}
+              ignoreEol={ignoreEol}
               line={lineCtx}
             />
           </Fragment>
@@ -972,6 +992,9 @@ function DiffToolbar({
   onToggleWrap,
   hideWhitespace,
   onToggleHideWhitespace,
+  eolChanges,
+  ignoreEol,
+  onToggleIgnoreEol,
   commentCount,
   onPrevComment,
   onNextComment,
@@ -990,6 +1013,10 @@ function DiffToolbar({
   onToggleWrap: () => void;
   hideWhitespace: boolean;
   onToggleHideWhitespace: () => void;
+  /** The diff has CRLF <-> LF-only changes — the only time the EOL toggle shows. */
+  eolChanges: boolean;
+  ignoreEol: boolean;
+  onToggleIgnoreEol: () => void;
   commentCount: number;
   onPrevComment: () => void;
   onNextComment: () => void;
@@ -1052,6 +1079,21 @@ function DiffToolbar({
             <TextQuote className="size-3.5" />
             Hide whitespace
           </ToolBtn>
+          {eolChanges && (
+            <ToolBtn
+              tip={
+                ignoreEol
+                  ? "Ignoring CRLF ↔ LF changes — show every line whose ending changed"
+                  : "Line endings changed (CRLF ↔ LF) — hide those lines to see the real edits"
+              }
+              onClick={onToggleIgnoreEol}
+              pressed={ignoreEol}
+              active={ignoreEol}
+            >
+              <CornerDownLeft className="size-3.5" />
+              Ignore EOL
+            </ToolBtn>
+          )}
           <div className="mx-0.5 h-4 w-px bg-border/50" aria-hidden />
           <ToolBtn tip="Previous comment" onClick={onPrevComment} disabled={commentCount === 0}>
             <ChevronUp className="size-3.5" />
@@ -1229,7 +1271,11 @@ function HunkHeaderBar({ text, gutter }: { text: string; gutter?: string }) {
   const explain = meta?.onExplainBehavior;
   const busy = meta?.behaviorPending === newStart;
   return (
-    <div className="group/hunk sticky top-0 z-10 flex items-center border-y border-hairline bg-card/95 backdrop-blur-md">
+    // Opaque card-over-background rather than a translucent card + backdrop
+    // blur: this bar stays pinned over the rows for as long as its hunk is on
+    // screen (a whole rewritten file), and a backdrop filter there re-blurs
+    // the scrolling content on every frame.
+    <div className="group/hunk sticky top-0 z-10 flex items-center border-y border-hairline [background:linear-gradient(var(--color-card),var(--color-card)),var(--color-background)]">
       {gutter && <span className={cn("shrink-0", gutter)} />}
       <pre className="min-w-0 flex-1 select-text truncate px-3 py-1 text-xs">
         {symbol ? (
@@ -1270,6 +1316,9 @@ function GutterSlot() {
 
 /* ────────────────────────────────────────────────────────────────── */
 
+/** Below this `sharedRatio`, a del/add pair is treated as unrelated lines. */
+const MIN_SHARED_RATIO = 0.4;
+
 interface PairWordDiff {
   oldHtml: string;
   newHtml: string;
@@ -1282,6 +1331,13 @@ interface PairWordDiff {
  */
 function wordDiff(oldText: string, newText: string, lang: string): PairWordDiff {
   const parts = diffWordsWithSpace(oldText, newText);
+  // A pair is just whichever del and add happen to sit side by side, so in a
+  // rewritten block it's often two unrelated lines. Their word diff marks
+  // nearly every token — noise to read, and thousands of extra spans to paint
+  // — so show them as plain removed and added lines instead.
+  if (sharedRatio(parts) < MIN_SHARED_RATIO) {
+    return { oldHtml: highlightLine(oldText, lang), newHtml: highlightLine(newText, lang) };
+  }
   let oldHtml = "";
   let newHtml = "";
   for (const part of parts) {
@@ -1302,6 +1358,12 @@ interface DecoratedLine extends DiffLine {
   html: string;
   /** Marks a del/add pair collapsed because it differs only in whitespace. */
   whitespaceOnly?: boolean;
+}
+
+/** The muted tag on a row collapsed by hide-whitespace or ignore-EOL. */
+function collapsedLabel(line: DecoratedLine): string | null {
+  if (line.eolChange) return line.eolChange === "crlf-to-lf" ? "CRLF→LF" : "LF→CRLF";
+  return line.whitespaceOnly ? "whitespace" : null;
 }
 
 /** True when two strings are identical once all whitespace is stripped. */
@@ -1367,6 +1429,7 @@ function HunkBlock({
   ui,
   onAddComment,
   hideWhitespace = false,
+  ignoreEol = false,
   line,
 }: {
   path: string;
@@ -1377,11 +1440,12 @@ function HunkBlock({
   ui: CommentUiState;
   onAddComment: (c: DraftComment) => void;
   hideWhitespace?: boolean;
+  ignoreEol?: boolean;
   line: LineRenderCtx;
 }) {
   const decorated = useMemo(
-    () => decorateHunk(hunk, lang, hideWhitespace),
-    [hunk, lang, hideWhitespace],
+    () => decorateHunk(ignoreEol ? ignoreLineEndings(hunk) : hunk, lang, hideWhitespace),
+    [hunk, lang, hideWhitespace, ignoreEol],
   );
 
   if (view === "split") {
@@ -1397,34 +1461,74 @@ function HunkBlock({
     );
   }
 
-  // Big-diff perf (SAFE): let the browser skip layout/paint for off-screen
-  // hunks via `content-visibility:auto`, reserving an estimated height so the
-  // scrollbar stays stable. No virtualization or logic change — purely a
-  // rendering hint.
-  //
-  // `bg-background` is load-bearing, not cosmetic. A skipped subtree paints
-  // nothing, and every ancestor up to <html> is translucent (the macOS
-  // vibrancy setup in globals.css) over a `transparent: true` window whose
-  // base colour is #00000000. Without an opaque surface *inside* the
-  // containment boundary, a hunk that WebKit hasn't finished painting yet
-  // composites as window black — the flash seen when scrolling fast.
-  const estHeight = estimateHunkHeight(decorated, line);
+  return (
+    <div className="border-b border-border/20">
+      {chunked(decorated).map(({ start, rows }) => (
+        <RowChunk key={start} height={estimateRowsHeight(rows, line.charsPerLine, line.wrap)}>
+          {rows.map((row, i) => (
+            <RowUnified
+              key={start + i}
+              line={row}
+              path={path}
+              threads={threads}
+              ui={ui}
+              onAddComment={onAddComment}
+              render={line}
+            />
+          ))}
+        </RowChunk>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Rows per `content-visibility` boundary. Hunk-sized boundaries aren't enough:
+ * a rewritten file is often a single hunk of a thousand-plus rows that is
+ * always partly on screen, so the browser never gets to skip any of it.
+ */
+const CHUNK_ROWS = 100;
+
+function chunked<T>(rows: T[]): { start: number; rows: T[] }[] {
+  const out: { start: number; rows: T[] }[] = [];
+  for (let start = 0; start < rows.length; start += CHUNK_ROWS) {
+    out.push({ start, rows: rows.slice(start, start + CHUNK_ROWS) });
+  }
+  return out;
+}
+
+/**
+ * Big-diff perf (SAFE): let the browser skip layout/paint for off-screen rows
+ * via `content-visibility:auto`, reserving an estimated height so the
+ * scrollbar stays stable. No virtualization or logic change — every row stays
+ * in the DOM for find, `data-line` lookups and selection; purely a rendering
+ * hint.
+ *
+ * `bg-background` is load-bearing, not cosmetic. A skipped subtree paints
+ * nothing, and every ancestor up to <html> is translucent (the macOS
+ * vibrancy setup in globals.css) over a `transparent: true` window whose
+ * base colour is #00000000. Without an opaque surface *inside* the
+ * containment boundary, a chunk that WebKit hasn't finished painting yet
+ * composites as window black — the flash seen when scrolling fast.
+ */
+function RowChunk({
+  height,
+  className,
+  children,
+}: {
+  height: number;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => (ref.current ? renderAhead(ref.current) : undefined), []);
   return (
     <div
-      className="border-b border-border/20 bg-background [content-visibility:auto]"
-      style={{ containIntrinsicSize: `auto ${estHeight}px` }}
+      ref={ref}
+      className={cn("bg-background [content-visibility:auto]", className)}
+      style={{ containIntrinsicSize: `auto ${height}px` }}
     >
-      {decorated.map((row, i) => (
-        <RowUnified
-          key={i}
-          line={row}
-          path={path}
-          threads={threads}
-          ui={ui}
-          onAddComment={onAddComment}
-          render={line}
-        />
-      ))}
+      {children}
     </div>
   );
 }
@@ -1432,9 +1536,40 @@ function HunkBlock({
 const ROW_LINE_HEIGHT = 18.6; // 12px * 1.55 leading
 const ROW_PADDING_Y = 4; // py-0.5, top + bottom
 
+/** One observer per scroll container, shared by every chunk inside it. */
+const renderAheadObservers = new WeakMap<Element, IntersectionObserver>();
+
 /**
- * Height a hunk will occupy once rendered, used only as the reserved size for
- * `content-visibility:auto`.
+ * `content-visibility:auto` only starts laying out and painting a chunk once
+ * it reaches the viewport, and macOS scrolls on its own thread, so on a fast
+ * scroll the chunk arrives on screen as an empty background and its text pops
+ * in a few frames later. Force chunks within one screen-height of the
+ * viewport to render — a back buffer — and hand them back to `auto` (which
+ * remembers their real size) once they're far away again.
+ */
+function renderAhead(el: HTMLElement): () => void {
+  const root = scrollParent(el);
+  const key = root ?? document.documentElement;
+  let io = renderAheadObservers.get(key);
+  if (!io) {
+    io = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          (e.target as HTMLElement).style.contentVisibility = e.isIntersecting ? "visible" : "";
+        }
+      },
+      { root, rootMargin: "100% 0px" },
+    );
+    renderAheadObservers.set(key, io);
+  }
+  const observer = io;
+  observer.observe(el);
+  return () => observer.unobserve(el);
+}
+
+/**
+ * Height a run of rows will occupy once rendered, used only as the reserved
+ * size for `content-visibility:auto`.
  *
  * A row is one 12px/1.55 line box plus 4px of vertical padding (~22.6px), which
  * is why the old flat `rows * 22` estimate was fine — but only while lines do
@@ -1445,14 +1580,36 @@ const ROW_PADDING_Y = 4; // py-0.5, top + bottom
  * shifted content under the scroll offset and forced another layout+paint pass,
  * which is what made fast scrolling drop frames.
  */
-function estimateHunkHeight(rows: DecoratedLine[], ctx: LineRenderCtx): number {
-  if (!ctx.wrap || ctx.charsPerLine <= 0) {
+function estimateRowsHeight(rows: DecoratedLine[], charsPerLine: number, wrap: boolean): number {
+  if (!wrap || charsPerLine <= 0) {
     return Math.max(1, rows.length) * (ROW_LINE_HEIGHT + ROW_PADDING_Y);
   }
   let total = 0;
-  for (const row of rows) {
-    const visualLines = Math.max(1, Math.ceil(row.text.length / ctx.charsPerLine));
-    total += visualLines * ROW_LINE_HEIGHT + ROW_PADDING_Y;
+  for (const row of rows) total += rowHeight(row.text, charsPerLine);
+  return Math.max(1, Math.round(total));
+}
+
+function rowHeight(text: string, charsPerLine: number): number {
+  const visualLines = Math.max(1, Math.ceil(text.length / charsPerLine));
+  return visualLines * ROW_LINE_HEIGHT + ROW_PADDING_Y;
+}
+
+/**
+ * `estimateRowsHeight` for split view: each side gets roughly half the code
+ * width (a split half's chrome is ~56px narrower than a unified row's two
+ * halves combined), and a row is as tall as its taller side.
+ */
+function estimateSplitRowsHeight(rows: SplitRow[], ctx: LineRenderCtx): number {
+  const perSide = Math.floor(ctx.charsPerLine / 2) - 4;
+  if (!ctx.wrap || perSide <= 0) {
+    return Math.max(1, rows.length) * (ROW_LINE_HEIGHT + ROW_PADDING_Y);
+  }
+  let total = 0;
+  for (const r of rows) {
+    total += Math.max(
+      rowHeight(r.left?.text ?? "", perSide),
+      rowHeight(r.right?.text ?? "", perSide),
+    );
   }
   return Math.max(1, Math.round(total));
 }
@@ -1596,9 +1753,9 @@ function RowUnified({
           // biome-ignore lint/security/noDangerouslySetInnerHtml: pre-sanitized via Prism / escapeHtml
           dangerouslySetInnerHTML={{ __html: line.html || "&nbsp;" }}
         />
-        {line.whitespaceOnly && (
+        {collapsedLabel(line) && (
           <span className="shrink-0 self-center pr-1 text-3xs text-muted-foreground/50">
-            whitespace
+            {collapsedLabel(line)}
           </span>
         )}
         <CopyLineButton text={line.text} />
@@ -1660,39 +1817,49 @@ function SplitHunk({
   line: LineRenderCtx;
 }) {
   const rows = useMemo(() => toSplitDecorated(lines), [lines]);
+  // Chunked split rows, so a del/add pair never straddles two grids.
   return (
-    <div className="grid grid-cols-2 divide-x divide-border/20 border-b border-border/20">
-      {rows.map((row, i) => {
-        if (row.left?.kind === "hunk") {
-          return (
-            <div key={i} className="col-span-2">
-              <HunkHeaderBar text={row.left.text} />
-            </div>
-          );
-        }
-        return (
-          <div key={i} className="col-span-2 contents">
-            <Half
-              line={row.left}
-              side="LEFT"
-              path={path}
-              threads={threads}
-              ui={ui}
-              onAddComment={onAddComment}
-              render={render}
-            />
-            <Half
-              line={row.right}
-              side="RIGHT"
-              path={path}
-              threads={threads}
-              ui={ui}
-              onAddComment={onAddComment}
-              render={render}
-            />
-          </div>
-        );
-      })}
+    <div className="border-b border-border/20">
+      {chunked(rows).map(({ start, rows: chunk }) => (
+        <RowChunk
+          key={start}
+          height={estimateSplitRowsHeight(chunk, render)}
+          className="grid grid-cols-2 divide-x divide-border/20"
+        >
+          {chunk.map((row, j) => {
+            const i = start + j;
+            if (row.left?.kind === "hunk") {
+              return (
+                <div key={i} className="col-span-2">
+                  <HunkHeaderBar text={row.left.text} />
+                </div>
+              );
+            }
+            return (
+              <div key={i} className="col-span-2 contents">
+                <Half
+                  line={row.left}
+                  side="LEFT"
+                  path={path}
+                  threads={threads}
+                  ui={ui}
+                  onAddComment={onAddComment}
+                  render={render}
+                />
+                <Half
+                  line={row.right}
+                  side="RIGHT"
+                  path={path}
+                  threads={threads}
+                  ui={ui}
+                  onAddComment={onAddComment}
+                  render={render}
+                />
+              </div>
+            );
+          })}
+        </RowChunk>
+      ))}
     </div>
   );
 }
@@ -1775,6 +1942,11 @@ function Half({
           // biome-ignore lint/security/noDangerouslySetInnerHtml: Prism output
           dangerouslySetInnerHTML={{ __html: line.html || "&nbsp;" }}
         />
+        {side === "RIGHT" && collapsedLabel(line) && (
+          <span className="shrink-0 self-center pr-1 text-3xs text-muted-foreground/50">
+            {collapsedLabel(line)}
+          </span>
+        )}
         <CopyLineButton text={line.text} />
       </div>
       {isPopoverHere && (
@@ -1982,7 +2154,7 @@ function ThreadsBlock({ threads }: { threads: ReviewThread[] }) {
   const ungrouped = threads.filter((t) => !grouped.has(t.id));
 
   return (
-    <div className="space-y-2 px-10 py-2.5 font-sans backdrop-blur-md">
+    <div className="space-y-2 px-10 py-2.5 font-sans">
       {meta &&
         groups.map(({ thread, comments }) => (
           <ReviewThreadGroup

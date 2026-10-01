@@ -21,6 +21,9 @@ interface State {
   /** Collapse del/add pairs that differ only by whitespace. */
   hideWhitespace: boolean;
   setHideWhitespace: (v: boolean) => void;
+  /** Treat lines that differ only by CRLF vs LF as unchanged. */
+  ignoreLineEndings: boolean;
+  setIgnoreLineEndings: (v: boolean) => void;
   /** Show Markdown files as rendered documents instead of a raw diff. */
   markdownPreview: boolean;
   setMarkdownPreview: (v: boolean) => void;
@@ -47,6 +50,8 @@ export const useReviewPrefs = create<State>()(
       setDiffWrap: (diffWrap) => set({ diffWrap }),
       hideWhitespace: false,
       setHideWhitespace: (hideWhitespace) => set({ hideWhitespace }),
+      ignoreLineEndings: false,
+      setIgnoreLineEndings: (ignoreLineEndings) => set({ ignoreLineEndings }),
       markdownPreview: false,
       setMarkdownPreview: (markdownPreview) => set({ markdownPreview }),
       autoStartTour: false,

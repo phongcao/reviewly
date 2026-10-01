@@ -424,6 +424,8 @@ function CodeReviewSection() {
   const setDiffWrap = useReviewPrefs((s) => s.setDiffWrap);
   const hideWhitespace = useReviewPrefs((s) => s.hideWhitespace);
   const setHideWhitespace = useReviewPrefs((s) => s.setHideWhitespace);
+  const ignoreLineEndings = useReviewPrefs((s) => s.ignoreLineEndings);
+  const setIgnoreLineEndings = useReviewPrefs((s) => s.setIgnoreLineEndings);
   const markdownPreview = useReviewPrefs((s) => s.markdownPreview);
   const setMarkdownPreview = useReviewPrefs((s) => s.setMarkdownPreview);
   const diffView = useUi((s) => s.diffView);
@@ -497,6 +499,12 @@ function CodeReviewSection() {
           description="Collapse lines that differ only by whitespace when reading a diff."
           checked={hideWhitespace}
           onChange={setHideWhitespace}
+        />
+        <SettingToggle
+          label="Ignore line-ending changes"
+          description="Treat lines that only switched between CRLF and LF as unchanged, so a converted file shows just its real edits."
+          checked={ignoreLineEndings}
+          onChange={setIgnoreLineEndings}
         />
         <SettingToggle
           label="Render Markdown files"
