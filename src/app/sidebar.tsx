@@ -75,14 +75,15 @@ export function Sidebar() {
           to="/"
           aria-label="Dashboard"
           className={cn(
-            "group relative mb-2 flex h-8 w-8 items-center justify-center rounded-md transition-colors",
+            "group relative mb-2 flex size-9 items-center justify-center rounded-lg transition-colors",
             location.pathname === "/" ? "bg-foreground/[0.08]" : "hover:bg-foreground/[0.05]",
           )}
         >
-          <ReviewlyGlyph size={26} />
+          <ReviewlyGlyph size={22} />
         </Link>
       </TooltipFor>
-      <nav className="flex flex-1 flex-col items-center gap-0.5">
+      <div className="mb-2 h-px w-5 bg-foreground/[0.08]" aria-hidden />
+      <nav className="flex flex-1 flex-col items-center gap-1.5">
         {NAV.map((item) => (
           <RailItem
             key={item.to}
@@ -105,7 +106,7 @@ export function Sidebar() {
         ))}
       </nav>
 
-      <div className="flex flex-col items-center gap-0.5">
+      <div className="flex flex-col items-center gap-1.5">
         <RailItem
           item={{
             to: "/settings",
@@ -148,14 +149,14 @@ function RailItem({
 }) {
   const Icon = item.icon;
   const cls = cn(
-    "group relative flex h-8 w-8 items-center justify-center rounded-md transition-colors",
+    "group relative flex size-9 items-center justify-center rounded-lg transition-colors",
     active
       ? "text-foreground bg-foreground/[0.09]"
       : "text-muted-foreground hover:text-foreground hover:bg-foreground/[0.04]",
   );
   const inner = (
     <>
-      <Icon className="size-[16px]" strokeWidth={1.5} />
+      <Icon className="size-[18px]" strokeWidth={1.75} />
       {pending ? (
         <span
           className="pointer-events-none absolute -right-1 -top-1 size-2 rounded-full bg-muted-foreground/50 ring-2 ring-background"
