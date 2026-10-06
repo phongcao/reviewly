@@ -83,6 +83,45 @@ export function parsePatch(patch: string | null | undefined): Hunk[] {
  * Group adjacent del/add lines into pairs for split view. Stand-alone
  * dels/adds become half-rows.
  */
+/**
+ * The rows around an anchored range `[lo, hi]` (new-file lines): the hunk that
+ * contains the range, else the first hunk that reaches past `lo`, cut to the
+ * range plus `ctx` rows each side. Null when no hunk reaches the anchor.
+ *
+ * Shared by the tour's inline snippet and the exported report, so a stop shows
+ * the same lines in both. Deliberately no blind first-hunk fallback: for an
+ * out-of-range line an honest "not in this diff" beats a confidently-wrong
+ * slice of unrelated code.
+ */
+export function anchorWindow(
+  patch: string | null | undefined,
+  lo: number,
+  hi: number,
+  ctx = 4,
+): DiffLine[] | null {
+  const hunks = parsePatch(patch);
+  const inRange = (nl: number | null | undefined) => nl != null && nl >= lo && nl <= hi;
+  const hunk =
+    hunks.find((h) => h.lines.some((l) => inRange(l.newLine))) ??
+    hunks.find((h) => h.lines.some((l) => (l.newLine ?? 0) >= lo));
+  if (!hunk) return null;
+  const rows = hunk.lines.filter((l) => l.kind !== "hunk");
+  let first = rows.findIndex((l) => inRange(l.newLine));
+  let last = -1;
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (inRange(rows[i].newLine)) {
+      last = i;
+      break;
+    }
+  }
+  if (first < 0) {
+    // Range not present as added lines — center on the closest line.
+    const c = rows.findIndex((l) => (l.newLine ?? 0) >= lo);
+    first = last = c < 0 ? 0 : c;
+  }
+  return rows.slice(Math.max(0, first - ctx), Math.min(rows.length, last + ctx + 1));
+}
+
 export interface SplitRow {
   left: DiffLine | null;
   right: DiffLine | null;

@@ -3,9 +3,10 @@ import { EmptyState } from "@/components/empty-state";
 import { KbdCmd, KbdEnter } from "@/components/kbd";
 import { PatchView } from "@/components/patch-view";
 import { PopoverPanel } from "@/components/popover";
+import { RepoCodeView } from "@/components/repo-code-view";
+import { RepoExplain } from "@/components/repo-explain";
 import { RepoQuickOpen } from "@/components/repo-quick-open";
 import { Segmented } from "@/components/segmented";
-import { SourceView } from "@/components/source-view";
 import { TooltipFor } from "@/components/tooltip-for";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -28,7 +29,6 @@ import {
   Check,
   ChevronRight,
   ChevronsUpDown,
-  FileCode,
   Folder,
   FolderGit2,
   FolderOpen,
@@ -115,7 +115,12 @@ export function RepoDetailPage() {
   const { owner, repo } = useParams({ from: "/repos/$owner/$repo" });
   const localRepo = useLocalRepos((s) => s.repos.find((r) => r.owner === owner && r.repo === repo));
   const [selected, setSelected] = useState<string | null>(null);
-  const [mode, setMode] = useState<"code" | "changes" | "history">("code");
+  const [mode, setMode] = useState<"code" | "changes" | "history" | "explain">("code");
+  // A line to land on when the Explain tab opens a file in the Code tab.
+  const [focus, setFocus] = useState<{ line: number | null; nonce: number }>({
+    line: null,
+    nonce: 0,
+  });
   const [quickOpen, setQuickOpen] = useState(false);
   const root = localRepo?.path ?? "";
   const codeMode = mode === "code";
@@ -206,6 +211,14 @@ export function RepoDetailPage() {
     };
   }, [root, status.data, branchChanges.data, activity.data, owners.data]);
 
+  /** Open a repository-relative path in the Code tab, at a line when given. */
+  const openInCode = (rel: string, line?: number) => {
+    if (!localRepo) return;
+    setSelected(`${localRepo.path}/${rel}`);
+    setFocus((f) => ({ line: line ?? null, nonce: f.nonce + 1 }));
+    setMode("code");
+  };
+
   if (!localRepo) {
     return (
       <EmptyState
@@ -238,6 +251,7 @@ export function RepoDetailPage() {
             { value: "code", label: "Code" },
             { value: "changes", label: "Changes" },
             { value: "history", label: "History" },
+            { value: "explain", label: "Explain" },
           ]}
           value={mode}
           onChange={setMode}
@@ -259,7 +273,9 @@ export function RepoDetailPage() {
           <RepoToolbar path={localRepo.path} />
         </div>
       </header>
-      {mode === "changes" ? (
+      {mode === "explain" ? (
+        <RepoExplain owner={owner} repo={repo} root={localRepo.path} onOpenFile={openInCode} />
+      ) : mode === "changes" ? (
         <ChangesPanel path={localRepo.path} />
       ) : mode === "history" ? (
         <CommitLog path={localRepo.path} />
@@ -274,7 +290,10 @@ export function RepoDetailPage() {
                     name={repo}
                     depth={0}
                     selected={selected}
-                    onSelect={setSelected}
+                    onSelect={(p) => {
+                      setSelected(p);
+                      setFocus((f) => ({ line: null, nonce: f.nonce }));
+                    }}
                   />
                 </DecoCtx.Provider>
               </div>
@@ -282,7 +301,7 @@ export function RepoDetailPage() {
           </ResizablePanel>
           <ResizableHandle />
           <ResizablePanel>
-            <CodeView path={selected} />
+            <RepoCodeView path={selected} line={focus.line} lineNonce={focus.nonce} />
           </ResizablePanel>
         </ResizablePanelGroup>
       )}
@@ -453,89 +472,6 @@ function Tree({
           );
         })}
     </div>
-  );
-}
-
-const IMAGE_RE = /\.(png|jpe?g|gif|webp|svg|bmp|avif|ico)$/i;
-
-function CodeView({ path }: { path: string | null }) {
-  const isImage = !!path && IMAGE_RE.test(path);
-  const file = useQuery({
-    queryKey: ["file", path],
-    queryFn: () => invoke<string>("read_file", { path: path as string }),
-    enabled: !!path && !isImage,
-    retry: false,
-    staleTime: 30_000,
-  });
-  const image = useQuery({
-    queryKey: ["file-image", path],
-    queryFn: () => invoke<string>("read_file_data_url", { path: path as string }),
-    enabled: isImage,
-    retry: false,
-    staleTime: 30_000,
-  });
-
-  if (!path) {
-    return (
-      <EmptyState icon={FileCode} title="Pick a file" description="Browse the tree to view code." />
-    );
-  }
-
-  // Images preview as a centered, contained render on a checkerboard (so
-  // transparency reads), instead of the text path that rejects binary content.
-  if (isImage) {
-    if (image.isLoading) {
-      return (
-        <div className="flex h-full items-center justify-center p-8">
-          <Skeleton className="size-48" />
-        </div>
-      );
-    }
-    if (image.isError) {
-      return (
-        <div className="p-6 text-xs text-muted-foreground">
-          Can't preview this image — {String(image.error)}
-        </div>
-      );
-    }
-    return (
-      <div
-        className="flex h-full items-center justify-center overflow-auto p-8"
-        style={{
-          background:
-            "repeating-conic-gradient(rgba(128,128,128,0.08) 0% 25%, transparent 0% 50%) 0 0 / 18px 18px",
-        }}
-      >
-        <img
-          src={image.data}
-          alt={path.split("/").pop() ?? "image"}
-          className="max-h-full max-w-full rounded-md border border-border/40 object-contain"
-        />
-      </div>
-    );
-  }
-
-  if (file.isLoading) {
-    return (
-      <div className="space-y-2 p-4">
-        {[...Array(10)].map((_, i) => (
-          <Skeleton key={i} className="h-4 w-full" />
-        ))}
-      </div>
-    );
-  }
-  if (file.isError) {
-    return (
-      <div className="p-6 text-xs text-muted-foreground">
-        Can't preview this file — {String(file.error)}
-      </div>
-    );
-  }
-
-  return (
-    <ScrollArea className="h-full">
-      <SourceView path={path} content={file.data ?? ""} />
-    </ScrollArea>
   );
 }
 

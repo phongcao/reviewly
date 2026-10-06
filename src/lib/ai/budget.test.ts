@@ -3,6 +3,7 @@ import {
   STEP_CAP_LAYER_MAX,
   STEP_CAP_LAYER_MIN,
   layerStepCap,
+  repoStepBudget,
   reviewUnits,
   stepBudget,
 } from "@/lib/ai/budget";
@@ -79,5 +80,14 @@ describe("layer step band", () => {
     };
     expect(layerStepCap(blind)).toBe(STEP_CAP_LAYER_MIN);
     expect(band(blind).max).toBeLessThan(STEP_CAP_LAYER_MIN);
+  });
+});
+
+describe("repoStepBudget", () => {
+  it("grows with a layer's lines and caps at 16", () => {
+    expect(repoStepBudget(0)).toEqual({ min: 2, max: 4 });
+    expect(repoStepBudget(3000)).toEqual({ min: 3, max: 6 });
+    expect(repoStepBudget(15_000).max).toBe(14);
+    expect(repoStepBudget(1_000_000).max).toBe(16);
   });
 });

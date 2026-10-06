@@ -1,3 +1,5 @@
+import { landSynthesis, maybeSynthesize } from "@/lib/ai/deep-synthesis";
+import { parseSynthKey } from "@/lib/deep-tour";
 import { parseGuided, parseTourKey } from "@/lib/guided";
 import { subscribe } from "@/lib/tauri";
 import { useDeepTour } from "@/stores/deep-tour";
@@ -31,6 +33,14 @@ export function useDeepTourEvents() {
     (async () => {
       unsub = await subscribe<AiDone>("ai:done", (e) => {
         const { key, ok, output, error, provider, headSha, canceled } = e.payload;
+        // The whole-PR synthesis that follows a finished deep tour. Quiet on
+        // failure: the planner's summary stays, and the tour says where it came from.
+        const synthPr = parseSynthKey(key);
+        if (synthPr) {
+          if (ok && !canceled) landSynthesis(synthPr, output ?? "", headSha ?? "");
+          return;
+        }
+
         const parsed = parseTourKey(key);
         if (!parsed) return;
         const { prKey, layerId } = parsed;
@@ -87,6 +97,7 @@ export function useDeepTourEvents() {
           const steps = batches.reduce((n, b) => n + b.plan.steps.length, 0);
           const failed = Object.values(after.errors).filter(Boolean).length;
           const ref = prKey.split("/").pop() ?? prKey;
+          maybeSynthesize(prKey);
           if (failed > 0) {
             toast.warning(`Deep tour finished with gaps · ${ref}`, {
               description: `${steps} stops across ${batches.length} layers · ${failed} layer(s) failed`,

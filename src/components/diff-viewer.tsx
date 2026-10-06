@@ -30,6 +30,7 @@ import type { DraftComment, PullFile, ReviewThread, ReviewThreadGraphQL } from "
 import { safeOpenUrl } from "@/lib/ui";
 import { cn } from "@/lib/utils";
 import { useLocalRepos } from "@/stores/local-repos";
+import { type PendingComment, useReviewDraft } from "@/stores/review-draft";
 import { useReviewPrefs } from "@/stores/review-prefs";
 import { useViewedFiles } from "@/stores/viewed-files";
 import { diffWordsWithSpace } from "diff";
@@ -46,9 +47,11 @@ import {
   MessageSquare,
   MessageSquarePlus,
   PanelRight,
+  Pencil,
   Sparkles,
   SquarePen,
   TextQuote,
+  Trash2,
   UnfoldVertical,
   WrapText,
 } from "lucide-react";
@@ -144,6 +147,10 @@ interface ThreadMeta {
   onExplainBehavior?: (line: number, symbol: string) => void;
   /** The hunk (by new-file start line) currently waiting on an explanation. */
   behaviorPending?: number | null;
+  /** This file's not-yet-submitted review comments, shown under their line. */
+  pending: PendingComment[];
+  onEditPending: (id: string) => (body: string) => void;
+  onRemovePending: (c: PendingComment) => void;
 }
 const ThreadMetaContext = createContext<ThreadMeta | null>(null);
 
@@ -249,6 +256,25 @@ export function DiffViewer({
   onAskAi,
 }: Props) {
   const hunks = useMemo(() => parsePatch(patch), [patch]);
+
+  // Pending (not-yet-submitted) review comments on this file, edited and
+  // removed in place under the line they're anchored to.
+  const draftKey = { owner, repo, number };
+  const draftComments = useReviewDraft((s) => s.drafts[`${owner}/${repo}#${number}`]?.comments);
+  const pending = useMemo(
+    () => (draftComments ?? []).filter((c) => c.path === path),
+    [draftComments, path],
+  );
+  const updateDraftComment = useReviewDraft((s) => s.updateComment);
+  const removeDraftComment = useReviewDraft((s) => s.removeComment);
+  const addDraftComment = useReviewDraft((s) => s.addComment);
+  const onEditPending = (id: string) => (body: string) => updateDraftComment(draftKey, id, body);
+  const onRemovePending = (c: PendingComment) => {
+    removeDraftComment(draftKey, c.id);
+    toast("Pending comment deleted", {
+      action: { label: "Undo", onClick: () => addDraftComment(draftKey, c) },
+    });
+  };
 
   // Behavior explanations requested from this file's diff — by the hunk header
   // or by a selection. Keyed by the enclosing hunk's new-file start so the
@@ -602,8 +628,12 @@ export function DiffViewer({
       const ln = t.line ?? t.original_line;
       if (ln != null) set.add(ln);
     }
+    // Rows are addressed by new-file line, so only RIGHT-side drafts can be.
+    for (const c of pending) {
+      if (c.line != null && (c.side ?? "RIGHT") === "RIGHT") set.add(c.line);
+    }
     return [...set].sort((a, b) => a - b);
-  }, [threads, path]);
+  }, [threads, path, pending]);
 
   const navComment = (dir: 1 | -1) => {
     const root = rootRef.current;
@@ -784,6 +814,9 @@ export function DiffViewer({
               onPeek: onPeek ? (line: number) => onPeek({ path, line }) : undefined,
               onExplainBehavior: explainHunk,
               behaviorPending: pendingHunk,
+              pending,
+              onEditPending,
+              onRemovePending,
             }}
           >
             <DiffSelectionToolbar
@@ -841,6 +874,9 @@ export function DiffViewer({
         onPeek: onPeek ? (line: number) => onPeek({ path, line }) : undefined,
         onExplainBehavior: explainHunk,
         behaviorPending: pendingHunk,
+        pending,
+        onEditPending,
+        onRemovePending,
       }}
     >
       {toolbar}
@@ -1308,10 +1344,18 @@ function HunkHeaderBar({ text, gutter }: { text: string; gutter?: string }) {
   );
 }
 
-/** Fixed-width gutter slot, kept so line content stays aligned. Reserved for
- * future per-line markers (e.g. guided-tour steps). */
-function GutterSlot() {
-  return <span className="w-4 shrink-0" aria-hidden />;
+/** Fixed-width gutter slot, kept so line content stays aligned. Marks lines
+ * that carry a pending review comment. */
+function GutterSlot({ pending = 0 }: { pending?: number }) {
+  if (pending === 0) return <span className="w-4 shrink-0" aria-hidden />;
+  return (
+    <span
+      className="flex w-4 shrink-0 select-none items-center justify-center text-primary"
+      title={`${pending} pending comment${pending === 1 ? "" : "s"}`}
+    >
+      <MessageSquare className="size-3" aria-hidden />
+    </span>
+  );
 }
 
 /* ────────────────────────────────────────────────────────────────── */
@@ -1686,9 +1730,17 @@ function RowUnified({
   onAddComment: (c: DraftComment) => void;
   render: LineRenderCtx;
 }) {
+  const meta = useContext(ThreadMetaContext);
   const isHunk = line.kind === "hunk";
   const lineNum = line.newLine ?? line.oldLine;
   const side: Side = line.newLine != null ? "RIGHT" : "LEFT";
+  // Either side can land on a unified row: a context line carries both numbers.
+  const pendingHere = isHunk
+    ? []
+    : [
+        ...pendingAt(meta?.pending, "LEFT", line.oldLine),
+        ...pendingAt(meta?.pending, "RIGHT", line.newLine),
+      ];
   const matchingThreads = !isHunk
     ? threads.filter(
         (t) =>
@@ -1726,7 +1778,7 @@ function RowUnified({
       >
         <Gutter num={line.oldLine} side="LEFT" ui={ui} />
         <Gutter num={line.newLine} side="RIGHT" ui={ui} />
-        <GutterSlot />
+        <GutterSlot pending={pendingHere.length} />
         <CommentTrigger
           disabled={lineNum == null}
           onClick={(shift) => ui.open({ side, line: lineNum as number }, shift)}
@@ -1771,6 +1823,7 @@ function RowUnified({
         />
       )}
       {matchingThreads.length > 0 && <ThreadsBlock threads={matchingThreads} />}
+      {pendingHere.length > 0 && <PendingBlock comments={pendingHere} />}
     </>
   );
 }
@@ -1900,10 +1953,12 @@ function Half({
   onAddComment: (c: DraftComment) => void;
   render: LineRenderCtx;
 }) {
+  const meta = useContext(ThreadMetaContext);
   if (!line) {
     return <div className="border-l-2 border-transparent bg-foreground/[0.03]" />;
   }
   const lineNum = side === "RIGHT" ? line.newLine : line.oldLine;
+  const pendingHere = pendingAt(meta?.pending, side, lineNum);
   const matchingThreads = threads.filter(
     (t) =>
       t.path === path &&
@@ -1929,7 +1984,7 @@ function Half({
         )}
       >
         <Gutter num={lineNum} side={side} ui={ui} />
-        <GutterSlot />
+        <GutterSlot pending={pendingHere.length} />
         <CommentTrigger
           disabled={lineNum == null}
           onClick={(shift) => ui.open({ side, line: lineNum as number }, shift)}
@@ -1960,6 +2015,7 @@ function Half({
         />
       )}
       {matchingThreads.length > 0 && <ThreadsBlock threads={matchingThreads} />}
+      {pendingHere.length > 0 && <PendingBlock comments={pendingHere} />}
     </div>
   );
 }
@@ -2132,6 +2188,95 @@ function buildComment(
     start_line: r.from,
     start_side: r.side,
   };
+}
+
+/** Pending comments anchored at `line` on `side`. A draft with no side is RIGHT,
+ * as GitHub defaults it. Multi-line drafts anchor at their last line. */
+function pendingAt(
+  pending: PendingComment[] | undefined,
+  side: Side,
+  line: number | null | undefined,
+): PendingComment[] {
+  if (!pending || line == null) return [];
+  return pending.filter((c) => c.line === line && (c.side ?? "RIGHT") === side);
+}
+
+/** Not-yet-submitted review comments under their line, editable in place. */
+function PendingBlock({ comments }: { comments: PendingComment[] }) {
+  return (
+    <div className="space-y-2 px-10 py-2.5 font-sans">
+      {comments.map((c) => (
+        <PendingCommentCard key={c.id} comment={c} />
+      ))}
+    </div>
+  );
+}
+
+function PendingCommentCard({ comment: c }: { comment: PendingComment }) {
+  const meta = useContext(ThreadMetaContext);
+  const [editing, setEditing] = useState(false);
+  const range =
+    c.start_line != null && c.start_line !== c.line
+      ? `Lines ${c.start_line}–${c.line}`
+      : `Line ${c.line}`;
+  const header = (
+    <>
+      <span className="rounded-md bg-primary/15 px-1.5 py-0.5 text-2xs font-medium text-primary">
+        Pending
+      </span>
+      <span className="font-mono text-2xs text-muted-foreground">{range}</span>
+    </>
+  );
+
+  if (editing && meta) {
+    return (
+      <Composer
+        autoFocus
+        className="mx-auto max-w-3xl"
+        initialValue={c.body}
+        submitLabel="Save"
+        header={header}
+        onCancel={() => setEditing(false)}
+        onSubmit={(body) => {
+          meta.onEditPending(c.id)(body);
+          setEditing(false);
+        }}
+      />
+    );
+  }
+
+  return (
+    <div className="rounded-lg border border-dashed border-primary/40 bg-primary/[0.04] p-3 text-xs">
+      <div className="mb-1.5 flex items-center gap-2">
+        {header}
+        {meta && (
+          <div className="ml-auto flex items-center gap-0.5">
+            <TooltipFor label="Edit">
+              <button
+                type="button"
+                onClick={() => setEditing(true)}
+                className="rounded p-1 text-muted-foreground/70 transition-colors hover:bg-foreground/[0.07] hover:text-foreground"
+                aria-label="Edit pending comment"
+              >
+                <Pencil className="size-3" />
+              </button>
+            </TooltipFor>
+            <TooltipFor label="Delete">
+              <button
+                type="button"
+                onClick={() => meta.onRemovePending(c)}
+                className="rounded p-1 text-muted-foreground/70 transition-colors hover:bg-destructive/10 hover:text-destructive"
+                aria-label="Delete pending comment"
+              >
+                <Trash2 className="size-3" />
+              </button>
+            </TooltipFor>
+          </div>
+        )}
+      </div>
+      <MarkdownBody>{c.body}</MarkdownBody>
+    </div>
+  );
 }
 
 function ThreadsBlock({ threads }: { threads: ReviewThread[] }) {

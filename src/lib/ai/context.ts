@@ -35,8 +35,9 @@ export const LAYER_DIFF_BUDGET = 120_000;
  * tail (and say so) instead of shredding everything. */
 const MIN_SLICE = 2_000;
 
-/** Lower rank = more important to show the model first. */
-function fileRank(name: string): number {
+/** Lower rank = more important to show the model first. Also the path rules
+ * `classifyRepoFile` uses to tell generated and config files from source. */
+export function fileRank(name: string): number {
   const n = name.toLowerCase();
   if (
     /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|cargo\.lock|go\.sum|poetry\.lock|composer\.lock)$/.test(

@@ -312,6 +312,8 @@ pub fn run() {
             commands::git::git_pull,
             commands::git::git_push,
             commands::git::git_ls_files,
+            commands::git::git_file_stats,
+            commands::git::read_file_heads,
             commands::git::git_grep,
             commands::git::git_file_activity,
             commands::git::git_branch_changes,

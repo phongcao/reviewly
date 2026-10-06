@@ -4,21 +4,57 @@ import { DiffSelectionToolbar } from "@/components/diff-selection-toolbar";
 import { IconButton } from "@/components/icon-button";
 import { KiteLoader } from "@/components/kite-loader";
 import { MarkdownBody } from "@/components/markdown-body";
+import { renderMermaidSvg } from "@/components/mermaid-diagram";
 import { TooltipFor } from "@/components/tooltip-for";
+import { ClaimRows } from "@/components/tour/claim-rows";
+import { CodeSpans } from "@/components/tour/code-spans";
+import { GradeLabel, PR_GRADE_HELP } from "@/components/tour/grade";
+import { KIND } from "@/components/tour/kinds";
+import { type TourProgress, idKeyedProgress } from "@/components/tour/progress";
+import { StepHeader } from "@/components/tour/step-header";
+import { type StopFilterKind, StopFilters } from "@/components/tour/stop-filters";
+import { LayerDivider, TourEnd, TourStepper } from "@/components/tour/tour-chrome";
+import { TourRail } from "@/components/tour/tour-rail";
+import { useEvent } from "@/components/tour/use-event";
+import { useTourNavigation } from "@/components/tour/use-tour-navigation";
+import {
+  AlertDialog,
+  AlertDialogClose,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { refFromStopNote } from "@/lib/ai/attach";
 import { STEP_CAP_SINGLE, shouldFanOut, stepBudget } from "@/lib/ai/budget";
 import type { ContextOptions, ReviewContext } from "@/lib/ai/context";
+import { maybeSynthesize } from "@/lib/ai/deep-synthesis";
+import { useNamesInClone } from "@/lib/ai/name-lookup";
 import { CLONE_ABSENT_CLAUSE, buildGuidedSystem } from "@/lib/ai/prompts";
 import { useAiAvailable } from "@/lib/ai/use-ai-available";
 import { useBehavior } from "@/lib/ai/use-behavior";
 import { useDeepTourRunner } from "@/lib/ai/use-deep-tour";
-import { prCorpus, verifyStep } from "@/lib/ai/verify";
+import {
+  CHECK_CONCURRENCY,
+  pendingClaimChecks,
+  useStepCheckRunner,
+} from "@/lib/ai/use-step-checks";
+import { groundInClone, namesToLookUp, prCorpus, verifyStep, verifySteps } from "@/lib/ai/verify";
 import type { BehaviorDiff } from "@/lib/behavior";
+import { type CheckRecord, checkTypeFor, stepTrust } from "@/lib/claim-check";
 import { type CoverageReport, RISK_LABEL, blindSpots, tourCoverage } from "@/lib/coverage";
-import { type DeepTourProgress, deepTourProgress, mergeDeepTour, stepId } from "@/lib/deep-tour";
-import { parsePatch } from "@/lib/diff";
+import {
+  type DeepTourProgress,
+  deepTourProgress,
+  mergeDeepTour,
+  stepId,
+  synthesisFresh,
+} from "@/lib/deep-tour";
+import { anchorWindow } from "@/lib/diff";
+import { loadEdgeTexts } from "@/lib/edge-sources";
 import { relativeTime } from "@/lib/format";
 import {
   type GuidedPlan,
@@ -26,12 +62,17 @@ import {
   type GuidedVerdict,
   type StepKind,
   type TourLayer,
-  groupTourStops,
+  activeLayerPos,
+  layerReadCounts,
   parseTourKey,
+  tourLayerIndex,
   verdictDisplay,
 } from "@/lib/guided";
 import { detectLanguage, highlightLine } from "@/lib/lang";
-import { heuristicLayers, reconcileLayers } from "@/lib/layers";
+import { layerEdges, layerMermaid } from "@/lib/layer-edges";
+import { type LayerPlan, heuristicLayers, reconcileLayers } from "@/lib/layers";
+import { type SummarySource, buildReviewReport, reportFilename } from "@/lib/report";
+import { renderReportHtml } from "@/lib/report-html";
 import type { DraftComment, PullFile } from "@/lib/tauri";
 import { invoke } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
@@ -44,24 +85,23 @@ import { useLayers } from "@/stores/layers";
 import { useLocalRepos } from "@/stores/local-repos";
 import { useReviewPrefs } from "@/stores/review-prefs";
 import { type ReviewEvent, useReviewVerdict } from "@/stores/review-verdict";
+import { checksKey, runKey, useStepCheckRuns, useStepChecks } from "@/stores/step-checks";
+import { getVersion } from "@tauri-apps/api/app";
+import { save } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
-  ArrowRight,
   Check,
-  ChevronLeft,
   ChevronRight,
-  ChevronsDownUp,
-  ChevronsUpDown,
   Compass,
   FileCode,
+  FileDown,
   GitCompare,
-  HelpCircle,
   Layers,
   ListOrdered,
   MessageSquare,
   RefreshCw,
-  RotateCcw,
   Send,
+  ShieldCheck,
   Sparkles,
   ThumbsUp,
   X,
@@ -90,6 +130,9 @@ interface Props {
   files: PullFile[];
   /** Head SHA of the PR right now — used to flag a stale (out-of-date) tour. */
   headSha?: string;
+  /** PR title and web URL, for the exported review report. */
+  prTitle?: string;
+  prUrl?: string;
   /** Add a suggested comment to the pending review. */
   onAddComment: (c: DraftComment) => void;
   /** Post a suggested comment straight to GitHub as an inline review comment. */
@@ -100,55 +143,6 @@ interface Props {
   onScrolledChange?: (scrolled: boolean) => void;
   /** Opens (or focuses) the chat once a highlighted passage is attached. */
   onAskAi?: () => void;
-}
-
-const KIND: Record<
-  StepKind,
-  {
-    icon: ComponentType<{ className?: string }>;
-    text: string;
-    /** Progress-rail / focus-chip fill for this kind. */
-    dot: string;
-    label: string;
-  }
-> = {
-  orient: {
-    icon: Compass,
-    text: "text-muted-foreground",
-    dot: "bg-foreground/55",
-    label: "Orientation",
-  },
-  concern: {
-    icon: AlertTriangle,
-    text: "text-warning",
-    dot: "bg-warning",
-    label: "Worth a comment",
-  },
-  question: { icon: HelpCircle, text: "text-info", dot: "bg-info", label: "Question" },
-  praise: { icon: ThumbsUp, text: "text-success", dot: "bg-success", label: "Nice" },
-};
-
-/** Stable empty set, so a tour with no collapse support doesn't hand the rail a
- * fresh `Set` identity on every render. */
-const NO_COLLAPSE: ReadonlySet<string> = new Set();
-
-/**
- * A callback with a permanent identity that always invokes the latest version
- * handed to it.
- *
- * Load-bearing for `Step`'s memoization, and the reason is worth stating: a
- * tour of this size only stays responsive if moving the cursor re-renders the
- * two stops whose appearance actually changed rather than all of them. But
- * nearly every handler a stop receives is rebuilt on a cursor move anyway —
- * `progress`'s methods are recreated whenever read state changes, and the
- * page's own `onAddComment` / `onOpenFile` are inline arrows. Passing those
- * straight down would defeat `memo` on every single click. Wrapping them here
- * decouples "this handler does the newest thing" from "this prop changed".
- */
-function useEvent<A extends unknown[], R>(fn: (...args: A) => R): (...args: A) => R {
-  const ref = useRef(fn);
-  ref.current = fn;
-  return useCallback((...args: A) => ref.current(...args), []);
 }
 
 /** The tour's suggested verdict → its chip + the review event it seeds. */
@@ -176,42 +170,6 @@ const VERDICT_META: Record<
   },
 };
 
-/**
- * How the tour reads and writes the reviewer's progress.
- *
- * `Tour` is used by two surfaces whose progress is keyed differently: the
- * classic whole-PR tour stores `seen` / `dismissed` as indices into a single
- * fixed `steps` array, while a fanned-out deep tour grows its step list as
- * layers land and so must key progress by a stable per-step id. Rather than
- * duplicate the tour UI, `Tour` takes plain step indices and lets the caller
- * decide what they mean.
- */
-export interface TourProgress {
-  /** Indices of stops the reviewer dismissed (hidden from the tour). */
-  dismissed: Set<number>;
-  /** Indices of stops the reviewer has already read. The rail marks these done
-   * rather than inferring it from position: in a deep tour the list grows, and
-   * a stop that lands ahead of the cursor has not been read just because it now
-   * sits behind it. */
-  seen: Set<number>;
-  /** Index to resume on. */
-  lastActive: number;
-  markSeen: (index: number) => void;
-  setLastActive: (index: number) => void;
-  dismiss: (index: number) => void;
-  restoreDismissed: () => void;
-  /** Which layers are folded away in the tour rail. Rail-only view state, but
-   * persisted per PR alongside the rest of the reviewer's tour state — shrinking
-   * the rail should survive navigating away. Absent on the classic whole-PR
-   * tour, which has no layers to fold: its absence is what hides the controls. */
-  collapse?: {
-    collapsed: Set<string>;
-    toggle: (layerId: string) => void;
-    /** Bulk set, for collapse-all / expand-all. */
-    setAll: (layerIds: string[], collapsed: boolean) => void;
-  };
-}
-
 /** Seconds elapsed while `running` is true; resets to 0 when it flips off. */
 function useElapsed(running: boolean): number {
   const [secs, setSecs] = useState(0);
@@ -235,6 +193,8 @@ export function GuidedReview({
   buildContext,
   files,
   headSha,
+  prTitle,
+  prUrl,
   onAddComment,
   onPostComment,
   onOpenFile,
@@ -313,6 +273,15 @@ export function GuidedReview({
     return reconcileLayers(base, files).layers.length;
   }, [layersEntry, files]);
 
+  // The layer partition, for the classic tour's exported report. A whole-PR
+  // tour saw every layer, so each is marked toured; the report's coverage
+  // section is what says which files it actually reached.
+  const classicLayers = useMemo(() => {
+    if (!layersEntry?.plan) return undefined;
+    const plan = reconcileLayers(layersEntry.plan, files);
+    return { plan, toured: new Set(plan.layers.map((l) => l.id)) };
+  }, [layersEntry, files]);
+
   // A PR past the fan-out threshold cannot be covered honestly by one call, so
   // that's the default there. The reviewer can still force either mode.
   const fanOut = shouldFanOut(context.size);
@@ -349,14 +318,33 @@ export function GuidedReview({
     // the effect above and spend a fresh fan-out on the way out of the click.
     autoStartedFor.current = prKey;
     if (!snapshot) return;
+    // Checks live in their own store, keyed by stable step
+    // id — and a re-toured layer often yields the very same ids, so without
+    // this the fresh tour would open with the old tour's verdicts on it. Only
+    // this tour's stops (`<layerId>#…`) go; a classic tour's (`#…`) stay.
+    const key = checksKey(prKey, headSha);
+    const runs = useStepCheckRuns.getState();
+    const running = runs.batch[key];
+    if (running) runs.setBatch(key, { ...running, cancelled: true });
+    const layerIds = new Set([
+      ...snapshot.plan.layers.map((l) => l.id),
+      ...Object.keys(snapshot.byLayer),
+    ]);
+    const forgotten = useStepChecks
+      .getState()
+      .forget(key, (id) => layerIds.has(id.slice(0, id.indexOf("#"))));
     const layers = Object.keys(snapshot.byLayer).length;
     toast(`Tour discarded — ${layers} layer${layers === 1 ? "" : "s"}`, {
       action: {
         label: "Undo",
-        onClick: () => useDeepTour.getState().restore(prKey, snapshot),
+        onClick: () => {
+          useDeepTour.getState().restore(prKey, snapshot);
+          // Newer wins per stop, so a check made since the discard survives.
+          useStepChecks.getState().importEntries({ [key]: forgotten });
+        },
       },
     });
-  }, [prKey]);
+  }, [prKey, headSha]);
 
   // Stop a running generation (kills the AI CLI on the backend).
   const cancel = useCallback(() => {
@@ -395,6 +383,7 @@ export function GuidedReview({
         entry={deepEntry}
         files={files}
         headSha={headSha}
+        prInfo={{ title: prTitle ?? prKey, url: prUrl ?? "" }}
         aiName={aiName}
         onRun={startDeep}
         onStartOver={startOver}
@@ -445,6 +434,13 @@ export function GuidedReview({
       progress={progress}
       stale={stale}
       files={files}
+      headSha={headSha}
+      report={{
+        pr: { title: prTitle ?? prKey, url: prUrl ?? "" },
+        type: "classic",
+        tourHeadSha: entry.headSha,
+        layers: classicLayers,
+      }}
       regenerating={pending}
       onRegenerate={() => {
         resetPlan(prKey);
@@ -474,6 +470,7 @@ function DeepTour({
   entry,
   files,
   headSha,
+  prInfo,
   aiName,
   onRun,
   onSinglePass,
@@ -488,6 +485,7 @@ function DeepTour({
   entry: DeepTourEntry | undefined;
   files: PullFile[];
   headSha?: string;
+  prInfo: { title: string; url: string };
   aiName: string;
   /** (Re)run layers: the ids given, or every layer still missing a tour —
    * `force` redoes the ones already toured too. */
@@ -532,9 +530,12 @@ function DeepTour({
   // layer actually lands, which is the only time the merge can differ.
   const layerPlan = entry?.plan;
   const byLayer = entry?.byLayer;
+  const tourHead = entry?.headSha;
+  const synthesis = entry?.synthesis;
   const toured = useMemo(
-    () => (layerPlan && byLayer ? { plan: layerPlan, byLayer } : null),
-    [layerPlan, byLayer],
+    () =>
+      layerPlan && byLayer ? { plan: layerPlan, byLayer, headSha: tourHead, synthesis } : null,
+    [layerPlan, byLayer, tourHead, synthesis],
   );
   const plan = useMemo(() => (toured ? mergeDeepTour(toured, files) : null), [toured, files]);
   const info: DeepTourProgress = useMemo(
@@ -542,64 +543,56 @@ function DeepTour({
     [toured, files, busy],
   );
 
-  // Index ↔ stable id, rebuilt whenever the merged plan changes. This is the
-  // whole point of id-keyed progress: after a new layer lands, index 4 may be a
-  // different stop, but the id the reviewer dismissed still resolves correctly.
+  // Every layer in: write the whole-PR summary from their results. Also covers
+  // tours that finished before the synthesis existed, or while the app was
+  // closed. `maybeSynthesize` sends at most one call per head and batch set.
+  useEffect(() => {
+    if (busy.size === 0 && info.missing.length === 0 && info.done.length > 0) {
+      maybeSynthesize(prKey);
+    }
+  }, [busy, info, prKey]);
+
+  // Index ↔ stable id, rebuilt whenever the merged plan changes (see
+  // `idKeyedProgress`).
   const ids = useMemo(() => (plan ? plan.steps.map(stepId) : []), [plan]);
   const dismissedIds = entry?.dismissed;
   const seenIds = entry?.seen;
   const lastActiveId = entry?.lastActiveId;
   const collapsedLayerIds = entry?.collapsedLayers;
-  const progress = useMemo<TourProgress>(() => {
-    const hidden = new Set(dismissedIds ?? []);
-    const read = new Set(seenIds ?? []);
-    const dismissed = new Set<number>();
-    const seen = new Set<number>();
-    ids.forEach((id, i) => {
-      if (hidden.has(id)) dismissed.add(i);
-      if (read.has(id)) seen.add(i);
-    });
-    const resume = lastActiveId ? ids.indexOf(lastActiveId) : -1;
-    return {
-      dismissed,
-      // Read state is per stop, by stable id — the whole point of id-keyed
-      // progress. Stops that land later read as new, however far up the merged
-      // list their layer inserts them.
-      seen,
-      lastActive: resume >= 0 ? resume : 0,
-      markSeen: (i) => {
-        const id = ids[i];
-        if (id) markSeenStep(prKey, id);
-      },
-      setLastActive: (i) => {
-        const id = ids[i];
-        if (id) setLastActive(prKey, id);
-      },
-      dismiss: (i) => {
-        const id = ids[i];
-        if (id) dismissStep(prKey, id);
-      },
-      restoreDismissed: () => restoreDismissed(prKey),
-      collapse: {
-        collapsed: new Set(collapsedLayerIds ?? []),
-        toggle: (id) => toggleLayerCollapsed(prKey, id),
-        setAll: (ids, c) => setLayersCollapsed(prKey, ids, c),
-      },
-    };
-  }, [
-    ids,
-    dismissedIds,
-    seenIds,
-    lastActiveId,
-    collapsedLayerIds,
-    prKey,
-    markSeenStep,
-    setLastActive,
-    dismissStep,
-    restoreDismissed,
-    toggleLayerCollapsed,
-    setLayersCollapsed,
-  ]);
+  const progress = useMemo<TourProgress>(
+    () =>
+      idKeyedProgress(
+        ids,
+        {
+          dismissed: dismissedIds,
+          seen: seenIds,
+          lastActiveId,
+          collapsedLayers: collapsedLayerIds,
+        },
+        {
+          markSeen: (id) => markSeenStep(prKey, id),
+          setLastActive: (id) => setLastActive(prKey, id),
+          dismiss: (id) => dismissStep(prKey, id),
+          restoreDismissed: () => restoreDismissed(prKey),
+          toggleLayerCollapsed: (id) => toggleLayerCollapsed(prKey, id),
+          setLayersCollapsed: (ids, c) => setLayersCollapsed(prKey, ids, c),
+        },
+      ),
+    [
+      ids,
+      dismissedIds,
+      seenIds,
+      lastActiveId,
+      collapsedLayerIds,
+      prKey,
+      markSeenStep,
+      setLastActive,
+      dismissStep,
+      restoreDismissed,
+      toggleLayerCollapsed,
+      setLayersCollapsed,
+    ],
+  );
 
   // A layer the reviewer explicitly opened from the layered view: jump to its
   // first stop once the batch is in. Only that intent moves the cursor — a
@@ -634,6 +627,18 @@ function DeepTour({
     }
     return out;
   }, [toured, files]);
+
+  // The partition as the report shows it, with which layers have landed.
+  const deepLayers = useMemo(
+    () =>
+      toured
+        ? {
+            plan: reconcileLayers(toured.plan, files),
+            toured: new Set(Object.keys(toured.byLayer)),
+          }
+        : null,
+    [toured, files],
+  );
 
   const strip = (
     <DeepTourStrip
@@ -691,6 +696,14 @@ function DeepTour({
           onFocusConsumed={() => clearFocus(prKey)}
           stale={!!headSha && !!entry?.headSha && entry.headSha !== headSha}
           files={files}
+          headSha={headSha}
+          report={{
+            pr: prInfo,
+            type: "deep",
+            tourHeadSha: entry?.headSha ?? "",
+            summarySource: toured && synthesisFresh(toured) ? "deep-synthesis" : "layer-planner",
+            layers: deepLayers ?? undefined,
+          }}
           regenerating={busy.size > 0}
           onRegenerate={() => onRun(undefined, { force: true })}
           onAddComment={onAddComment}
@@ -1159,6 +1172,8 @@ function Tour({
   onFocusConsumed,
   stale,
   files,
+  headSha,
+  report,
   regenerating,
   onRegenerate,
   onAddComment,
@@ -1190,6 +1205,17 @@ function Tour({
   onFocusConsumed?: () => void;
   stale: boolean;
   files: PullFile[];
+  /** The PR's head right now — what checks are keyed to. */
+  headSha?: string;
+  /** What the report export needs beyond what the tour pane already holds. */
+  report: {
+    pr: { title: string; url: string };
+    type: "classic" | "deep";
+    /** Head the tour was generated on. */
+    tourHeadSha: string;
+    summarySource?: SummarySource;
+    layers?: { plan: LayerPlan; toured: ReadonlySet<string> };
+  };
   regenerating: boolean;
   onRegenerate: () => void;
   onAddComment: (c: DraftComment) => void;
@@ -1211,11 +1237,8 @@ function Tour({
   );
   const preferPost = useReviewPrefs((s) => s.defaultSuggestionAction === "post");
   // `progress` is rebuilt every time read state changes — i.e. on every stop
-  // the reviewer visits — so its methods are taken through `useEvent`. That
-  // keeps the keyboard/cursor effects below from resubscribing on each move,
-  // and keeps `dismiss` usable as a prop on a memoized Step.
-  const markSeen = useEvent(progress.markSeen);
-  const setLastActive = useEvent(progress.setLastActive);
+  // the reviewer visits — so `dismiss` is taken through `useEvent`, which keeps
+  // it usable as a prop on a memoized Step.
   const dismiss = useEvent(progress.dismiss);
   const { restoreDismissed } = progress;
   const localRepos = useLocalRepos((s) => s.repos);
@@ -1225,21 +1248,29 @@ function Tour({
     const [owner, repo] = prKey.split("#")[0].split("/");
     return localRepos.find((r) => r.owner === owner && r.repo === repo)?.path ?? null;
   }, [prKey, localRepos]);
-  // Verify one concern against the clone; the Step auto-dismisses (resolved) or
-  // refines the comment (valid) from the result.
-  const checkWithAI = useEvent(async (step: GuidedStep): Promise<CheckResult | null> => {
+  // Checks on single stops, persisted per PR head. A concern check needs the
+  // clone; a claim check (orient / praise) holds the stop against its patch and
+  // works without one.
+  const runner = useStepCheckRunner({ subject: prKey, headSha, files, cwd });
+  const checksKey = runner.key;
+  const checks = useStepChecks((s) => s.byKey[checksKey]);
+  const checkStep = useEvent(async (step: GuidedStep): Promise<void> => {
     try {
-      const out = await invoke<string>("ai_review", {
-        ...aiInvokeArgs(),
-        cwd,
-        prompt: checkPrompt(step),
-      });
-      return parseCheckResult(out);
+      await runner.check(step);
     } catch (e) {
       toast.error(`AI check failed — ${String(e)}`);
-      return null;
     }
   });
+  const clearCheck = useEvent((step: GuidedStep) =>
+    useStepChecks.getState().clear(checksKey, stepId(step)),
+  );
+  const batch = useStepCheckRuns((s) => s.batch[checksKey]);
+  // What the confirm dialog would send; `layer` when it came from a layer
+  // heading rather than the toolbar's whole-tour "Check all".
+  const [confirmCheckAll, setConfirmCheckAll] = useState<{
+    steps: GuidedStep[];
+    layer?: TourLayer;
+  } | null>(null);
   // Explain ONE stop's symbol as behavior (before / after / what changed).
   // Unlike the concern check this does NOT require a clone: the file's own
   // patch carries both sides of the change. Shared with the diff viewer's hunk
@@ -1273,19 +1304,20 @@ function Tour({
   });
   // Page-level inline arrow, so it goes through `useEvent` like the rest.
   const askAi = useEvent(() => onAskAi?.());
-  const [active, setActive] = useState(() => Math.max(0, Math.min(progress.lastActive, total - 1)));
   const [posted, setPosted] = useState<Set<number>>(new Set());
   const [filter, setFilter] = useState<StepKind | null>(null);
+  // Narrow the tour to the stops that need something, from the header counts.
+  // Holds the set taken when the filter was turned on, so a stop checked under
+  // it stays in view (showing its new chip) instead of vanishing mid-read.
+  const [stopFilter, setStopFilter] = useState<{
+    kind: StopFilterKind;
+    ids: Set<number>;
+  } | null>(null);
   const [tourScrolled, setTourScrolled] = useState(false);
   // 82: lets the reviewer keep a stale tour — acknowledges staleness and hides
   // the banner without discarding the (still useful) walkthrough.
   const [staleAck, setStaleAck] = useState(false);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const stepRefs = useRef<(HTMLElement | null)[]>([]);
   const scrolledRef = useRef(false);
-  const setStepRef = useCallback((i: number, el: HTMLElement | null) => {
-    stepRefs.current[i] = el;
-  }, []);
 
   // Every changed line in the PR, joined once for the whole tour. Each stop's
   // grounding check needs this window, and `verifyClaim` builds it itself when
@@ -1304,28 +1336,6 @@ function Tour({
   );
   const postStep = onPostComment ? postComment : undefined;
 
-  // While a programmatic jump (click a node / next / prev) is smooth-scrolling,
-  // hold the chosen stop active until the scroll actually arrives — otherwise
-  // the scroll listener reads the mid-animation position and briefly flashes
-  // each stop it passes over (the "blink to the previous one").
-  const jumpTargetRef = useRef<number | null>(null);
-  const jumpTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const beginJump = useCallback((target: number) => {
-    jumpTargetRef.current = target;
-    if (jumpTimer.current) clearTimeout(jumpTimer.current);
-    // Safety release: the scroll may never reach the very top (e.g. the last
-    // stops), so don't hold the highlight hostage forever.
-    jumpTimer.current = setTimeout(() => {
-      jumpTargetRef.current = null;
-    }, 1000);
-  }, []);
-  useEffect(
-    () => () => {
-      if (jumpTimer.current) clearTimeout(jumpTimer.current);
-    },
-    [],
-  );
-
   // Stops the reviewer dismissed (handled questions / concerns) are hidden.
   const dismissedSet = progress.dismissed;
 
@@ -1341,108 +1351,195 @@ function Tour({
     () => (["orient", "concern", "question", "praise"] as StepKind[]).filter((k) => counts[k] > 0),
     [counts],
   );
-  // Original-index list of the steps currently in view (not dismissed; all or one kind).
-  const visible = useMemo(
+  // Every stop's grade against the diff, once per tour. A stop that failed
+  // only because it names something outside the diff gets a second chance
+  // against the local clone: with a clone the tour reads files the PR doesn't
+  // touch, and those names are real (see `groundInClone`).
+  const baseEvidence = useMemo(
+    () => verifySteps(plan.steps, files, corpus).map((v) => v.evidence),
+    [plan.steps, files, corpus],
+  );
+  const lookupNames = useMemo(() => namesToLookUp(baseEvidence), [baseEvidence]);
+  const cloneNames = useNamesInClone(cwd, headSha ?? "", lookupNames);
+  const evidenceAt = useMemo(
+    () => baseEvidence.map((e) => groundInClone(e, cloneNames)),
+    [baseEvidence, cloneNames],
+  );
+
+  // Not dismissed, and of the focused kind — what the header counts describe.
+  // The stop filter is applied after, so its own counts don't collapse to the
+  // one set that's selected.
+  const inKind = useMemo(
     () =>
       plan.steps
         .map((_, i) => i)
         .filter((i) => !dismissedSet.has(i) && (!filter || plan.steps[i].kind === filter)),
     [plan.steps, filter, dismissedSet],
   );
-
-  // Layer headings for a merged deep tour. Keyed off the VISIBLE order, so a
-  // kind filter that empties a layer drops its heading too, and a layer split
-  // by the filter still heads each run it survives in.
-  const layerById = useMemo(
-    () => new Map((plan.layers ?? []).map((l) => [l.id, l])),
-    [plan.layers],
+  // The stops that still need the reviewer, by trust: a check disputed them,
+  // their anchor didn't hold up, or they are unchecked (never checked, or
+  // the check came back partial).
+  const needs = useMemo(() => {
+    const out: Record<StopFilterKind, number[]> = { disputed: [], unverified: [], unchecked: [] };
+    for (const i of inKind) {
+      const e = evidenceAt[i];
+      if (!e) continue;
+      const trust = stepTrust(e.grade, checks?.[stepId(plan.steps[i])]);
+      if (trust === "contradicted") out.disputed.push(i);
+      else if (trust === "unanchored") out.unverified.push(i);
+      else if (trust === "unchecked") out.unchecked.push(i);
+    }
+    return out;
+  }, [inKind, evidenceAt, plan.steps, checks]);
+  const needCounts = useMemo(
+    () => ({
+      disputed: needs.disputed.length,
+      unverified: needs.unverified.length,
+      unchecked: needs.unchecked.length,
+    }),
+    [needs],
   );
-  const layerHeads = useMemo(() => {
-    const heads = new Map<number, TourLayer>();
-    if (!plan.layers?.length) return heads;
-    let prev: string | undefined;
-    for (const i of visible) {
-      const id = plan.steps[i].layerId;
-      const layer = id ? layerById.get(id) : undefined;
-      if (layer && id !== prev) heads.set(i, layer);
-      prev = id;
-    }
-    return heads;
-  }, [visible, plan.steps, plan.layers, layerById]);
-  // Stops per layer among the visible ones — the denominator of the
-  // layer-relative counter, and the "N stops" on each heading.
-  const layerCounts = useMemo(() => {
-    const counts = new Map<string, number>();
-    for (const i of visible) {
-      const id = plan.steps[i].layerId;
-      if (id) counts.set(id, (counts.get(id) ?? 0) + 1);
-    }
-    return counts;
-  }, [visible, plan.steps]);
 
-  // The rail draws layer by layer so one layer's stops can fold away without
-  // breaking the spine that runs through the others. The reading pane still
-  // renders every visible stop — `layerHeads` above stays its heading source.
-  const groups = useMemo(
-    () => groupTourStops(visible, plan.steps, plan.layers),
+  // Original-index list of the steps currently in view.
+  const visible = useMemo(
+    () => (stopFilter ? inKind.filter((i) => stopFilter.ids.has(i)) : inKind),
+    [inKind, stopFilter],
+  );
+
+  const { active, pos, atFirst, atLast, move, jumpTo, scrollRef, setStepRef } = useTourNavigation({
+    visible,
+    initial: Math.max(0, Math.min(progress.lastActive, total - 1)),
+    // Persist resume position + mark the visited step as seen.
+    onActive: (i) => {
+      progress.markSeen(i);
+      progress.setLastActive(i);
+    },
+    onOpen: (i) => {
+      const step = plan.steps[i];
+      if (step) openStep(step.path, step.line);
+    },
+    onDismiss: dismiss,
+  });
+
+  // What "Check all" would send right now: visible orient / praise stops with
+  // no check yet. Concerns are left to their own, clone-backed button.
+  const inFlight = useStepCheckRuns((s) => s.inFlight);
+  const uncheckedClaims = useMemo(
+    () =>
+      pendingClaimChecks(
+        visible.map((i) => plan.steps[i]),
+        checks,
+        (id) => !!inFlight[runKey(checksKey, id)],
+      ),
+    [visible, plan.steps, checks, inFlight, checksKey],
+  );
+  // The same set split by layer, for the per-layer "Check layer" actions. The
+  // toolbar scrolls away; a reviewer deep in layer 5 checks from where they are.
+  const uncheckedByLayer = useMemo(() => {
+    const by = new Map<string, GuidedStep[]>();
+    for (const s of uncheckedClaims) {
+      if (!s.layerId) continue;
+      const list = by.get(s.layerId);
+      if (list) list.push(s);
+      else by.set(s.layerId, [s]);
+    }
+    return by;
+  }, [uncheckedClaims]);
+  // Layers with a check running on any of their stops — a heading shows a
+  // spinner in place of its check action.
+  const checkingLayers = useMemo(() => {
+    const ids = new Set<string>();
+    for (const i of visible) {
+      const s = plan.steps[i];
+      if (s.layerId && inFlight[runKey(checksKey, stepId(s))]) ids.add(s.layerId);
+    }
+    return ids;
+  }, [visible, plan.steps, inFlight, checksKey]);
+  // Export the tour as a self-contained HTML review report. Works on a
+  // partial deep tour; the report says it is partial.
+  const [exporting, setExporting] = useState(false);
+
+  async function exportReport() {
+    if (exporting) return;
+    setExporting(true);
+    try {
+      // Layer links for the report and its diagram, read the same way the
+      // layered view reads them. The SVG is rendered here, in the app, so the
+      // exported page itself stays script-free.
+      let edges: ReturnType<typeof layerEdges> | undefined;
+      let diagramSvg: string | undefined;
+      if (report.layers) {
+        const src = await loadEdgeTexts(files, cwd);
+        edges = layerEdges(report.layers.plan, src.texts, src.aliases);
+        if (edges.length > 0) {
+          diagramSvg = await renderMermaidSvg(layerMermaid(report.layers.plan, edges)).catch(
+            () => undefined,
+          );
+        }
+      }
+      const r = buildReviewReport({
+        pr: { key: prKey, title: report.pr.title, url: report.pr.url, headSha: headSha ?? "" },
+        plan,
+        tour: {
+          type: report.type,
+          headSha: report.tourHeadSha,
+          summarySource: report.summarySource,
+          provider,
+          generatedAt,
+          ...(coverage ? { layersToured: coverage } : {}),
+        },
+        layers: report.layers,
+        edges,
+        files,
+        checks,
+        cloneNames,
+        dismissedIds: new Set([...progress.dismissed].map((i) => stepId(plan.steps[i]))),
+        pendingPaths,
+        exportedAt: Date.now(),
+        app: await getVersion().catch(() => "unknown"),
+      });
+      const path = await save({
+        title: "Export review report",
+        defaultPath: reportFilename(r),
+        filters: [{ name: "HTML page", extensions: ["html"] }],
+      });
+      if (!path) return;
+      await invoke("write_bundle", { path, contents: renderReportHtml(r, { diagramSvg }) });
+      toast.success(`Report exported to ${path.split(/[\\/]/).pop()}`);
+    } catch (e) {
+      toast.error(`Export failed — ${String(e)}`);
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  const checkAllCount = confirmCheckAll?.steps.length ?? 0;
+  async function runCheckAll(steps: GuidedStep[]) {
+    const r = await runner.checkAll(steps);
+    if (r.failed > 0) toast.error(`${r.failed} of ${r.done} checks failed`);
+    else if (r.cancelled) toast(`Stopped after ${r.done} check${r.done === 1 ? "" : "s"}`);
+  }
+
+  // Layer headings, counts and the rail's per-layer runs for a merged deep tour.
+  const layerIndex = useMemo(
+    () => tourLayerIndex(visible, plan.steps, plan.layers),
     [visible, plan.steps, plan.layers],
   );
+  const { layerHeads, layerCounts } = layerIndex;
   // Read stops per layer — what a folded heading reports in place of its rows.
-  const layerDone = useMemo(() => {
-    const done = new Map<string, number>();
-    for (const i of visible) {
-      const id = plan.steps[i].layerId;
-      if (id && progress.seen.has(i)) done.set(id, (done.get(id) ?? 0) + 1);
-    }
-    return done;
-  }, [visible, plan.steps, progress.seen]);
-  const collapse = progress.collapse;
-  const collapsedIds = collapse?.collapsed ?? NO_COLLAPSE;
-  // Only layers with stops ON SCREEN: collapse-all must not fold ids the rail
-  // can't show, and a layer the kind filter emptied has nothing to fold.
-  const collapsibleIds = useMemo(
-    () => [...new Set(groups.map((g) => g.layer?.id).filter((id): id is string => !!id))],
-    [groups],
+  const layerDone = useMemo(
+    () => layerReadCounts(visible, plan.steps, progress.seen),
+    [visible, plan.steps, progress.seen],
+  );
+  const { activeLayer, layerPos } = activeLayerPos(
+    layerIndex.layerById,
+    visible,
+    plan.steps,
+    active,
   );
 
-  // Move ±1 through the *visible* set (respects an active kind filter).
-  const move = useCallback(
-    (delta: number) => {
-      setActive((a) => {
-        const p = visible.indexOf(a);
-        const curr = p < 0 ? 0 : p;
-        const n = visible[Math.max(0, Math.min(visible.length - 1, curr + delta))] ?? a;
-        beginJump(n);
-        stepRefs.current[n]?.scrollIntoView({ behavior: "smooth", block: "start" });
-        return n;
-      });
-    },
-    [visible, beginJump],
-  );
-
-  // When the filter hides the active step, snap to the first visible one.
-  useEffect(() => {
-    if (visible.length > 0 && !visible.includes(active)) setActive(visible[0]);
-  }, [visible, active]);
-
-  const pos = visible.indexOf(active);
-  const atFirst = pos <= 0;
-  const atLast = pos >= visible.length - 1;
-
-  // Where the cursor sits INSIDE its layer. The global "3 / 40" is the wrong
-  // unit of progress once a tour is layered — the question a reviewer is
-  // actually asking is whether they're through the layer in front of them.
-  const activeLayer = layerById.get(plan.steps[active]?.layerId ?? "");
-  const layerPos = activeLayer
-    ? visible.filter((i) => i <= active && plan.steps[i].layerId === activeLayer.id).length
-    : 0;
-
-  // Persist resume position + mark the visited step as seen.
-  useEffect(() => {
-    markSeen(active);
-    setLastActive(active);
-  }, [active, markSeen, setLastActive]);
-
+  // The tour controller folds away once the reader scrolls into the stops.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `scrollRef` is the navigation hook's stable ref
   useEffect(() => {
     const root = scrollRef.current;
     if (!root) return;
@@ -1465,139 +1562,6 @@ function Tour({
       onScrolledChange?.(false);
     };
   }, [onScrolledChange]);
-
-  // Keyboard nav: j/↓ next, k/↑ prev, o open file, x dismiss, Enter/d next
-  // undismissed stop. Ignored while typing.
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      const el = e.target as HTMLElement | null;
-      if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) {
-        return;
-      }
-      if (e.metaKey || e.ctrlKey || e.altKey) return;
-      if (e.key === "j" || e.key === "ArrowDown") {
-        e.preventDefault();
-        move(1);
-      } else if (e.key === "k" || e.key === "ArrowUp") {
-        e.preventDefault();
-        move(-1);
-      } else if (e.key === "o") {
-        const step = plan.steps[active];
-        if (step) openStep(step.path, step.line);
-      } else if (e.key === "x") {
-        // 81: dismiss the active stop; the effect on `visible` re-snaps to the
-        // next remaining stop automatically.
-        e.preventDefault();
-        dismiss(active);
-      } else if (e.key === "Enter" || e.key === "d") {
-        // 81: advance to the next (undismissed) stop.
-        e.preventDefault();
-        move(1);
-      }
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [active, plan.steps, openStep, move, dismiss]);
-
-  // Coming back to the tour (Back from a file a stop linked to, or the view
-  // toggle) resumes on the stop you left. `active` is seeded from the resume
-  // point, but the pane mounts scrolled to the top, and the scroll sync below
-  // would otherwise read that as "on the first stop" and overwrite it. Runs
-  // before that effect, so the jump is already held when it first measures.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: once, on mount
-  useEffect(() => {
-    if (active === visible[0]) return;
-    beginJump(active);
-    stepRefs.current[active]?.scrollIntoView({ block: "start" });
-  }, []);
-
-  // The active (colored) step is exactly the one whose sticky header is pinned
-  // at the top: the last visible section that has scrolled to/above the top
-  // edge. This keeps the highlight in lock-step with the stuck header.
-  useEffect(() => {
-    const root = scrollRef.current;
-    if (!root) return;
-
-    // Small tolerance throughout so a jumped-to stop (which lands ~flush at the
-    // top) still registers as current — a tight `<= 1` would snap back to the
-    // previous stop after a click/next jump.
-    const atTop = (i: number, top: number): boolean | null => {
-      const el = stepRefs.current[i];
-      if (!el) return null;
-      return el.getBoundingClientRect().top - top <= 4;
-    };
-
-    // The last visible stop that has scrolled to/above the top edge.
-    function stuck(top: number): number {
-      let current = visible[0] ?? 0;
-      for (const i of visible) {
-        const above = atTop(i, top);
-        if (above === null) continue;
-        if (above) current = i;
-        else break;
-      }
-      return current;
-    }
-
-    // Has a jump's smooth scroll ARRIVED at its target? Equivalent to
-    // `stuck(top) === target` — the stops above the target are above it in the
-    // document too, so they need no measuring — but it reads two rects instead
-    // of one per stop passed over. On a 200-stop tour that is the difference
-    // between two layout reads and two hundred, on every frame of the
-    // animation, which is most of what made a click feel slow.
-    function arrived(target: number, top: number): boolean {
-      const pos = visible.indexOf(target);
-      // A target the filter hid can never become the stuck stop, exactly as
-      // under the full scan — hold until `beginJump`'s safety timer releases.
-      if (pos < 0) return false;
-      if (atTop(target, top) !== true) {
-        // Nothing is pinned yet (the intro is still on screen). The scan's
-        // default in that case is the first visible stop, so a jump to that one
-        // has arrived; any other is still on its way.
-        return target === visible[0];
-      }
-      for (let p = pos + 1; p < visible.length; p++) {
-        const above = atTop(visible[p], top);
-        if (above === null) continue;
-        return !above;
-      }
-      return true; // nothing mounted below it — the target is as stuck as it gets
-    }
-
-    function syncStuck() {
-      if (!root) return;
-      const top = root.getBoundingClientRect().top;
-      // A jump is animating: hold the chosen stop until the scroll reaches it,
-      // so we don't flash each stop it passes over on the way.
-      const target = jumpTargetRef.current;
-      if (target !== null) {
-        if (!arrived(target, top)) return;
-        jumpTargetRef.current = null;
-        setActive(target);
-        return;
-      }
-      setActive(stuck(top));
-    }
-
-    // Coalesced to one measurement per frame. Scroll fires faster than that
-    // during a smooth scroll, and every extra call is a forced layout against
-    // the whole reading pane.
-    let frame = 0;
-    function onScroll() {
-      if (frame) return;
-      frame = requestAnimationFrame(() => {
-        frame = 0;
-        syncStuck();
-      });
-    }
-
-    syncStuck();
-    root.addEventListener("scroll", onScroll, { passive: true });
-    return () => {
-      root.removeEventListener("scroll", onScroll);
-      if (frame) cancelAnimationFrame(frame);
-    };
-  }, [visible]);
 
   const addComment = useEvent((step: GuidedStep, idx: number, body: string) => {
     if (!body.trim()) return;
@@ -1631,15 +1595,6 @@ function Tour({
     [visible, plan.steps],
   );
 
-  const jumpTo = useCallback(
-    (i: number) => {
-      beginJump(i);
-      stepRefs.current[i]?.scrollIntoView({ behavior: "smooth", block: "start" });
-      setActive(i);
-    },
-    [beginJump],
-  );
-
   // An explicitly requested stop (the reviewer opened one layer of a deep tour).
   // `active` is seeded once from the resume point, so a later request has to
   // move it here. The ref makes the jump idempotent: `onFocusConsumed` is an
@@ -1656,6 +1611,7 @@ function Tour({
     // A kind filter would hide the stop we were asked to open (and the
     // snap-to-visible effect would immediately pull the cursor elsewhere).
     setFilter(null);
+    setStopFilter(null);
     jumpTo(focusIndex);
     onFocusConsumed?.();
   }, [focusIndex, plan.steps.length, jumpTo, onFocusConsumed]);
@@ -1709,40 +1665,60 @@ function Tour({
               <Sparkles className="size-3.5 shrink-0 text-muted-foreground" />
               <span>Guided tour</span>
             </div>
+            {!noSteps && (
+              <StopFilters
+                counts={needCounts}
+                active={stopFilter?.kind ?? null}
+                onChange={(kind) =>
+                  setStopFilter(kind ? { kind, ids: new Set(needs[kind]) } : null)
+                }
+              />
+            )}
             <div className="ml-auto flex shrink-0 items-center gap-1">
               {!noSteps && (
-                <>
-                  {activeLayer ? (
-                    <span className="mr-1 flex items-baseline gap-1.5 text-xs tabular-nums">
-                      <span
-                        className="font-medium text-foreground/75"
-                        title={`${activeLayer.title} — layer ${activeLayer.index} of ${activeLayer.total}`}
-                      >
-                        L{activeLayer.index} · {Math.max(1, layerPos)} /{" "}
-                        {layerCounts.get(activeLayer.id) ?? 0}
-                      </span>
-                      <span className="text-muted-foreground/50">
-                        {Math.max(1, pos + 1)} / {visible.length}
-                      </span>
-                    </span>
-                  ) : (
-                    <span className="mr-1 text-xs tabular-nums text-muted-foreground">
-                      {Math.max(1, pos + 1)} / {visible.length}
-                    </span>
-                  )}
-                  <Button
-                    size="icon-sm"
-                    variant="ghost"
-                    disabled={atFirst}
-                    onClick={() => move(-1)}
-                  >
-                    <ChevronLeft className="size-4" />
-                  </Button>
-                  <Button size="icon-sm" variant="ghost" disabled={atLast} onClick={() => move(1)}>
-                    <ChevronRight className="size-4" />
-                  </Button>
-                </>
+                <TourStepper
+                  activeLayer={activeLayer}
+                  layerPos={layerPos}
+                  layerCount={activeLayer ? (layerCounts.get(activeLayer.id) ?? 0) : 0}
+                  pos={pos}
+                  total={visible.length}
+                  atFirst={atFirst}
+                  atLast={atLast}
+                  onMove={move}
+                />
               )}
+              {batch ? (
+                <Button
+                  size="xs"
+                  variant="ghost"
+                  onClick={runner.cancelAll}
+                  disabled={batch.cancelled}
+                  title="Stop after the checks already running"
+                >
+                  <Spinner className="size-3" />
+                  {batch.done} / {batch.total} checked
+                  <X className="size-3" />
+                </Button>
+              ) : (
+                uncheckedClaims.length > 0 && (
+                  <TooltipFor label="Check every unchecked orientation and praise stop with AI, claim by claim">
+                    <Button
+                      size="xs"
+                      variant="ghost"
+                      onClick={() => setConfirmCheckAll({ steps: uncheckedClaims })}
+                    >
+                      <ShieldCheck className="size-3" />
+                      Check all
+                    </Button>
+                  </TooltipFor>
+                )
+              )}
+              <IconButton
+                label="Export report"
+                icon={FileDown}
+                loading={exporting}
+                onClick={() => void exportReport()}
+              />
               <IconButton
                 label="Regenerate tour"
                 icon={RefreshCw}
@@ -1753,7 +1729,7 @@ function Tour({
           </div>
           {plan.summary && (
             <p className="mt-1.5 text-xs leading-relaxed text-foreground/80 line-clamp-2">
-              {plan.summary}
+              <CodeSpans text={plan.summary} />
             </p>
           )}
         </div>
@@ -1822,7 +1798,7 @@ function Tour({
               reviewer sees WHY it's approve / request-changes, not just the chip. */}
           {verdict && plan.verdictReason && (
             <p className="mt-1.5 text-xs leading-relaxed text-muted-foreground">
-              {plan.verdictReason}
+              <CodeSpans text={plan.verdictReason} />
             </p>
           )}
         </div>
@@ -1875,148 +1851,29 @@ function Tour({
           progress bar. */}
       <div className="mt-2 flex min-h-0 flex-1">
         {!noSteps && (
-          <aside className="hidden w-60 shrink-0 overflow-y-auto border-r border-hairline px-3 py-4 lg:block">
-            <div className="mb-2 flex items-center gap-1 px-2">
-              <p className="min-w-0 flex-1 text-3xs font-medium uppercase tracking-wide text-muted-foreground/50">
-                The tour
-              </p>
-              {/* With a single layer the per-heading chevron is enough, and the
-                  pair would just be noise. Two buttons rather than one toggle:
-                  a toggle has to invent a meaning for "3 of 7 folded". */}
-              {collapse && collapsibleIds.length > 1 && (
-                <div className="-mr-1 flex shrink-0 items-center">
-                  <button
-                    type="button"
-                    onClick={() => collapse.setAll(collapsibleIds, true)}
-                    aria-label="Collapse all layers"
-                    title="Collapse all"
-                    className="flex size-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-foreground/[0.05] hover:text-foreground"
-                  >
-                    <ChevronsDownUp className="size-3.5" strokeWidth={2} />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => collapse.setAll(collapsibleIds, false)}
-                    aria-label="Expand all layers"
-                    title="Expand all"
-                    className="flex size-6 items-center justify-center rounded text-muted-foreground transition-colors hover:bg-foreground/[0.05] hover:text-foreground"
-                  >
-                    <ChevronsUpDown className="size-3.5" strokeWidth={2} />
-                  </button>
-                </div>
-              )}
-            </div>
-            <div className="flex flex-col">
-              {groups.map((g, gi) => {
-                const layer = g.layer;
-                const folded = !!layer && !!collapse && collapsedIds.has(layer.id);
-                // Only the run the cursor is actually in takes the accent, even
-                // though the fold belongs to the layer as a whole.
-                const hasCursor =
-                  !!layer && layer.id === activeLayer?.id && g.items.includes(active);
-                const n = layer ? (layerCounts.get(layer.id) ?? g.items.length) : g.items.length;
-                const readN = layer ? (layerDone.get(layer.id) ?? 0) : 0;
-
-                // Kept mounted (display:none) so `aria-controls` points at a
-                // real node. Must be the `hidden` CLASS, not the attribute: the
-                // author-level `display:flex` below would outrank the UA
-                // sheet's `[hidden] { display: none }` and still render.
-                const rows = (
-                  <div
-                    id={layer ? `tour-layer-${layer.id}` : undefined}
-                    className={folded ? "hidden" : "flex flex-col"}
-                  >
-                    {g.items.map((i, q) => {
-                      const p = g.start + q;
-                      return (
-                        <RailStop
-                          key={i}
-                          step={plan.steps[i]}
-                          active={p === pos}
-                          // Read state, not position: a layer that lands ahead
-                          // of the cursor must not inherit the checkmarks of the
-                          // stops it was inserted behind.
-                          done={progress.seen.has(i) && p !== pos}
-                          first={q === 0}
-                          last={q === g.items.length - 1}
-                          aboveFilled={p <= pos}
-                          belowFilled={p < pos}
-                          onClick={() => jumpTo(i)}
-                        />
-                      );
-                    })}
-                  </div>
-                );
-
-                if (!layer) return <Fragment key="ungrouped">{rows}</Fragment>;
-                return (
-                  <div key={`${layer.id}@${g.start}`} className={cn(gi > 0 && "mt-3")}>
-                    <button
-                      type="button"
-                      onClick={() => collapse?.toggle(layer.id)}
-                      disabled={!collapse}
-                      aria-expanded={!folded}
-                      aria-controls={`tour-layer-${layer.id}`}
-                      title={`Layer ${layer.index} of ${layer.total} — ${layer.title} · ${readN} of ${n} read${
-                        hasCursor ? ` · you're on stop ${Math.max(1, layerPos)}` : ""
-                      }`}
-                      className={cn(
-                        "mb-1 flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left transition-colors",
-                        collapse && "hover:bg-foreground/[0.04]",
-                        folded && hasCursor && "bg-foreground/[0.05]",
-                      )}
-                    >
-                      {collapse && (
-                        <ChevronRight
-                          aria-hidden
-                          strokeWidth={2}
-                          className={cn(
-                            "size-3 shrink-0 text-muted-foreground/50 transition-transform duration-200 motion-reduce:transition-none",
-                            !folded && "rotate-90",
-                          )}
-                        />
-                      )}
-                      {/* Abbreviated because the chevron and the state chunk now
-                          share this row — the full text is in the title. */}
-                      <span className="shrink-0 text-3xs font-medium uppercase tracking-wide text-muted-foreground/50">
-                        L{layer.index}/{layer.total}
-                      </span>
-                      <span
-                        className={cn(
-                          "min-w-0 flex-1 truncate text-2xs font-medium",
-                          folded && hasCursor ? "text-foreground" : "text-foreground/70",
-                        )}
-                      >
-                        {layer.title}
-                      </span>
-                      {/* A folded layer has to report itself — how much of it is
-                          read, and whether the cursor is inside it, since the
-                          active row it would show is hidden. Rendered in all
-                          three states so the heading doesn't reflow on toggle. */}
-                      <span
-                        className={cn(
-                          "flex shrink-0 items-center gap-1 text-2xs tabular-nums",
-                          hasCursor ? "text-foreground/75" : "text-muted-foreground/50",
-                        )}
-                      >
-                        {hasCursor ? (
-                          <>
-                            <span aria-hidden className="size-1.5 rounded-full bg-foreground/70" />
-                            {Math.max(1, layerPos)}/{n}
-                          </>
-                        ) : readN >= n ? (
-                          <Check className="size-3" strokeWidth={3} />
-                        ) : (
-                          `${readN}/${n}`
-                        )}
-                      </span>
-                    </button>
-                    {rows}
-                  </div>
-                );
-              })}
-            </div>
-          </aside>
+          <TourRail
+            steps={plan.steps}
+            index={layerIndex}
+            layerDone={layerDone}
+            pos={pos}
+            active={active}
+            seen={progress.seen}
+            activeLayer={activeLayer}
+            layerPos={layerPos}
+            collapse={progress.collapse}
+            onJump={jumpTo}
+            layerAction={(layer, hasCursor) => (
+              <LayerCheckAction
+                layer={layer}
+                pending={batch ? undefined : uncheckedByLayer.get(layer.id)}
+                checking={checkingLayers.has(layer.id)}
+                onCheck={setConfirmCheckAll}
+                // Always shown on the layer being read; on hover elsewhere,
+                // so six layers don't stack six shields down the rail.
+                quiet={!hasCursor}
+              />
+            )}
+          />
         )}
 
         {/* No top padding here: container padding insets the sticky-stop, leaving
@@ -2043,11 +1900,16 @@ function Tour({
                 index={i}
                 files={files}
                 corpus={corpus}
+                cloneNames={cloneNames}
                 preferPost={preferPost}
                 posted={posted.has(i)}
                 onAdd={addComment}
                 onPost={postStep}
-                onCheckAI={cwd ? checkWithAI : undefined}
+                checksKey={checksKey}
+                check={checks?.[stepId(step)]}
+                onCheck={checkStep}
+                canConcernCheck={!!cwd}
+                onClearCheck={clearCheck}
                 onExplainBehavior={explainBehavior}
                 onDismiss={dismiss}
                 onOpenFile={openStep}
@@ -2060,193 +1922,152 @@ function Tour({
             // the reviewer just sees the list get longer.
             const head = layerHeads.get(i);
             if (!head) return stop;
-            const n = layerCounts.get(head.id) ?? 0;
             return (
               <Fragment key={`g${i}`}>
-                <div className="mb-3 mt-7 flex items-center gap-2.5">
-                  <span className="shrink-0 rounded-full bg-foreground/[0.06] px-2 py-0.5 text-3xs font-medium uppercase tracking-wide text-muted-foreground">
-                    Layer {head.index} of {head.total}
-                  </span>
-                  <span className="min-w-0 truncate text-xs font-medium text-foreground/80">
-                    {head.title}
-                  </span>
-                  <span className="shrink-0 text-2xs tabular-nums text-muted-foreground/60">
-                    {n} stop{n === 1 ? "" : "s"}
-                  </span>
-                  <span className="h-px min-w-4 flex-1 bg-hairline" />
-                </div>
+                <LayerDivider
+                  layer={head}
+                  count={layerCounts.get(head.id) ?? 0}
+                  action={
+                    <LayerCheckAction
+                      layer={head}
+                      pending={batch ? undefined : uncheckedByLayer.get(head.id)}
+                      checking={checkingLayers.has(head.id)}
+                      onCheck={setConfirmCheckAll}
+                      labelled
+                    />
+                  }
+                />
                 {stop}
               </Fragment>
             );
           })}
 
-          <div className="flex flex-col items-center gap-1.5 py-6">
-            {atLast ? (
-              <p className="text-center text-xs text-muted-foreground">
-                {noSteps
-                  ? "No stops to walk through — nothing needed a closer look. The recommendation is above."
+          <TourEnd
+            atLast={atLast}
+            endMessage={
+              noSteps
+                ? "No stops to walk through — nothing needed a closer look. The recommendation is above."
+                : stopFilter
+                  ? `That's every ${stopFilter.kind} stop.`
                   : filter
                     ? `That's every ${KIND[filter].label.toLowerCase()} stop.`
-                    : "That's the whole tour — happy reviewing."}
-              </p>
-            ) : (
-              <Button size="xs" variant="ghost" onClick={() => move(1)}>
-                Next stop
-                <ArrowRight className="size-3" />
-              </Button>
-            )}
-            {dismissedSet.size > 0 && (
-              <Button size="xs" variant="ghost" onClick={() => restoreDismissed()}>
-                <RotateCcw className="size-3" />
-                Restore {dismissedSet.size} dismissed
-              </Button>
-            )}
-          </div>
+                    : "That's the whole tour — happy reviewing."
+            }
+            onNext={() => move(1)}
+            dismissedCount={dismissedSet.size}
+            onRestore={restoreDismissed}
+          />
         </div>
       </div>
+
+      <AlertDialog
+        open={confirmCheckAll != null}
+        onOpenChange={(o) => {
+          if (!o) setConfirmCheckAll(null);
+        }}
+      >
+        <AlertDialogPopup>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              {confirmCheckAll?.layer
+                ? `Check layer ${confirmCheckAll.layer.index} with AI?`
+                : "Check the tour with AI?"}
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              This makes {checkAllCount} AI call{checkAllCount === 1 ? "" : "s"},{" "}
+              {CHECK_CONCURRENCY} at a time — one per unchecked orientation or praise stop
+              {confirmCheckAll?.layer ? ` in “${confirmCheckAll.layer.title}”` : ""}. Each checks
+              its stop claim by claim against the code, without seeing the rest of the tour.
+              Worth-a-comment and question stops are checked one at a time from the stop itself. You
+              can stop the run at any time and keep what has landed.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button variant="outline" size="sm" />}>
+              Cancel
+            </AlertDialogClose>
+            <Button
+              size="sm"
+              onClick={() => {
+                const steps = confirmCheckAll?.steps;
+                setConfirmCheckAll(null);
+                if (steps) void runCheckAll(steps);
+              }}
+            >
+              <ShieldCheck className="size-3.5" />
+              {confirmCheckAll?.layer ? "Check layer" : "Check all"}
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
     </div>
   );
 }
 
 /**
- * One stop on the tour rail.
- *
- * `first`/`last` are GROUP-local, so the spine breaks where a layer does — and
- * so folding a layer away leaves no dangling segment on its neighbours.
- * `aboveFilled`/`belowFilled` stay global: how far the reviewer has got is a
- * fact about the whole tour, not about one layer.
+ * "Check layer" on a layer heading: the toolbar's "Check all" scoped to one
+ * layer, reachable from wherever the reviewer has scrolled to. Shows a spinner
+ * while any of the layer's stops is being checked, and nothing once every
+ * orientation / praise stop in it has a check.
  */
-function RailStop({
-  step,
-  active,
-  done,
-  first,
-  last,
-  aboveFilled,
-  belowFilled,
-  onClick,
+function LayerCheckAction({
+  layer,
+  pending,
+  checking,
+  onCheck,
+  labelled = false,
+  quiet = false,
 }: {
-  step: GuidedStep;
-  active: boolean;
-  done: boolean;
-  first: boolean;
-  last: boolean;
-  aboveFilled: boolean;
-  belowFilled: boolean;
-  onClick: () => void;
+  layer: TourLayer;
+  /** The layer's unchecked claim stops; undefined while a batch runs. */
+  pending: GuidedStep[] | undefined;
+  checking: boolean;
+  onCheck: (req: { steps: GuidedStep[]; layer: TourLayer }) => void;
+  /** Text button (reading pane) rather than an icon (rail). */
+  labelled?: boolean;
+  /** Hidden until the heading is hovered or the button focused. */
+  quiet?: boolean;
 }) {
-  const K = KIND[step.kind] ?? KIND.orient;
+  if (checking) {
+    return (
+      <span
+        title={`Checking layer ${layer.index}…`}
+        className={cn(
+          "flex shrink-0 items-center gap-1 text-2xs text-muted-foreground",
+          !labelled && "size-6 justify-center",
+        )}
+      >
+        <Spinner className="size-3" />
+        {labelled && "Checking…"}
+      </span>
+    );
+  }
+  if (!pending?.length) return null;
+  const label = `Check layer ${layer.index} with AI`;
+  if (labelled) {
+    return (
+      <TooltipFor label={label}>
+        <Button size="xs" variant="ghost" onClick={() => onCheck({ steps: pending, layer })}>
+          <ShieldCheck className="size-3" />
+          Check layer
+        </Button>
+      </TooltipFor>
+    );
+  }
   return (
     <button
       type="button"
-      onClick={onClick}
+      onClick={() => onCheck({ steps: pending, layer })}
+      aria-label={label}
+      title={label}
       className={cn(
-        "group flex w-full gap-2.5 rounded-lg px-2 text-left transition-colors hover:bg-foreground/[0.04]",
-        active && "bg-foreground/[0.05]",
+        "flex size-6 shrink-0 items-center justify-center rounded text-muted-foreground transition-[opacity,color,background-color] hover:bg-foreground/[0.05] hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100",
+        quiet && "opacity-0",
       )}
     >
-      <span className="relative flex w-4 shrink-0 flex-col items-center self-stretch">
-        <span
-          className={cn(
-            "w-px flex-1",
-            first ? "bg-transparent" : aboveFilled ? "bg-foreground/35" : "bg-foreground/12",
-          )}
-        />
-        <span className="relative flex size-3.5 items-center justify-center">
-          {active && (
-            <span
-              aria-hidden
-              className="absolute inline-flex size-full rounded-full bg-foreground opacity-20 motion-safe:animate-ping"
-            />
-          )}
-          {/* Fill encodes STATE (done/current = accent, ahead = hollow).
-            The kind shows in the row heading, not on the node. */}
-          <span
-            className={cn(
-              "relative flex size-3.5 items-center justify-center rounded-full",
-              done && "bg-foreground/55 text-background",
-              active && "bg-foreground/75 text-background ring-4 ring-foreground/10",
-              !done && !active && "border-[1.5px] border-foreground/25 bg-background",
-            )}
-          >
-            {done && <Check className="size-2.5" strokeWidth={3} />}
-          </span>
-        </span>
-        <span
-          className={cn(
-            "w-px flex-1",
-            last ? "bg-transparent" : belowFilled ? "bg-foreground/35" : "bg-foreground/12",
-          )}
-        />
-      </span>
-      <span className="min-w-0 flex-1 py-2.5">
-        <span
-          className={cn(
-            "mb-1 block text-3xs font-medium uppercase leading-none tracking-wide",
-            K.text,
-            !active && "opacity-55",
-          )}
-        >
-          {K.label}
-        </span>
-        <span
-          className={cn(
-            "block truncate text-xs leading-snug",
-            active
-              ? "font-medium text-foreground"
-              : done
-                ? "text-muted-foreground"
-                : "text-muted-foreground/55",
-          )}
-        >
-          {step.title}
-        </span>
-      </span>
+      <ShieldCheck className="size-3.5" strokeWidth={2} />
     </button>
   );
-}
-
-/** Verdict the per-step "Check with AI" returns. */
-type CheckResult = { verdict: "resolved" | "valid"; finding: string };
-
-/** Ask the agent to verify ONE concern against the repo it runs in. */
-function checkPrompt(step: GuidedStep): string {
-  const loc = `${step.path}:${step.line}${step.endLine ? `-${step.endLine}` : ""}`;
-  return [
-    "You are verifying ONE code-review concern against the actual repository in this working directory. Read the relevant files to check it — don't guess.",
-    "",
-    `Concern (${step.kind}) at ${loc}`,
-    `Title: ${step.title}`,
-    step.detail ? `Details: ${step.detail}` : "",
-    step.suggestion ? `Proposed review comment: ${step.suggestion}` : "",
-    "",
-    "Decide:",
-    '- "resolved": NOT worth raising — false alarm, already handled, or not actually an issue.',
-    '- "valid": a real concern worth a comment.',
-    "",
-    "Reply with ONLY a single-line JSON object — no prose, no code fences:",
-    '{"verdict":"resolved"|"valid","finding":"<1-2 sentences; if valid, a sharp ready-to-post comment>"}',
-  ]
-    .filter(Boolean)
-    .join("\n");
-}
-
-/** Pull the verdict JSON from the agent's (possibly chatty) reply. Unparseable
- *  output is treated as "valid" so we never auto-dismiss on ambiguity. */
-function parseCheckResult(out: string): CheckResult {
-  const m = out.match(/\{[\s\S]*\}/);
-  if (m) {
-    try {
-      const o = JSON.parse(m[0]) as { verdict?: unknown; finding?: unknown };
-      return {
-        verdict: o.verdict === "resolved" ? "resolved" : "valid",
-        finding: typeof o.finding === "string" && o.finding.trim() ? o.finding.trim() : out.trim(),
-      };
-    } catch {
-      /* fall through to raw-text fallback */
-    }
-  }
-  return { verdict: "valid", finding: out.trim() };
 }
 
 /**
@@ -2264,11 +2085,16 @@ const Step = memo(function Step({
   index,
   files,
   corpus,
+  cloneNames,
   preferPost,
   posted,
   onAdd,
   onPost,
-  onCheckAI,
+  checksKey,
+  check,
+  onCheck,
+  canConcernCheck,
+  onClearCheck,
   onExplainBehavior,
   onDismiss,
   onOpenFile,
@@ -2281,13 +2107,23 @@ const Step = memo(function Step({
   files: PullFile[];
   /** The whole PR's diff text, joined once by the tour — see `verifyClaim`. */
   corpus: string;
+  /** Names found in the local clone — see `groundInClone`. */
+  cloneNames: ReadonlySet<string>;
   /** When posting straight to GitHub is available, make it the primary action. */
   preferPost: boolean;
   posted: boolean;
   onAdd: (step: GuidedStep, index: number, body: string) => void;
   onPost?: (step: GuidedStep, body: string) => Promise<void>;
-  /** Verify this concern against the local clone (concern/question kinds). */
-  onCheckAI?: (step: GuidedStep) => Promise<CheckResult | null>;
+  /** Where this tour's checks are stored — `checksKey(prKey, headSha)`. */
+  checksKey: string;
+  /** The stored check on this stop, if any. */
+  check?: CheckRecord;
+  /** Run this stop's check (concern check or claim check, by kind). */
+  onCheck: (step: GuidedStep) => Promise<void>;
+  /** A clone exists, so concerns and questions can be checked too. */
+  canConcernCheck: boolean;
+  /** Forget this stop's check. */
+  onClearCheck: (step: GuidedStep) => void;
   /** Explain this stop's symbol as behavior (before / after / what changed). */
   onExplainBehavior?: (step: GuidedStep) => Promise<BehaviorDiff | null>;
   onDismiss?: (index: number) => void;
@@ -2296,28 +2132,34 @@ const Step = memo(function Step({
   prKey: string;
   onAskAi: () => void;
 }) {
-  const kind = KIND[step.kind] ?? KIND.orient;
   const sectionRef = useCallback((el: HTMLElement | null) => setRef(index, el), [setRef, index]);
   const dismiss = useMemo(
     () => (onDismiss ? () => onDismiss(index) : undefined),
     [onDismiss, index],
   );
-  const Icon = kind.icon;
   const [posting, setPosting] = useState(false);
   const [postedGh, setPostedGh] = useState(false);
-  const [checking, setChecking] = useState(false);
-  // The AI's verdict + finding from "Check with AI", kept so the reasoning is
-  // always shown — a cleared concern is never dismissed as a black box. On
-  // "valid" the finding is a sharper comment that replaces the suggestion.
-  const [result, setResult] = useState<CheckResult | null>(null);
+  const id = useMemo(() => stepId(step), [step]);
+  const checking = useStepCheckRuns((s) => !!s.inFlight[runKey(checksKey, id)]);
+  // The AI's verdict + finding from "Check with AI", kept (and persisted) so
+  // the reasoning is always shown — a cleared concern is never dismissed as a
+  // black box. On "valid" the finding is a sharper comment that replaces the
+  // suggestion.
+  const result = check?.type === "concern" ? check : null;
+  const claims = check?.type === "claims" ? check : null;
   const refined = result?.verdict === "valid" ? result.finding : null;
-  const checkable = !!onCheckAI && (step.kind === "concern" || step.kind === "question");
+  const checkType = checkTypeFor(step.kind);
+  const checkable = checkType === "claims" || canConcernCheck;
 
   // Deterministic grounding check, at read time against the PR's real files —
   // same reasoning as `mergeDeepTour`: the PR keeps moving, so a grade computed
   // when the tour was generated could outlive the diff it describes. Only a
   // downgrade is surfaced; annotating every well-anchored stop would be noise.
-  const evidence = useMemo(() => verifyStep(step, files, corpus), [step, files, corpus]);
+  const evidence = useMemo(
+    () => groundInClone(verifyStep(step, files, corpus), cloneNames),
+    [step, files, corpus, cloneNames],
+  );
+  const trust = stepTrust(evidence.grade, check);
 
   // Highlight → "Ask AI", as in the diff: code in the snippet pins its lines;
   // text in the commentary pins the passage as a claim about the stop's anchor.
@@ -2332,15 +2174,8 @@ const Step = memo(function Step({
     [step],
   );
 
-  async function runCheck() {
-    if (!onCheckAI || checking) return;
-    setChecking(true);
-    try {
-      const r = await onCheckAI(step);
-      if (r) setResult(r);
-    } finally {
-      setChecking(false);
-    }
+  function runCheck() {
+    if (!checking) void onCheck(step);
   }
 
   // Behavior summary for this stop's symbol, fetched on demand. Ephemeral for
@@ -2381,54 +2216,25 @@ const Step = memo(function Step({
       {/* sticky header — the current stop stays pinned while you read it.
           Opaque so the diff scrolls cleanly *under* it (no bleed-through). The
           pinning itself marks "where you are", so the row stays neutral. */}
-      <div className="sticky top-0 z-20 -mx-5 flex items-center gap-2 border-b border-b-hairline bg-background px-5 py-2 shadow-sm">
-        <span aria-hidden className={cn("absolute inset-y-0 left-0 w-0.5", kind.dot)} />
-        <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-foreground/10 text-2xs font-medium tabular-nums text-muted-foreground">
-          {index + 1}
-        </span>
-        <span
-          className={cn("inline-flex shrink-0 items-center gap-1 text-xs font-medium", kind.text)}
-        >
-          <Icon className="size-3.5" />
-          {kind.label}
-        </span>
-        <h3 className="min-w-0 flex-1 truncate text-sm font-medium text-foreground">
-          {step.title}
-        </h3>
-        {/* Full path, not just the basename — `__init__.py` or `README.md`
-            can exist in several folders. The directory gives way first when
-            the header is tight; hover shows all of it. */}
-        <TooltipFor label={`Open ${step.path} in the diff`} align="end">
-          <button
-            type="button"
-            onClick={() => onOpenFile(step.path, step.line)}
-            aria-label={`Open ${step.path} in the diff`}
-            className="group/path inline-flex min-w-0 max-w-[50%] items-center gap-1.5 font-mono text-xs text-muted-foreground transition-colors hover:text-foreground"
-          >
-            <FileCode className="size-3.5 shrink-0" />
-            <span className="flex min-w-0">
-              {step.path.includes("/") && (
-                <span className="min-w-0 truncate text-muted-foreground/60 group-hover/path:text-muted-foreground">
-                  {step.path.slice(0, step.path.lastIndexOf("/") + 1)}
-                </span>
-              )}
-              <span className="shrink-0">
-                {step.path.split("/").pop()}:{step.line}
-                {step.endLine ? `-${step.endLine}` : ""}
-              </span>
-            </span>
-          </button>
-        </TooltipFor>
-        {dismiss && (
-          <IconButton
-            label="Dismiss this stop"
-            icon={X}
-            size="icon-xs"
-            onClick={dismiss}
-            className="shrink-0 text-muted-foreground/60 hover:text-foreground"
+      <StepHeader
+        index={index}
+        step={step}
+        trust={trust}
+        // Only a check's outcome. An unverified stop already says so in its
+        // grade label and its warning; a third "unverified" adds nothing.
+        showTrust={trust === "verified" || trust === "contradicted"}
+        grade={
+          <GradeLabel
+            grade={evidence.grade}
+            help={PR_GRADE_HELP}
+            // The heuristic reason is spelled out in the warning box below.
+            reason={evidence.grade === "heuristic" ? undefined : evidence.reason}
           />
-        )}
-      </div>
+        }
+        openLabel={`Open ${step.path} in the diff`}
+        onOpenFile={onOpenFile}
+        onDismiss={dismiss}
+      />
 
       {/* content */}
       <div className="min-w-0 pt-3 pb-8">
@@ -2440,8 +2246,8 @@ const Step = memo(function Step({
           <div className="mb-2 flex items-start gap-2 rounded-lg bg-warning/10 px-2.5 py-2 text-xs text-warning">
             <AlertTriangle className="mt-px size-3 shrink-0" />
             <span className="min-w-0 flex-1">
-              Couldn't verify this against the diff — {evidence.reason} Read the source before
-              acting on it.
+              Couldn't verify this against the diff — <CodeSpans text={evidence.reason ?? ""} />{" "}
+              Read the source before acting on it.
             </span>
           </div>
         )}
@@ -2473,7 +2279,7 @@ const Step = memo(function Step({
         )}
 
         <div className="mt-3 flex flex-wrap items-center gap-2">
-          {checkable && !result && (
+          {checkable && !check && (
             <Button size="xs" variant="secondary" loading={checking} onClick={runCheck}>
               <Sparkles className="size-3 text-info" />
               Check with AI
@@ -2499,6 +2305,15 @@ const Step = memo(function Step({
           />
         )}
 
+        {claims && (
+          <ClaimRows
+            record={claims}
+            checking={checking}
+            onRecheck={runCheck}
+            onOpenFile={onOpenFile}
+          />
+        )}
+
         {/* Cleared: show the AI's reasoning and let the reviewer close it (or
             keep it if they disagree) — never a silent black-box dismiss. */}
         {result?.verdict === "resolved" && (
@@ -2509,7 +2324,7 @@ const Step = memo(function Step({
             </p>
             <p className="mt-1.5 text-xs leading-relaxed text-foreground/80">{result.finding}</p>
             <div className="mt-2.5 flex items-center justify-end gap-1.5">
-              <Button size="xs" variant="ghost" onClick={() => setResult(null)}>
+              <Button size="xs" variant="ghost" onClick={() => onClearCheck(step)}>
                 Keep it
               </Button>
               {dismiss && (
@@ -2604,39 +2419,14 @@ function InlineDiff({
   // Prism is the expensive part of drawing a snippet, and running it in the
   // render body meant re-tokenising every visible line of every mounted stop
   // each time the tour re-rendered.
-  const window = useMemo(() => {
-    const hunks = parsePatch(file?.patch ?? null);
-    const inRange = (nl: number | null | undefined) => nl != null && nl >= lo && nl <= hi;
-    // The hunk that actually contains the anchor line, else the first hunk that
-    // reaches past it. NO blind `hunks[0]` fallback — for a hallucinated/out-of-
-    // range line we'd rather show the honest "not in this diff" note than a
-    // confidently-wrong slice of unrelated code.
-    const hunk =
-      hunks.find((h) => h.lines.some((l) => inRange(l.newLine))) ??
-      hunks.find((h) => h.lines.some((l) => (l.newLine ?? 0) >= lo));
-    if (!hunk) return null;
-    const rows = hunk.lines.filter((l) => l.kind !== "hunk");
-    let first = rows.findIndex((l) => inRange(l.newLine));
-    let last = -1;
-    for (let i = rows.length - 1; i >= 0; i--) {
-      if (inRange(rows[i].newLine)) {
-        last = i;
-        break;
-      }
-    }
-    if (first < 0) {
-      // Range not present as added lines — center on the closest line.
-      const c = rows.findIndex((l) => (l.newLine ?? 0) >= lo);
-      first = last = c < 0 ? 0 : c;
-    }
-    const CTX = 4;
-    const from = Math.max(0, first - CTX);
-    const to = Math.min(rows.length, last + CTX + 1);
-    return rows.slice(from, to).map((l) => ({
-      line: l,
-      html: highlightLine(l.text, lang) || "&nbsp;",
-    }));
-  }, [file?.patch, lo, hi, lang]);
+  const window = useMemo(
+    () =>
+      anchorWindow(file?.patch, lo, hi)?.map((l) => ({
+        line: l,
+        html: highlightLine(l.text, lang) || "&nbsp;",
+      })) ?? null,
+    [file?.patch, lo, hi, lang],
+  );
 
   if (!window) {
     return (

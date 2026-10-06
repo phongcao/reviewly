@@ -136,6 +136,16 @@ export function fileRisks(file: PullFile): RiskCategory[] {
   );
 }
 
+/** Sensitive categories a repository file's path or text matches — the
+ * codebase-tour counterpart of `fileRisks`, on the same `RISK` table. There
+ * is no change to look at, so the text is the file itself (in practice its
+ * head, from `read_file_heads`). */
+export function riskFromText(path: string, text: string): RiskCategory[] {
+  return RISK.filter((r) => r.path?.test(path) || (text && r.content?.test(text))).map(
+    (r) => r.category,
+  );
+}
+
 /* ─────────────────────── the report ─────────────────────── */
 
 const EMPTY = (): Record<CoverageBucket, number> => ({

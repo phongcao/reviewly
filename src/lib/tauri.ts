@@ -224,6 +224,24 @@ export interface PullDetail {
   auto_merge: { merge_method: string | null; enabled_by: UserRef | null } | null;
 }
 
+/** `git_repo_info` — a local clone's state. */
+export interface RepoInfo {
+  remoteUrl: string | null;
+  currentBranch: string;
+  dirty: boolean;
+  /** `HEAD`'s full SHA; empty in a repository with no commits. */
+  head: string;
+}
+
+/** `git_file_stats` — one tracked file. `lines` is 0 for binary files and for
+ * text over the 2 MB `read_file` cap. */
+export interface FileStat {
+  path: string;
+  bytes: number;
+  lines: number;
+  binary: boolean;
+}
+
 export interface PullFile {
   sha: string | null;
   filename: string;

@@ -158,6 +158,20 @@ export function shouldFanOut(s: PrSize): boolean {
   return s.files >= FANOUT_FILES || s.churn >= FANOUT_CHURN || s.coverage < FANOUT_COVERAGE;
 }
 
+/** Most stops one codebase-tour layer asks for. */
+export const REPO_STEP_CAP = 16;
+
+/**
+ * Stops for one layer of a codebase tour, from the layer's source lines:
+ * about `4 + lines / 1500`, capped at `REPO_STEP_CAP`. A repository layer has
+ * no diff to size from, and its reader is learning, not reviewing — so the
+ * count grows slowly with size and stays well under a PR layer's ceiling.
+ */
+export function repoStepBudget(lines: number): CountBand {
+  const max = clamp(Math.round(4 + Math.max(0, lines) / 1500), 4, REPO_STEP_CAP);
+  return { min: Math.max(2, Math.round(max * 0.5)), max };
+}
+
 /** Round a raw ratio into the 0..1 `coverage` field. */
 export const toCoverage = (shown: number, total: number): number =>
   total <= 0 ? 1 : clamp(shown / total, 0, 1);

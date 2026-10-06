@@ -7,6 +7,8 @@ use crate::error::{AppError, AppResult};
 const MAX_BUNDLE_BYTES: u64 = 64_000_000;
 
 /// Write a review-data bundle to a path the user picked in a save dialog.
+/// Also writes exported HTML review reports: plain text the webview has already
+/// built, going to a path the user chose.
 #[tauri::command]
 pub async fn write_bundle(path: String, contents: String) -> AppResult<()> {
     std::fs::write(&path, contents).map_err(|e| AppError::Other(format!("write: {e}")))

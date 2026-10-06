@@ -41,6 +41,12 @@ export interface StepEvidence {
   ungrounded: string[];
   /** Why this isn't `exact`, phrased for a UI tooltip. Absent when it is. */
   reason?: string;
+  /** For a `heuristic` grade, what failed: the file isn't in the PR, the line
+   * misses every hunk, or only a cited name is missing. Only the last can be
+   * rescued by finding the name elsewhere (see `groundInClone`). */
+  cause?: "file" | "line" | "names";
+  /** Set when a name missing from the diff was found in the local clone. */
+  inClone?: string[];
 }
 
 export interface VerifiedStep {
@@ -51,10 +57,12 @@ export interface VerifiedStep {
 /**
  * Tokens that carry no identity, so their absence from the diff proves nothing.
  *
- * Three groups: language keywords that appear inside quoted expressions
+ * Four groups: language keywords that appear inside quoted expressions
  * (`quantity <= 0`, `if (!user)`); built-in error and container types, which a
  * model names generically when describing behaviour ("guards against
- * `KeyError`") rather than quoting the file; and conventional doc filenames.
+ * `KeyError`") rather than quoting the file; conventional doc filenames; and
+ * date-format placeholders (`YYYY-MM-DD`), which describe a format the code
+ * checks with a regex rather than name anything in it.
  *
  * Measured against two real tours (78 stops): without the built-ins, 3 of 4
  * flags were false positives — enough to train a reviewer to ignore the banner,
@@ -98,6 +106,11 @@ const NOISE = new Set([
   "license",
   "readme",
   "todo",
+  // Date-format placeholders; the two-letter ones are already too short.
+  "mmm",
+  "mmmm",
+  "sss",
+  "yyyy",
   // Language keywords, which appear inside quoted expressions.
   "and",
   "async",
@@ -191,7 +204,7 @@ export function citedIdentifiers(text: string): string[] {
 /** The PR's file whose name matches `path`, tolerating a case-only miss the way
  * `reconcileLayers` does — models re-case paths far more often than they invent
  * a file that differs from a real one only in case. */
-function findFile(files: PullFile[], path: string): PullFile | undefined {
+export function findFile(files: PullFile[], path: string): PullFile | undefined {
   const exact = files.find((f) => f.filename === path);
   if (exact) return exact;
   const lower = path.toLowerCase();
@@ -245,6 +258,7 @@ export function verifyClaim(claim: Claim, files: PullFile[], corpus?: string): S
       grade: "heuristic",
       ungrounded: citedIdentifiers(claim.text).filter((id) => !all.includes(id)),
       reason: `${claim.path} isn't among this PR's changed files.`,
+      cause: "file",
     };
   }
 
@@ -276,8 +290,11 @@ export const prCorpus = (files: PullFile[]): string => files.map((f) => f.patch 
 /** Verify a whole tour. Nothing is removed: a stop the diff can't support is
  * graded `heuristic` and shown as such, because a concern the reviewer never
  * sees is the one failure mode they cannot audit. */
-export function verifySteps(steps: GuidedStep[], files: PullFile[]): VerifiedStep[] {
-  const corpus = prCorpus(files);
+export function verifySteps(
+  steps: GuidedStep[],
+  files: PullFile[],
+  corpus: string = prCorpus(files),
+): VerifiedStep[] {
   return steps.map((step) => ({ step, evidence: verifyStep(step, files, corpus) }));
 }
 
@@ -292,6 +309,7 @@ function grade(o: {
       grade: "heuristic",
       ungrounded: o.ungrounded,
       reason: `Line ${o.line} isn't in this file's diff.`,
+      cause: "line",
     };
   }
   if (o.ungrounded.length > 0) {
@@ -300,6 +318,7 @@ function grade(o: {
       grade: "heuristic",
       ungrounded: o.ungrounded,
       reason: `${names} ${o.ungrounded.length === 1 ? "doesn't appear" : "don't appear"} anywhere in this diff.`,
+      cause: "names",
     };
   }
   if (!o.touchesAdd) {
@@ -312,5 +331,63 @@ function grade(o: {
   return { grade: "exact", ungrounded: [] };
 }
 
+const tick = (names: string[]) => names.map((n) => `\`${n}\``).join(", ");
+
+/**
+ * Re-grade a stop whose only failure is a cited name missing from the diff,
+ * given the names a lookup found in the local clone.
+ *
+ * With a clone, the tour reads files the PR doesn't touch and names what it
+ * finds there — a `.gitignore`, an env var, a caller. Those names are real but
+ * absent from the diff, and grading them `heuristic` puts the same warning on
+ * a truthful stop as on a fabricated one. A name found in the clone is not a
+ * fabrication, so the stop rises to `strong` — never `exact`: the clone may not
+ * be at the PR's head, and the claim is still about code outside the change.
+ * A missing file or line is never rescued; a clone can't fix an anchor.
+ */
+export function groundInClone(
+  e: StepEvidence,
+  found: ReadonlySet<string> | undefined,
+): StepEvidence {
+  if (!found || found.size === 0 || e.grade !== "heuristic" || e.cause !== "names") return e;
+  const inClone = e.ungrounded.filter((n) => found.has(n));
+  if (inClone.length === 0) return e;
+  const missing = e.ungrounded.filter((n) => !found.has(n));
+  if (missing.length > 0) {
+    return {
+      ...e,
+      ungrounded: missing,
+      inClone,
+      reason: `${tick(missing)} ${missing.length === 1 ? "doesn't appear" : "don't appear"} in this diff or in your local clone.`,
+    };
+  }
+  return {
+    grade: "strong",
+    ungrounded: [],
+    inClone,
+    reason: `${tick(inClone)} ${inClone.length === 1 ? "isn't" : "aren't"} in this diff, but ${
+      inClone.length === 1 ? "is" : "are"
+    } in your local clone.`,
+  };
+}
+
+/** Names worth looking up in a clone: those cited by stops that failed only
+ * on a name. Sorted and unique, so the list is a stable cache key. */
+export function namesToLookUp(evidence: StepEvidence[]): string[] {
+  const out = new Set<string>();
+  for (const e of evidence) {
+    if (e.grade === "heuristic" && e.cause === "names") for (const n of e.ungrounded) out.add(n);
+  }
+  return [...out].sort();
+}
+
 /** True when a stop is weakly enough grounded that the UI should say so. */
 export const isDowngraded = (e: StepEvidence): boolean => e.grade === "heuristic";
+
+/** How a grade reads in the UI. `heuristic` is the code's word for it; a
+ * reviewer reads it as "unverified", the label the per-stop warning uses. */
+export const GRADE_LABEL: Record<Evidence, string> = {
+  exact: "exact",
+  strong: "strong",
+  heuristic: "unverified",
+};

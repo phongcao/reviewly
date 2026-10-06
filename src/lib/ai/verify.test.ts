@@ -1,4 +1,11 @@
-import { citedIdentifiers, prCorpus, verifyStep, verifySteps } from "@/lib/ai/verify";
+import {
+  citedIdentifiers,
+  groundInClone,
+  namesToLookUp,
+  prCorpus,
+  verifyStep,
+  verifySteps,
+} from "@/lib/ai/verify";
 import type { GuidedStep } from "@/lib/guided";
 import type { PullFile } from "@/lib/tauri";
 import { describe, expect, it } from "vitest";
@@ -147,7 +154,58 @@ describe("citedIdentifiers", () => {
     expect(out.sort()).toEqual(["ValidationFailure", "quantity"]);
   });
 
+  it("ignores a date-format placeholder", () => {
+    expect(citedIdentifiers("Dates must match `YYYY-MM-DD` and `MMM yyyy`.")).toEqual([]);
+  });
+
   it("reads unbackticked prose as narration, not as a claim", () => {
     expect(citedIdentifiers("This calls OrderValidator.")).toEqual([]);
+  });
+});
+
+describe("groundInClone", () => {
+  const named = verifyStep(step({ detail: "`.gitignore` lists `item` paths." }), files);
+
+  it("records why a stop is unverified", () => {
+    expect(named.cause).toBe("names");
+    expect(verifyStep(step({ line: 400 }), files).cause).toBe("line");
+    expect(verifyStep(step({ path: "gone.py" }), files).cause).toBe("file");
+  });
+
+  it("raises a stop to strong when every missing name is in the clone", () => {
+    const e = groundInClone(named, new Set(["gitignore"]));
+    expect(e.grade).toBe("strong");
+    expect(e.inClone).toEqual(["gitignore"]);
+    expect(e.reason).toContain("your local clone");
+  });
+
+  it("keeps it unverified, naming what is still missing, when only some are found", () => {
+    const two = verifyStep(step({ detail: "`.gitignore` and `OrderValidator`." }), files);
+    const e = groundInClone(two, new Set(["gitignore"]));
+    expect(e.grade).toBe("heuristic");
+    expect(e.ungrounded).toEqual(["OrderValidator"]);
+    expect(e.reason).toContain("OrderValidator");
+    expect(e.reason).not.toContain("gitignore");
+  });
+
+  it("never rescues a missing line or file", () => {
+    const line = verifyStep(step({ line: 400, detail: "`.gitignore`" }), files);
+    expect(groundInClone(line, new Set(["gitignore"]))).toBe(line);
+    const file = verifyStep(step({ path: "gone.py", detail: "`.gitignore`" }), files);
+    expect(groundInClone(file, new Set(["gitignore"]))).toBe(file);
+  });
+
+  it("leaves a stop alone with no clone", () => {
+    expect(groundInClone(named, undefined)).toBe(named);
+    expect(groundInClone(named, new Set())).toBe(named);
+  });
+
+  it("asks only for names from stops that failed on a name", () => {
+    const out = namesToLookUp([
+      named,
+      verifyStep(step({ line: 400, detail: "`Elsewhere`" }), files),
+      verifyStep(step(), files),
+    ]);
+    expect(out).toEqual(["gitignore"]);
   });
 });

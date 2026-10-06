@@ -1132,7 +1132,7 @@ function ReviewDataSection() {
       if (!picked || typeof picked !== "string") return;
       const bundle = await readBundle(picked);
       const r = applyBundle(bundle);
-      const landed = r.deepTours + r.guidedTours + r.layerPlans + r.viewedKeys;
+      const landed = r.deepTours + r.guidedTours + r.layerPlans + r.viewedKeys + r.checks;
       if (landed === 0) {
         toast.info("Already up to date — nothing in that bundle was newer.");
         return;
@@ -1142,6 +1142,7 @@ function ReviewDataSection() {
         r.guidedTours && `${r.guidedTours} guided ${plural(r.guidedTours, "tour")}`,
         r.layerPlans && `${r.layerPlans} layer ${plural(r.layerPlans, "plan")}`,
         r.viewedKeys && `viewed marks for ${r.viewedKeys} ${plural(r.viewedKeys, "PR")}`,
+        r.checks && `${r.checks} stop ${plural(r.checks, "check")}`,
       ].filter((p): p is string => !!p);
       toast.success(`Imported ${parts.join(", ")}`, {
         description: r.skipped > 0 ? `${r.skipped} kept — the local copy was newer.` : undefined,

@@ -2,6 +2,7 @@ import { invoke } from "@/lib/tauri";
 import { type DeepTourEntry, useDeepTour } from "@/stores/deep-tour";
 import { type GuidedEntry, useGuided } from "@/stores/guided";
 import { type LayersEntry, useLayers } from "@/stores/layers";
+import { type StepChecks, useStepChecks } from "@/stores/step-checks";
 import { useViewedFiles } from "@/stores/viewed-files";
 import { getVersion } from "@tauri-apps/api/app";
 
@@ -36,6 +37,10 @@ export interface PrReviewData {
   /** Viewed-file marks, by full `${prKey}@${headSha}` key — a PR can carry
    * several if it was reviewed across pushes. */
   viewed?: Record<string, Record<string, true>>;
+  /** AI checks on tour stops, by full `${prKey}@${headSha}` key, like
+   * `viewed`. Additive and optional, so it rides on `BUNDLE_VERSION` 1: an
+   * older build drops the field in `parseBundle` and imports the rest. */
+  checks?: Record<string, StepChecks>;
 }
 
 export interface ReviewDataBundle {
@@ -88,12 +93,15 @@ export async function collectBundle(): Promise<ReviewDataBundle> {
   const layers = useLayers.getState().byPr;
   const guided = useGuided.getState().byPr;
   const viewed = useViewedFiles.getState().viewed;
+  const checks = useStepChecks.getState().byKey;
 
   const prs: Record<string, PrReviewData> = {};
   for (const key of new Set([
     ...Object.keys(deep),
     ...Object.keys(layers),
     ...Object.keys(guided),
+    // A check key is `prKey@sha`; the PR key is everything before the last `@`.
+    ...Object.keys(checks).map((k) => k.slice(0, k.lastIndexOf("@"))),
   ])) {
     const entry: PrReviewData = {};
     if (deep[key]) entry.deepTour = deep[key];
@@ -106,6 +114,12 @@ export async function collectBundle(): Promise<ReviewDataBundle> {
       if (vKey.startsWith(`${key}@`)) marks[vKey] = paths;
     }
     if (Object.keys(marks).length > 0) entry.viewed = marks;
+    const prChecks: Record<string, StepChecks> = {};
+    for (const [cKey, byStep] of Object.entries(checks)) {
+      if (cKey.startsWith(`${key}@`) && Object.keys(byStep).length > 0) prChecks[cKey] = byStep;
+    }
+    if (Object.keys(prChecks).length > 0) entry.checks = prChecks;
+    if (Object.keys(entry).length === 0) continue;
     prs[key] = entry;
   }
 
@@ -160,6 +174,7 @@ export function parseBundle(text: string): ReviewDataBundle {
     if (e.layers?.plan) entry.layers = e.layers;
     if (e.guided?.plan) entry.guided = e.guided;
     if (e.viewed && typeof e.viewed === "object") entry.viewed = e.viewed;
+    if (e.checks && typeof e.checks === "object") entry.checks = e.checks;
     if (Object.keys(entry).length > 0) prs[key] = entry;
   }
   if (Object.keys(prs).length === 0) throw new BundleError("bundle has no usable review data");
@@ -179,6 +194,8 @@ export interface ImportResult {
   guidedTours: number;
   layerPlans: number;
   viewedKeys: number;
+  /** Stop checks that landed (newer than the local copy, per stop). */
+  checks: number;
   /** PRs present in the bundle whose local copy was already newer. */
   skipped: number;
 }
@@ -198,12 +215,14 @@ export function applyBundle(bundle: ReviewDataBundle): ImportResult {
   const layers: Record<string, LayersEntry> = {};
   const guided: Record<string, GuidedEntry> = {};
   let viewed: Record<string, Record<string, true>> = {};
+  let checks: Record<string, StepChecks> = {};
 
   for (const [key, entry] of Object.entries(bundle.prs)) {
     if (entry.deepTour) deep[key] = entry.deepTour;
     if (entry.layers) layers[key] = entry.layers;
     if (entry.guided) guided[key] = entry.guided;
     if (entry.viewed) viewed = { ...viewed, ...entry.viewed };
+    if (entry.checks) checks = { ...checks, ...entry.checks };
   }
 
   const result: ImportResult = {
@@ -211,6 +230,7 @@ export function applyBundle(bundle: ReviewDataBundle): ImportResult {
     layerPlans: useLayers.getState().importEntries(layers),
     guidedTours: useGuided.getState().importEntries(guided),
     viewedKeys: useViewedFiles.getState().importViewed(viewed),
+    checks: useStepChecks.getState().importEntries(checks),
     skipped: 0,
   };
   result.skipped = Object.keys(deep).length - result.deepTours;

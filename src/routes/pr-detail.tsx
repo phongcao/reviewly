@@ -74,7 +74,7 @@ import { useLocalRepos } from "@/stores/local-repos";
 import { usePinboard } from "@/stores/pinboard";
 import { usePrView } from "@/stores/pr-view";
 import { useReviewContext } from "@/stores/review-context";
-import { useReviewDraft } from "@/stores/review-draft";
+import { toSubmittable, useReviewDraft } from "@/stores/review-draft";
 import { useReviewPrefs } from "@/stores/review-prefs";
 import { useUi } from "@/stores/ui";
 import { useViewedFiles, viewedKey } from "@/stores/viewed-files";
@@ -934,7 +934,7 @@ export function PRDetailPage() {
   const submit = useMutation({
     mutationFn: async (event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES") => {
       const body = draft?.body ?? "";
-      const comments = draft?.comments ?? [];
+      const comments = (draft?.comments ?? []).map(toSubmittable);
       // Non-blocking nudge (item 22): requesting changes with no summary is
       // usually a mistake, but we still let it through — just warn.
       if (event === "REQUEST_CHANGES" && !body.trim()) {
@@ -1266,7 +1266,7 @@ export function PRDetailPage() {
                 defaultEvent={reviewStateToEvent(myReviewState)}
                 onJumpToComment={jumpToDraftComment}
                 onBodyChange={(b) => setBody(prKey, b)}
-                onRemoveComment={(i) => removeComment(prKey, i)}
+                onRemoveComment={(id) => removeComment(prKey, id)}
                 submitting={submit.isPending}
                 onSubmit={(event) => submit.mutate(event)}
               />
@@ -1517,6 +1517,8 @@ export function PRDetailPage() {
             buildContext={buildContext}
             files={fileList}
             headSha={headSha}
+            prTitle={d.title}
+            prUrl={d.html_url}
             onAddComment={(c) => addComment(prKey, c)}
             onPostComment={(c) =>
               executeAiAction({
@@ -1733,7 +1735,7 @@ export function PRDetailPage() {
               defaultEvent={reviewStateToEvent(myReviewState)}
               onJumpToComment={jumpToDraftComment}
               onBodyChange={(b) => setBody(prKey, b)}
-              onRemoveComment={(i) => removeComment(prKey, i)}
+              onRemoveComment={(id) => removeComment(prKey, id)}
               submitting={submit.isPending}
               onSubmit={(event) => submit.mutate(event)}
             />

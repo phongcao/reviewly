@@ -1,4 +1,12 @@
-import { type GuidedStep, type TourLayer, groupTourStops, verdictDisplay } from "@/lib/guided";
+import {
+  type GuidedStep,
+  type TourLayer,
+  activeLayerPos,
+  groupTourStops,
+  layerReadCounts,
+  tourLayerIndex,
+  verdictDisplay,
+} from "@/lib/guided";
 import { describe, expect, it } from "vitest";
 
 /**
@@ -146,5 +154,67 @@ describe("groupTourStops", () => {
     const groups = groupTourStops([0, 1, 2], mixed, layers);
     expect(groups.map((g) => g.layer?.id ?? null)).toEqual(["l1", null, "l2"]);
     expect(groups.map((g) => g.start)).toEqual([0, 1, 2]);
+  });
+});
+
+describe("tourLayerIndex", () => {
+  const step = (layerId?: string): GuidedStep => ({
+    path: "a.ts",
+    line: 1,
+    kind: "orient",
+    title: "t",
+    detail: "d",
+    ...(layerId ? { layerId } : {}),
+  });
+  const layer = (id: string, index: number): TourLayer => ({
+    id,
+    title: id,
+    index,
+    total: 3,
+    steps: 2,
+  });
+  const layers = [layer("l1", 1), layer("l2", 2), layer("l3", 3)];
+  const steps = [step("l1"), step("l1"), step("l2"), step("l2"), step("l3"), step("l3")];
+
+  it("heads each layer's first visible stop and counts visible stops per layer", () => {
+    const idx = tourLayerIndex([0, 1, 2, 3, 4, 5], steps, layers);
+    expect([...idx.layerHeads.entries()].map(([i, l]) => [i, l.id])).toEqual([
+      [0, "l1"],
+      [2, "l2"],
+      [4, "l3"],
+    ]);
+    expect(Object.fromEntries(idx.layerCounts)).toEqual({ l1: 2, l2: 2, l3: 2 });
+    expect(idx.collapsibleIds).toEqual(["l1", "l2", "l3"]);
+  });
+
+  it("follows what is visible: a hidden first stop moves the heading, an emptied layer drops it", () => {
+    const idx = tourLayerIndex([1, 4, 5], steps, layers);
+    expect([...idx.layerHeads.keys()]).toEqual([1, 4]);
+    expect(Object.fromEntries(idx.layerCounts)).toEqual({ l1: 1, l3: 2 });
+    expect(idx.collapsibleIds).toEqual(["l1", "l3"]);
+  });
+
+  it("has no headings for a classic tour", () => {
+    const idx = tourLayerIndex([0, 1], [step(), step()], undefined);
+    expect(idx.layerHeads.size).toBe(0);
+    expect(idx.groups).toEqual([{ layer: null, items: [0, 1], start: 0 }]);
+    expect(idx.collapsibleIds).toEqual([]);
+  });
+
+  it("counts read stops per layer among the visible ones only", () => {
+    const read = layerReadCounts([0, 2, 3], steps, new Set([0, 1, 3]));
+    expect(Object.fromEntries(read)).toEqual({ l1: 1, l2: 1 });
+  });
+
+  it("places the cursor inside its layer", () => {
+    const { layerById } = tourLayerIndex([0, 1, 2, 3, 4, 5], steps, layers);
+    expect(activeLayerPos(layerById, [0, 1, 2, 3, 4, 5], steps, 3)).toEqual({
+      activeLayer: layers[1],
+      layerPos: 2,
+    });
+    expect(activeLayerPos(new Map(), [0], [step()], 0)).toEqual({
+      activeLayer: undefined,
+      layerPos: 0,
+    });
   });
 });

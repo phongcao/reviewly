@@ -52,7 +52,7 @@ export const layersKey = (prKey: string): string => `${LAYERS_KEY_PREFIX}${prKey
 
 const RISKS = new Set<LayerRisk>(["low", "medium", "high"]);
 
-function toRisk(v: unknown): LayerRisk {
+export function toRisk(v: unknown): LayerRisk {
   const s = typeof v === "string" ? v.toLowerCase().trim() : "";
   if (RISKS.has(s as LayerRisk)) return s as LayerRisk;
   // Near-misses, then a neutral default — a layer never disappears over a bad
@@ -245,6 +245,9 @@ export interface FileClass {
 
 const has = (path: string, re: RegExp) => re.test(path);
 
+/** Files that are UI components whatever folder they sit in. */
+const UI_COMPONENT = /\.(tsx|jsx|vue|svelte)$/;
+
 /**
  * Buckets in CLASSIFICATION order — a file lands in the first one that matches,
  * so the narrow rules (a generated file, a test) come before the broad ones (a
@@ -323,8 +326,13 @@ const BUCKETS: Bucket[] = [
     focus: ["Inputs are validated", "Auth and error paths are unchanged unless intended"],
     risk: "high",
     rank: 40,
+    // A component file under `routes/` or `pages/` is a frontend page built
+    // from the UI layer, not a backend surface the UI calls — read it with the
+    // UI, after the components it imports. Backend routes, handlers, and
+    // commands (`.ts`, `.py`, `.rs`, …) stay here.
     match: (p) =>
-      has(p, /(^|\/)(api|routes?|controllers?|handlers?|endpoints?|resolvers?|commands?)\//),
+      has(p, /(^|\/)(api|routes?|controllers?|handlers?|endpoints?|resolvers?|commands?)\//) &&
+      !has(p, UI_COMPONENT),
   },
   {
     id: "ui",

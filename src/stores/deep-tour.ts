@@ -56,6 +56,20 @@ export interface DeepTourEntry {
    * tour" in the layered view). The tour jumps to its first stop as soon as the
    * batch is in, then clears this — it's a one-shot intent, not a selection. */
   focusLayerId?: string;
+  /** Whole-PR summary written from the landed layers' results once every
+   * layer is in — see `buildDeepSummarySystem`. Valid only while `headSha` and
+   * `basis` still match the entry (`synthesisFresh`): a push or a regenerated
+   * layer makes it describe a tour that no longer exists. */
+  synthesis?: DeepSynthesis;
+}
+
+export interface DeepSynthesis {
+  summary: string;
+  verdictReason: string;
+  headSha: string;
+  generatedAt: number;
+  /** `synthesisBasis(byLayer)` when it was written. */
+  basis: string;
 }
 
 /** Keep at most this many deep tours so the persisted kv row stays bounded.
@@ -73,6 +87,8 @@ interface State {
     plan: GuidedPlan,
     meta: { headSha: string; provider: string },
   ) => void;
+  /** Store a whole-PR synthesis. Dropped if the tour moved to another head. */
+  setSynthesis: (key: string, synthesis: DeepSynthesis) => void;
   /** Forget one layer's batch, so it can be regenerated. */
   dropLayer: (key: string, layerId: string) => void;
   reset: (key: string) => void;
@@ -162,6 +178,12 @@ export const useDeepTour = create<State>()(
             },
           },
         });
+      },
+
+      setSynthesis: (key, synthesis) => {
+        const cur = get().byPr[key];
+        if (!cur || (cur.headSha && synthesis.headSha !== cur.headSha)) return;
+        set({ byPr: { ...get().byPr, [key]: { ...cur, synthesis } } });
       },
 
       dropLayer: (key, layerId) => {

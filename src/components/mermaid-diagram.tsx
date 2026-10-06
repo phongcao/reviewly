@@ -34,12 +34,30 @@ function renderDiagram(id: string, text: string, theme: "light" | "dark"): Promi
       fontFamily: fontFamily || undefined,
       // Throw on bad syntax instead of injecting mermaid's error SVG into <body>.
       suppressErrorRendering: true,
+      // Labels are measured in a scratch node under <body> but shown inside
+      // whatever hosts the diagram, so pin the inherited text metrics on the
+      // labels themselves — otherwise body's letter-spacing sizes the boxes,
+      // the host's (`.prose-mermaid` resets it) lays out the text, and a
+      // label that just fit wraps onto a line its box has no room for.
+      themeCSS: "foreignObject > div, text { letter-spacing: normal; font-weight: 300; }",
     });
     const { svg } = await mermaid.render(id, text);
     return svg;
   });
   queue = run.catch(() => undefined);
   return run;
+}
+
+let exportSeq = 0;
+
+/**
+ * Render mermaid source to an SVG string outside the React tree — for a
+ * diagram embedded in an exported page. Same serialized renderer and the same
+ * `securityLevel: "strict"` as the in-app diagrams.
+ */
+export function renderMermaidSvg(text: string, theme: "light" | "dark" = "light"): Promise<string> {
+  exportSeq += 1;
+  return renderDiagram(`mermaid-export-${exportSeq}`, text, theme);
 }
 
 function readScheme(): "light" | "dark" {

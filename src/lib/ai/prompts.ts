@@ -8,6 +8,7 @@
  */
 import type { CountBand, PrSize } from "@/lib/ai/budget";
 import type { LayerScopeInfo } from "@/lib/ai/context";
+import type { GuidedStep } from "@/lib/guided";
 
 export interface GuidedPromptOpts {
   /** How many stops to ask for — from `stepBudget`. */
@@ -17,6 +18,41 @@ export interface GuidedPromptOpts {
   /** Set when this call tours ONE layer of a fanned-out deep tour. */
   layer?: LayerScopeInfo;
 }
+
+/**
+ * A plain-language writing standard (about 80% of ASD-STE100), shared by every
+ * prompt whose output a reviewer reads as a claim about the code.
+ *
+ * The point is checkability, not tone. A sentence with one claim, a named
+ * actor, and the identifier in backticks is one `verify.ts` can grade and a
+ * claim check can split; "the flow is streamlined to be more robust" is
+ * neither. Callers scope it to named fields, because the same model output
+ * also carries text (a suggested PR comment, a chat answer) written for a
+ * person, where this register reads as curt.
+ */
+export const STE_STYLE_CLAUSE = `## Writing style (about 80% of ASD-STE100)
+- One claim per sentence. At most ~20 words per sentence.
+- Active voice, present tense: "\`Session\` retries the request", not "the request is retried".
+- Name the actor. Put every identifier, literal value, route, and config key in backticks,
+  copied verbatim from the code. Code names are allowed as technical names.
+- State numbers as the literal in the code: "\`MAX_RETRIES\` is \`3\`", not "a few retries".
+- No hedges or filler: never "essentially", "basically", "simply", "should help",
+  "more robust", "streamlines", "improves", "cleans up".
+- Use one word for one meaning. Do not switch between synonyms for the same thing.`;
+
+/**
+ * A looser version of `STE_STYLE_CLAUSE` for a tour stop's `detail`.
+ *
+ * A detail explains: why the reader is at this stop, and what follows from the
+ * code there. "One claim per sentence" and the 20-word cap strip out exactly
+ * that, the "so" and "because" between two facts, and leave a list of facts
+ * that is short but hard to follow. The rules that keep a sentence checkable
+ * (backticks, literal numbers, active voice, no hedges) still apply.
+ */
+export const DETAIL_STYLE_CLAUSE = `Each step's "detail" uses a looser version of this style, because it explains rather than states one fact:
+- Up to 4 sentences, usually 2 or 3. A sentence may join one fact to its cause or effect: "\`Session\` now owns the retry loop, so callers no longer retry."
+- The first sentence says why this stop matters, or how it connects to the stop before it.
+- The rules on backticks, literal numbers, active voice, and hedges still apply. The one-claim and ~20-word limits do not.`;
 
 /** Guided-tour system prompt — drives the narrated, sequenced PR walkthrough. */
 export function buildGuidedSystem(o: GuidedPromptOpts): string {
@@ -53,9 +89,14 @@ A "concern" is a claim you are CERTAIN of and can point to on a specific changed
 ## Size of this change
 ${o.size.shownFiles} of ${o.size.files} changed files are visible to you (~${o.size.shownChurn} changed lines). Size the tour to that: ${o.steps.min} to ${o.steps.max} stops. Cover every visible file that carries real change — do not stop early because the tour "feels long enough", and do not pad a small change to reach the number.
 
+${STE_STYLE_CLAUSE}
+Apply this style to "summary", "tour", "verdictReason", and each step's "title". A "title" is at most 8 words.
+${DETAIL_STYLE_CLAUSE}
+Do NOT apply either style to "suggestion": that is a comment to the PR author and may read naturally.
+
 ## Output
 Return ONLY a single JSON object — no prose, no markdown fence. Shape:
-{"summary":"one sentence: what this PR does","tour":"1-2 sentences: the reading strategy — where to start and why this order","verdict":"approve"|"request_changes"|"comment","verdictReason":"one sentence: WHY this verdict — what makes it mergeable, or the single concrete thing that blocks it","steps":[{"path":"path/to/file","line":<new-file line that exists in the diff>,"endLine":<optional last line of the relevant range>,"kind":"orient"|"concern"|"question"|"praise","title":"short human title for this stop","detail":"what this code does and why we're looking here, in the flow of the story (1-3 sentences, markdown ok); for a concern or question, quote the exact diff line(s) that justify it","suggestion":"OPTIONAL ready-to-post review comment — ONLY when this stop genuinely deserves one"}]}
+{"summary":"one sentence: what this PR does","tour":"1-2 sentences: the reading strategy — where to start and why this order","verdict":"approve"|"request_changes"|"comment","verdictReason":"one sentence: WHY this verdict — what makes it mergeable, or the single concrete thing that blocks it","steps":[{"path":"path/to/file","line":<new-file line that exists in the diff>,"endLine":<optional last line of the relevant range>,"kind":"orient"|"concern"|"question"|"praise","title":"short human title for this stop","detail":"what this code does and why we're looking here, in the flow of the story (up to 4 sentences, markdown ok); for a concern or question, quote the exact diff line(s) that justify it","suggestion":"OPTIONAL ready-to-post review comment — ONLY when this stop genuinely deserves one"}]}
 Rules:
 - "summary" is a plain one-sentence statement of what the PR does — no greeting, never address the reader by name, no "this PR" padding if avoidable.
 - "verdict" is REQUIRED — ALWAYS include it, and ALWAYS include a one-sentence "verdictReason". "verdict" is your overall recommendation: "approve" if you'd merge as-is, "request_changes" only if a CERTAIN, diff-grounded concern should block (a diff-evident removal of a security / correctness control, or a breaking change to a signature you can see changed, both qualify), else "comment". It seeds the reviewer's verdict; they decide. Never let an unverifiable or out-of-diff worry drive "request_changes".
@@ -133,6 +174,9 @@ A reviewer landing on layer 3 should never have to say "wait, what is this type?
 - "intent": 1-2 sentences — what this layer changes AND why it belongs at this position in the order.
 - "focus": 1-3 SHORT, concrete things to verify while reading THIS layer, grounded in what these specific files actually change. "The retry loop can't run unbounded" is useful; "check for bugs", "make sure it's correct", "verify tests pass" are noise — omit them rather than pad. Do not state a defect as fact; you have not reviewed the code.
 - "risk": how much attention the layer needs — "high" (subtle, security-adjacent, or hard to undo), "medium" (normal reading), "low" (skim).
+
+${STE_STYLE_CLAUSE}
+Apply this style to "summary", "strategy", each layer's "intent", and each "focus" item.
 
 ## Output
 Return ONLY a single JSON object — no prose, no markdown fence. Shape:
@@ -225,6 +269,353 @@ Return ONLY a single JSON object — no prose, no markdown fence:
 \`\`\`diff
 ${o.patch}
 \`\`\``;
+}
+
+/**
+ * Whole-PR summary of a finished deep tour, written from the layers' own
+ * results.
+ *
+ * Until this runs, a deep tour's opening sentence is the layer planner's — and
+ * the planner wrote it from the file list and a budget-limited diff, before
+ * any layer was read. Neither the tour pane nor the exported report should
+ * open on that. This call sees no diff at all: only what the layer tours
+ * concluded, so the summary can restate their findings and cannot add new ones.
+ */
+export function buildDeepSummarySystem(): string {
+  return `You are writing the opening summary of a code review that was done layer by layer. Each layer of the pull request was toured separately; their results are below under "# Layer results". You see no code and no diff.
+
+## Rules
+- Restate only what the layer results say. Add no new facts, names, or numbers.
+- Name only identifiers that appear verbatim in the layer results.
+- "summary": what the whole pull request does, in one or two sentences.
+- "verdictReason": one sentence that explains the combined verdict given under "# Combined verdict", using the layer results.
+- If the layer results disagree, say what each says. Do not resolve the disagreement.
+
+${STE_STYLE_CLAUSE}
+Apply this style to "summary" and "verdictReason".
+
+## Output
+Return ONLY a single JSON object — no prose, no markdown fence:
+{"summary":"one or two sentences","verdictReason":"one sentence"}`;
+}
+
+/** Most README characters the map planner sees. */
+export const REPO_MAP_README_CHARS = 4_000;
+/** Most characters per manifest file the map planner sees. */
+export const REPO_MAP_MANIFEST_CHARS = 3_000;
+
+/**
+ * Codebase-map planner: groups a repository's modules into layers to read in
+ * order, and names its entry points.
+ *
+ * It runs WITHOUT a clone (no `cwd`). Everything it needs — the modules, the
+ * computed import links, the computed order, the README and manifests — is
+ * in the prompt, which keeps it fast and makes the same repository map the
+ * same way twice. Structure and order are given, not asked for: the model's
+ * job is to name and group what was computed.
+ */
+export function buildRepoMapSystem(o: { layers: CountBand; modules: number }): string {
+  return `You are a senior engineer preparing a guided introduction to a repository for a new teammate. The repository has already been cut into modules (directories), and the import links between modules and a dependency-ordered reading sequence have been COMPUTED from the code. Your job is to GROUP the modules into layers that a newcomer reads one at a time, NAME each layer, and pick the ENTRY POINTS where execution starts.
+
+## Rules you cannot break
+- Every module id under "## Modules" goes in EXACTLY ONE layer. Copy ids verbatim.
+- ${o.layers.min} to ${o.layers.max} layers for ${o.modules} modules.
+- Keep the computed order under "## Computed reading order" unless you have a stated reason to change it. If you change it, say why in "strategy".
+- Entry points: 1 to 5. Each "path" is copied verbatim from a file name listed under a module. Prefer where execution starts: a main function, a server or app bootstrap, a CLI, a route table.
+- Say only what the module names, file names, README, manifests, and links show. You have not read the code.
+
+## Fields
+- "summary": what the repository is and does, in 1-2 sentences.
+- "strategy": 1-2 sentences on why the layers are in this order.
+- "title": 2-4 words naming the idea of the layer, not the folder.
+- "intent": 1-2 sentences on what the layer holds and why it is read at this position.
+- "focus": 1-3 concrete things to learn in this layer.
+- "risk": how much care a newcomer needs here — "high" (subtle, security-adjacent, or central), "medium", "low".
+
+${STE_STYLE_CLAUSE}
+Apply this style to "summary", "strategy", each "why", "intent", and each "focus" item.
+
+## Output
+Return ONLY a single JSON object — no prose, no markdown fence:
+{"summary":"…","strategy":"…","entryPoints":[{"path":"path/from/a/module","why":"…"}],"layers":[{"title":"…","intent":"…","focus":["…"],"risk":"low"|"medium"|"high","modules":["module id"]}]}`;
+}
+
+/** The input to `buildRepoMapSystem`: computed facts plus the README and
+ * manifests, and no other file contents. */
+export function repoMapInput(o: {
+  modules: { id: string; lines: number; files: string[]; langs: string[] }[];
+  edges: { from: string; to: string; count: number }[];
+  order: string[][];
+  readme: string | null;
+  manifests: { path: string; text: string }[];
+}): string {
+  const mods = o.modules
+    .map((m) => {
+      const shown = m.files.slice(0, 15);
+      const more = m.files.length - shown.length;
+      return `- ${m.id} (${m.lines} lines${m.langs.length ? `; ${m.langs.slice(0, 3).join(", ")}` : ""})\n${shown
+        .map((f) => `  - ${f}`)
+        .join("\n")}${more > 0 ? `\n  - … ${more} more files` : ""}`;
+    })
+    .join("\n");
+  const links = o.edges.length
+    ? o.edges.map((e) => `- ${e.from} → ${e.to} (${e.count} imports)`).join("\n")
+    : "(none found — links come from the top of each file, in TS/JS and Python only)";
+  const order = o.order.map((unit, i) => `${i + 1}. ${unit.join(" + ")}`).join("\n");
+  const readme = o.readme
+    ? `\n\n## README (first ${REPO_MAP_README_CHARS} characters)\n${o.readme.slice(0, REPO_MAP_README_CHARS)}`
+    : "";
+  const manifests = o.manifests
+    .map(
+      (m) =>
+        `\n\n## ${m.path} (first ${REPO_MAP_MANIFEST_CHARS} characters)\n${m.text.slice(0, REPO_MAP_MANIFEST_CHARS)}`,
+    )
+    .join("");
+  return `## Modules\n${mods}\n\n## Import links (from → to: "to" imports "from")\n${links}\n\n## Computed reading order (foundations first; "+" joins a cycle)\n${order}${readme}${manifests}`;
+}
+
+/** Ask the agent to verify ONE concern against the repo it runs in. Needs a
+ * clone: a concern is usually about code outside the diff, and with only the
+ * diff the agent would be judging the claim on the same bytes that produced it. */
+export function buildConcernCheckPrompt(step: GuidedStep): string {
+  const loc = `${step.path}:${step.line}${step.endLine ? `-${step.endLine}` : ""}`;
+  return [
+    "You are verifying ONE code-review concern against the actual repository in this working directory. Read the relevant files to check it — don't guess.",
+    "",
+    `Concern (${step.kind}) at ${loc}`,
+    `Title: ${step.title}`,
+    step.detail ? `Details: ${step.detail}` : "",
+    step.suggestion ? `Proposed review comment: ${step.suggestion}` : "",
+    "",
+    "Decide:",
+    '- "resolved": NOT worth raising — false alarm, already handled, or not actually an issue.',
+    '- "valid": a real concern worth a comment.',
+    "",
+    "Reply with ONLY a single-line JSON object — no prose, no code fences:",
+    '{"verdict":"resolved"|"valid","finding":"<1-2 sentences; if valid, a sharp ready-to-post comment>"}',
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+/**
+ * The verdict rubric shared by both claim checks.
+ *
+ * `misplaced` exists because a stop can describe real behavior and cite the
+ * wrong line for it. With only three verdicts the checker filed that as
+ * "contradicted", which disputes a true stop. Before contradicting a claim about
+ * how a value is used, the checker must look for that use, because a checker
+ * that only reads the cited line misses a read one layer away (an API client,
+ * a mapper). Like the tour, the checker may not claim absence it never searched for.
+ */
+function claimVerdicts(canSearch: boolean): string {
+  const search = canSearch
+    ? '\n   Before you answer "contradicted" on a claim about how code is used (who reads, calls, stores or shows a value), search the checkout for that behavior itself, not just the place the claim names. Follow the value through the code between the places, such as API clients, mappers and serializers. If you find it, the verdict is "misplaced", not "contradicted".'
+    : "";
+  return `2. Give each claim a verdict:
+   - "supported": a line you can see shows it. Cite that line.
+   - "misplaced": the behavior the claim describes is real, but it happens somewhere other than the file, line or expression the claim names. Cite where it actually happens, and say in "note" what the named place does instead.
+   - "contradicted": a line you can see shows something else. Cite it, and say in "note" what it shows.
+   - "unverifiable": no code you can see settles it.${search}
+   Never write that something is "never read", "never called", "unused" or "not used" unless you searched for it. If you did, name the search in "note".`;
+}
+
+/** Most claims one check returns. A stop is a title plus up to 4 sentences,
+ * each a fact and perhaps its effect; past eight, the model is splitting hairs
+ * or restating the code line by line. */
+export const MAX_CLAIMS = 8;
+
+/**
+ * Claim-by-claim check of ONE tour stop, in a fresh context.
+ *
+ * The input is deliberately narrow: the stop's own text and the file's patch,
+ * and nothing else from the tour — no summary, no verdict, no neighbouring
+ * stops, no layer plan. A checker that can see the story the stop belongs to
+ * grades the story's coherence, not the stop's truth, and inherits the very
+ * framing it is meant to audit.
+ *
+ * It works without a clone because the patch carries the evidence for most
+ * orient stops; a clone only widens what can be cited.
+ */
+export function buildClaimCheckPrompt(o: {
+  path: string;
+  line: number;
+  endLine?: number;
+  title: string;
+  detail: string;
+  /** The anchored file's unified diff. */
+  patch: string | null;
+  /** True when a local checkout is available to read beyond the diff. */
+  clone: boolean;
+  /** For a codebase-tour stop: the anchored file's text around the anchor,
+   * instead of a patch. `startLine` is the 1-based line of `text`'s first
+   * line. There is no change, only the file. */
+  file?: { text: string; startLine: number };
+}): string {
+  const loc = `${o.path}:${o.line}${o.endLine ? `-${o.endLine}` : ""}`;
+  if (o.file) return claimCheckOnFile({ ...o, file: o.file, loc });
+  const see = o.clone
+    ? "You are running inside a local checkout of the repository and may read files in it. The checkout may not be at the pull request's head commit: if a file disagrees with the diff below, trust the diff."
+    : 'There is NO checkout. You can see ONLY the diff below. Code outside it is invisible to you: a claim about it is "unverifiable", never "contradicted".';
+  const cite = o.clone
+    ? "Cite new-file line numbers from the diff (the `+` side of the `@@` header), or a `path:line` you actually read in the checkout."
+    : "Cite new-file line numbers from the diff (the `+` side of the `@@` header).";
+  return `You are checking ONE explanation of a code change against the code. You did not write this explanation. Do not trust it. Check it.
+
+## The explanation
+Anchored at ${loc}.
+Title: ${o.title}
+Detail: ${o.detail || "(none)"}
+
+## What you can see
+${see}
+
+## What to do
+1. Split the title and detail into at most ${MAX_CLAIMS} atomic factual claims. One claim states one fact about the code. Skip claims that only say where to look ("start here", "read this next").
+${claimVerdicts(o.clone)}
+3. Never give "supported", "misplaced" or "contradicted" without a cited line. ${cite}
+4. If the explanation makes no factual claims, return an empty "claims" array.
+
+## Output
+Return ONLY a single JSON object — no prose, no markdown fence:
+{"claims":[{"text":"…","verdict":"supported"|"misplaced"|"contradicted"|"unverifiable","path":"${o.path}","line":0,"note":"one clause, at most 20 words"}]}
+
+# The file's diff
+\`\`\`diff
+${o.patch ?? "(no patch text: binary or too large)"}
+\`\`\``;
+}
+
+/** The claim check for a repository stop: same rules, but the evidence is the
+ * file at `HEAD` with line numbers, and the checker runs in the clone. */
+function claimCheckOnFile(o: {
+  title: string;
+  detail: string;
+  path: string;
+  loc: string;
+  file: { text: string; startLine: number };
+}): string {
+  const numbered = o.file.text
+    .split("\n")
+    .map((l, i) => `${String(o.file.startLine + i).padStart(5)}  ${l}`)
+    .join("\n");
+  return `You are checking ONE explanation of code against the code. You did not write this explanation. Do not trust it. Check it.
+
+## The explanation
+Anchored at ${o.loc}.
+Title: ${o.title}
+Detail: ${o.detail || "(none)"}
+
+## What you can see
+You are running inside a checkout of the repository and may read files in it. The anchored file's lines around the anchor are below, with their line numbers.
+
+## What to do
+1. Split the title and detail into at most ${MAX_CLAIMS} atomic factual claims. One claim states one fact about the code. Skip claims that only say where to look ("start here", "read this next").
+${claimVerdicts(true)}
+3. Never give "supported", "misplaced" or "contradicted" without a cited line. Cite the line numbers shown below, or a \`path:line\` you actually read in the checkout.
+4. If the explanation makes no factual claims, return an empty "claims" array.
+
+## Output
+Return ONLY a single JSON object — no prose, no markdown fence:
+{"claims":[{"text":"…","verdict":"supported"|"misplaced"|"contradicted"|"unverifiable","path":"${o.path}","line":0,"note":"one clause, at most 20 words"}]}
+
+# ${o.path}
+\`\`\`
+${numbered}
+\`\`\``;
+}
+
+/**
+ * One layer of a codebase tour: a senior engineer onboarding a teammate, run
+ * inside the clone (the model reads the files itself). Not a review — no
+ * verdict, no suggested comments — so the prompt keeps only the grounding
+ * rules that apply to a repository: anchor to real lines, never invent a
+ * symbol, name only what was read.
+ */
+export function buildCodebaseTourSystem(o: {
+  layer: {
+    title: string;
+    intent: string;
+    focus: string[];
+    index: number;
+    total: number;
+    modules: { id: string; files: string[] }[];
+  };
+  map: { summary: string };
+  /** Layer titles this one imports from, and that import it. */
+  neighbors: { uses: string[]; usedBy: string[] };
+  steps: CountBand;
+}): string {
+  const mods = o.layer.modules
+    .map((m) => `- ${m.id}\n${m.files.map((f) => `  - ${f}`).join("\n")}`)
+    .join("\n");
+  return `You are a senior engineer onboarding a new teammate to a codebase. You are touring ONE layer of it: "${o.layer.title}" (layer ${o.layer.index + 1} of ${o.layer.total}). This is NOT a code review: give no verdict and no suggested comments. Explain what the code is and how it fits together.
+
+## The repository
+${o.map.summary || "(no summary)"}
+
+## This layer
+${o.layer.intent}
+${o.layer.focus.length ? `What to learn here:\n${o.layer.focus.map((f) => `- ${f}`).join("\n")}\n` : ""}
+Its modules and files:
+${mods}
+
+## How it connects
+- This layer uses: ${o.neighbors.uses.join(", ") || "(no other layer)"}
+- Used by: ${o.neighbors.usedBy.join(", ") || "(no other layer)"}
+
+## How to work
+- You are running inside a checkout of the repository. Read the files above yourself. Read a caller or a dependency outside this layer when it explains this one.
+- Anchor every stop to a "path" + "line" that EXIST in the file at its current commit. Use "endLine" for a range. Prefer definitions — types, signatures, entry points, configuration — over the middle of a function body.
+- Each "orient" stop says what the code is, what calls it, and what it calls.
+- NEVER invent or recall a symbol. Name a class, function, file, route, constant, or config key only when you read it, and copy it verbatim. Only claim to have checked what you actually opened.
+- Kinds: "orient" (the default) explains; "question" asks a design question the code does not answer; "concern" is a PITFALL — a trap a newcomer would fall into, proven by a line you read. No "praise".
+- ${o.steps.min} to ${o.steps.max} stops, in reading order. Stop when the layer is covered; do not pad.
+
+${STE_STYLE_CLAUSE}
+Apply this style to "summary", "tour", and each step's "title". A "title" is at most 8 words.
+${DETAIL_STYLE_CLAUSE}
+
+## Output
+Return ONLY a single JSON object — no prose, no markdown fence:
+{"summary":"one sentence: what this layer does","tour":"1-2 sentences: the reading order within it","steps":[{"path":"path/to/file","line":<line that exists>,"endLine":<optional>,"kind":"orient"|"question"|"concern","title":"…","detail":"…"}]}
+Return the JSON object only.`;
+}
+
+/**
+ * A question tour: "how does X work?" answered as a short tour that traces
+ * the answer through the code, run in the clone.
+ *
+ * The no-answer rule is the load-bearing one. A model asked a question will
+ * produce an answer; one about something the repository doesn't do is a
+ * fabrication with line numbers attached. So "not found" is an explicit,
+ * valid output, and it must say what was searched for, so the reader can
+ * judge the search rather than trust a shrug.
+ */
+export function buildQuestionTourSystem(o: { question: string; map: { summary: string } }): string {
+  return `You are a senior engineer answering a teammate's question about a codebase by walking them through the code. You are running inside a checkout of the repository: search and read the files yourself.
+
+## The question
+${o.question}
+
+## The repository
+${o.map.summary || "(no summary)"}
+
+## How to answer
+- Trace the answer as an EXECUTION PATH: from where it starts (an entry point, a route, a handler, a command) to where the effect happens.
+- 3 to 10 stops, in execution order. Each stop is anchored to a "path" + "line" that EXIST in the file. Use "endLine" for a range.
+- Give an "answer" of 2 to 4 sentences BEFORE the steps.
+- NEVER invent or recall a symbol. Name a function, file, route, or config key only when you read it, and copy it verbatim.
+- If the code does not answer the question, return an EMPTY "steps" array. Then "answer" says what you searched for (the terms and the files you read) and that nothing conclusive was found. Do not guess. An honest "not found" is a correct answer.
+- Kinds: "orient" (the default); "question" for a step where the code leaves the answer open; "concern" for a pitfall on this path, proven by a line you read.
+
+${STE_STYLE_CLAUSE}
+Apply this style to "answer", and to each step's "title".
+${DETAIL_STYLE_CLAUSE}
+
+## Output
+Return ONLY a single JSON object — no prose, no markdown fence:
+{"answer":"2-4 sentences","steps":[{"path":"path/to/file","line":<line that exists>,"endLine":<optional>,"kind":"orient"|"question"|"concern","title":"…","detail":"…"}]}`;
 }
 
 /** Free-form review-chat system prompt — supports the <action> post protocol. */

@@ -8,6 +8,7 @@ import {
 import { useDeepTour } from "@/stores/deep-tour";
 import { useGuided } from "@/stores/guided";
 import { useLayers } from "@/stores/layers";
+import { useStepChecks } from "@/stores/step-checks";
 import { useViewedFiles } from "@/stores/viewed-files";
 import { beforeEach, describe, expect, it } from "vitest";
 
@@ -37,6 +38,7 @@ beforeEach(() => {
   useLayers.setState({ byPr: {} });
   useGuided.setState({ byPr: {} });
   useViewedFiles.setState({ viewed: {} });
+  useStepChecks.setState({ byKey: {} });
 });
 
 describe("parseBundle", () => {
@@ -126,5 +128,47 @@ describe("bundleStats", () => {
       }),
     );
     expect(s).toMatchObject({ prs: 2, deepTours: 2, layerPlans: 1, deepStops: 2 });
+  });
+});
+
+describe("checks in a bundle", () => {
+  const record = (checkedAt: number) => ({
+    type: "claims" as const,
+    result: "supported" as const,
+    claims: [{ text: "x", verdict: "supported" as const, path: "a.ts", line: 1, note: "" }],
+    checkedAt,
+    provider: "claude",
+  });
+
+  it("round-trips through parse and apply", () => {
+    const raw = JSON.stringify(
+      bundle({
+        "o/r#1": {
+          deepTour: deepEntry(100),
+          checks: { "o/r#1@abc123": { "#a.ts:1:t": record(5) } },
+        },
+      }),
+    );
+    const parsed = parseBundle(raw);
+    expect(parsed.prs["o/r#1"].checks?.["o/r#1@abc123"]["#a.ts:1:t"].checkedAt).toBe(5);
+    const r = applyBundle(parsed);
+    expect(r.checks).toBe(1);
+    expect(useStepChecks.getState().byKey["o/r#1@abc123"]["#a.ts:1:t"]).toEqual(record(5));
+  });
+
+  it("keeps a newer local check over an older imported one", () => {
+    useStepChecks.getState().set("o/r#1@abc123", "#a.ts:1:t", record(9));
+    const r = applyBundle(
+      bundle({ "o/r#1": { checks: { "o/r#1@abc123": { "#a.ts:1:t": record(5) } } } }),
+    );
+    expect(r.checks).toBe(0);
+    expect(useStepChecks.getState().byKey["o/r#1@abc123"]["#a.ts:1:t"].checkedAt).toBe(9);
+  });
+
+  it("still imports a bundle written before checks existed", () => {
+    const raw = JSON.stringify(bundle({ "o/r#1": { deepTour: deepEntry(100) } }));
+    const r = applyBundle(parseBundle(raw));
+    expect(r.deepTours).toBe(1);
+    expect(r.checks).toBe(0);
   });
 });

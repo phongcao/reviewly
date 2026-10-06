@@ -77,6 +77,86 @@ export function groupTourStops(
   return out;
 }
 
+/** Everything the tour rail and reading pane need to know about a layered
+ * tour's visible stops, derived once per change of what's on screen. */
+export interface TourLayerIndex {
+  layerById: Map<string, TourLayer>;
+  /** Original step index → the layer heading drawn above it. Keyed off the
+   * VISIBLE order, so a filter that empties a layer drops its heading too, and
+   * a layer split by the filter still heads each run it survives in. */
+  layerHeads: Map<number, TourLayer>;
+  /** Visible stops per layer — the denominator of the layer-relative counter,
+   * and the "N stops" on each heading. */
+  layerCounts: Map<string, number>;
+  /** The rail's per-layer runs (`groupTourStops`). */
+  groups: TourGroup[];
+  /** Layers with stops ON SCREEN: collapse-all must not fold ids the rail can't
+   * show, and a layer a filter emptied has nothing to fold. */
+  collapsibleIds: string[];
+}
+
+export function tourLayerIndex(
+  visible: number[],
+  steps: GuidedStep[],
+  layers: TourLayer[] | undefined,
+): TourLayerIndex {
+  const layerById = new Map((layers ?? []).map((l) => [l.id, l]));
+  const layerHeads = new Map<number, TourLayer>();
+  if (layers?.length) {
+    let prev: string | undefined;
+    for (const i of visible) {
+      const id = steps[i].layerId;
+      const layer = id ? layerById.get(id) : undefined;
+      if (layer && id !== prev) layerHeads.set(i, layer);
+      prev = id;
+    }
+  }
+  const layerCounts = new Map<string, number>();
+  for (const i of visible) {
+    const id = steps[i].layerId;
+    if (id) layerCounts.set(id, (layerCounts.get(id) ?? 0) + 1);
+  }
+  const groups = groupTourStops(visible, steps, layers);
+  const collapsibleIds = [
+    ...new Set(groups.map((g) => g.layer?.id).filter((id): id is string => !!id)),
+  ];
+  return { layerById, layerHeads, layerCounts, groups, collapsibleIds };
+}
+
+/** Read stops per layer among the visible ones — what a folded rail heading
+ * reports in place of its rows. Separate from `tourLayerIndex` because read
+ * state changes on every cursor move and the rest doesn't. */
+export function layerReadCounts(
+  visible: number[],
+  steps: GuidedStep[],
+  seen: ReadonlySet<number>,
+): Map<string, number> {
+  const done = new Map<string, number>();
+  for (const i of visible) {
+    const id = steps[i].layerId;
+    if (id && seen.has(i)) done.set(id, (done.get(id) ?? 0) + 1);
+  }
+  return done;
+}
+
+/**
+ * Where the cursor sits INSIDE its layer. The global "3 / 40" is the wrong unit
+ * of progress once a tour is layered — the question a reader is actually
+ * asking is whether they're through the layer in front of them.
+ */
+export function activeLayerPos(
+  layerById: ReadonlyMap<string, TourLayer>,
+  visible: number[],
+  steps: GuidedStep[],
+  active: number,
+): { activeLayer?: TourLayer; layerPos: number } {
+  const activeLayer = layerById.get(steps[active]?.layerId ?? "");
+  const layerPos = activeLayer
+    ? visible.filter((i) => i <= active && steps[i].layerId === activeLayer.id).length
+    : 0;
+  return { activeLayer, layerPos };
+}
+
 export interface GuidedPlan {
   /** One sentence: what this PR does. */
   summary: string;

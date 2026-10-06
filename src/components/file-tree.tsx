@@ -31,6 +31,12 @@ interface Props {
    * and (when wired by the parent) the `v` keyboard shortcut on the focused row.
    */
   onToggleViewed?: (path: string, viewed: boolean) => void;
+  /**
+   * `source`: the files are a repository's, not a PR's changes — no status
+   * glyph, no +/− counts, and no "empty / format-only" hiding (there is no diff
+   * to judge them by). Defaults to `diff`.
+   */
+  mode?: "diff" | "source";
 }
 
 interface FileNode {
@@ -176,6 +182,7 @@ export function FileTree({
   viewedKey,
   commentCounts = {},
   onToggleViewed,
+  mode = "diff",
 }: Props) {
   const focusMode = useUi((s) => s.focusMode);
   const [showHidden, setShowHidden] = useState(false);
@@ -193,10 +200,10 @@ export function FileTree({
   // the patch a second time.
   const classified = useMemo(() => {
     return files.map((f) => {
-      const reason = classify(f);
+      const reason = mode === "source" ? null : classify(f);
       return { file: f, reason, cls: classifyFile(f.filename, f, reason) };
     });
-  }, [files]);
+  }, [files, mode]);
 
   const hiddenCount = classified.filter((c) => c.reason !== null).length;
 
@@ -533,6 +540,7 @@ export function FileTree({
                 viewed={Boolean(viewedMap?.[file.filename])}
                 onToggleViewed={effectiveToggleViewed}
                 comments={commentCounts[file.filename] ?? 0}
+                source={mode === "source"}
               />
             );
           })}
@@ -721,6 +729,7 @@ function FileRow({
   viewed,
   onToggleViewed,
   comments,
+  source = false,
 }: {
   rowRef?: React.Ref<HTMLLIElement>;
   file: PullFile;
@@ -734,6 +743,8 @@ function FileRow({
   viewed: boolean;
   onToggleViewed?: (path: string, viewed: boolean) => void;
   comments: number;
+  /** A repository file rather than a change: no status, no +/−. */
+  source?: boolean;
 }) {
   const basename = file.filename.split("/").pop() ?? file.filename;
   const muted = reason !== null || (viewed && !active);
@@ -765,15 +776,17 @@ function FileRow({
         )}
         style={{ paddingLeft: 5 + depth * 10 }}
       >
-        <span
-          className={cn(
-            "flex size-3.5 shrink-0 items-center justify-center rounded-sm text-4xs font-semibold leading-none ring-1 ring-inset ring-border/50",
-            statusTextColor(file.status),
-          )}
-          aria-hidden
-        >
-          {statusLetter(file.status)}
-        </span>
+        {!source && (
+          <span
+            className={cn(
+              "flex size-3.5 shrink-0 items-center justify-center rounded-sm text-4xs font-semibold leading-none ring-1 ring-inset ring-border/50",
+              statusTextColor(file.status),
+            )}
+            aria-hidden
+          >
+            {statusLetter(file.status)}
+          </span>
+        )}
         <span className="min-w-0 flex-1 truncate">{basename}</span>
         <CommentBadge count={comments} />
         {reason ? (
@@ -814,12 +827,16 @@ function FileRow({
             />
           </span>
         )}
-        <span className="hidden shrink-0 text-xs text-success group-hover:inline group-focus-within:inline">
-          +{file.additions}
-        </span>
-        <span className="hidden shrink-0 text-xs text-destructive group-hover:inline group-focus-within:inline">
-          −{file.deletions}
-        </span>
+        {!source && (
+          <>
+            <span className="hidden shrink-0 text-xs text-success group-hover:inline group-focus-within:inline">
+              +{file.additions}
+            </span>
+            <span className="hidden shrink-0 text-xs text-destructive group-hover:inline group-focus-within:inline">
+              −{file.deletions}
+            </span>
+          </>
+        )}
       </button>
       {onToggleViewed && (
         <button

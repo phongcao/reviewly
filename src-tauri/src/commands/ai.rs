@@ -180,6 +180,19 @@ fn add_effort(cmd: &mut Command, effort: Option<&str>) {
     }
 }
 
+/// Limit a Claude run to reading the repo. `--allowedTools` alone only
+/// pre-approves these; it doesn't remove anything, so a user whose permission
+/// mode allows more (e.g. `auto`) let a run use Bash. `--tools` sets the run's
+/// only built-in tools, and `--strict-mcp-config` with no `--mcp-config` drops
+/// the user's MCP servers. `LS` is gone from current CLIs but kept for older ones.
+fn add_read_only_tools(cmd: &mut Command) {
+    cmd.arg("--tools")
+        .arg("Read,Grep,Glob,LS")
+        .arg("--allowedTools")
+        .arg("Read Grep Glob LS")
+        .arg("--strict-mcp-config");
+}
+
 /// The model that did the bulk of a Claude run, from the `modelUsage` map in
 /// `--output-format json|stream-json` results. A run can touch more than one
 /// model (a small helper model runs alongside the main one), so pick the one
@@ -479,7 +492,7 @@ async fn run_claude(
     // the actual code instead of reasoning off the diff alone. Without a clone
     // there's nothing local to explore, so we leave it diff-only.
     if has_repo(cwd) {
-        cmd.arg("--allowedTools").arg("Read Grep Glob LS");
+        add_read_only_tools(&mut cmd);
     }
     apply_cwd(&mut cmd, cwd);
     let mut child = cmd
@@ -1160,7 +1173,7 @@ async fn stream_claude(
     // Same read-only repo access as run_claude: the chat should be able to
     // open what the (budget-limited) diff leaves out.
     if has_repo(cwd) {
-        cmd.arg("--allowedTools").arg("Read Grep Glob LS");
+        add_read_only_tools(&mut cmd);
     }
     apply_cwd(&mut cmd, cwd);
     let mut child = cmd

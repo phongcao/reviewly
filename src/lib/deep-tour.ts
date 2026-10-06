@@ -9,7 +9,7 @@ import { CLONE_ABSENT_CLAUSE, buildGuidedSystem } from "@/lib/ai/prompts";
 import type { GuidedPlan, GuidedStep, GuidedVerdict, TourLayer } from "@/lib/guided";
 import { type LayerPlan, reconcileLayers } from "@/lib/layers";
 import type { PullFile } from "@/lib/tauri";
-import type { DeepTourEntry } from "@/stores/deep-tour";
+import type { DeepSynthesis, DeepTourEntry } from "@/stores/deep-tour";
 import type { TourJob } from "@/stores/deep-tour-gen";
 
 /**
@@ -40,7 +40,77 @@ const SEVERITY: GuidedVerdict[] = ["request_changes", "comment", "approve"];
  * to the ones it already had. Taking only what the merge reads lets the caller
  * memoize on exactly that, so cursor movement stops rebuilding the tour.
  */
-export type TouredLayers = Pick<DeepTourEntry, "plan" | "byLayer">;
+export type TouredLayers = Pick<DeepTourEntry, "plan" | "byLayer"> &
+  Partial<Pick<DeepTourEntry, "headSha" | "synthesis">>;
+
+/**
+ * Background-task key prefix for a deep tour's whole-PR synthesis. Disjoint
+ * from the bare `prKey` (classic tour), `layers:` and `tour:` for the reason
+ * `TOUR_KEY_PREFIX` gives: `ai:done` is broadcast to every listener.
+ */
+export const SYNTH_KEY_PREFIX = "synth:";
+export const synthKey = (prKey: string): string => `${SYNTH_KEY_PREFIX}${prKey}`;
+export const parseSynthKey = (key: string): string | null =>
+  key.startsWith(SYNTH_KEY_PREFIX) && key.length > SYNTH_KEY_PREFIX.length
+    ? key.slice(SYNTH_KEY_PREFIX.length)
+    : null;
+
+/** Which batches a synthesis was written from. A regenerated layer gets a new
+ * `generatedAt`, which changes the basis and retires the synthesis. */
+export const synthesisBasis = (byLayer: DeepTourEntry["byLayer"]): string =>
+  Object.entries(byLayer)
+    .map(([id, b]) => `${id}:${b.generatedAt}`)
+    .sort()
+    .join(",");
+
+/** The synthesis still describes this exact tour: same head, same batches. */
+export function synthesisFresh(entry: TouredLayers): DeepSynthesis | null {
+  const s = entry.synthesis;
+  if (!s) return null;
+  if ((entry.headSha ?? "") !== s.headSha) return null;
+  return s.basis === synthesisBasis(entry.byLayer) ? s : null;
+}
+
+/** Every layer of the tour's own partition has landed — the point at which
+ * a whole-PR summary can speak for the whole PR. */
+export const allLayersToured = (entry: TouredLayers): boolean =>
+  entry.plan.layers.length > 0 && entry.plan.layers.every((l) => !!entry.byLayer[l.id]);
+
+/**
+ * The input to `buildDeepSummarySystem`: each layer's title and intent, and
+ * for each toured layer its summary, verdict, reason, and concern titles. No
+ * diff and no stop details — the synthesis restates conclusions, it does not
+ * re-review.
+ */
+export function deepSummaryInput(entry: TouredLayers): string {
+  const verdicts: { verdict: GuidedVerdict; reason: string; title: string }[] = [];
+  const blocks = entry.plan.layers.map((layer, i) => {
+    const batch = entry.byLayer[layer.id];
+    const head = `## Layer ${i + 1} of ${entry.plan.layers.length}: ${layer.title}\nIntent: ${layer.intent}`;
+    if (!batch) return `${head}\n(not toured)`;
+    if (batch.plan.verdict) {
+      verdicts.push({
+        verdict: batch.plan.verdict,
+        reason: batch.plan.verdictReason?.trim() ?? "",
+        title: layer.title,
+      });
+    }
+    const concerns = batch.plan.steps
+      .filter((s) => s.kind === "concern")
+      .map((s) => `- ${s.title}`);
+    return [
+      head,
+      `Summary: ${batch.plan.summary || "(none)"}`,
+      `Verdict: ${batch.plan.verdict ?? "(none)"}`,
+      `Verdict reason: ${batch.plan.verdictReason || "(none)"}`,
+      concerns.length ? `Concerns:\n${concerns.join("\n")}` : "Concerns: none",
+    ].join("\n");
+  });
+  // Same fold `mergeDeepTour` shows, so the reason explains the verdict the
+  // reviewer actually sees.
+  const combined = aggregateVerdict(verdicts).verdict ?? "(none)";
+  return `# Combined verdict\n${combined}\n\n# Layer results\n${blocks.join("\n\n")}`;
+}
 
 /**
  * Fold the per-layer tours that have landed so far into one `GuidedPlan`.
@@ -98,16 +168,21 @@ export function mergeDeepTour(entry: TouredLayers, files: PullFile[]): GuidedPla
   }
 
   const touredTitles = plan.layers.filter((l) => entry.byLayer[l.id]).map((l) => l.title);
+  const synthesis = synthesisFresh(entry);
+  const verdict = aggregateVerdict(verdicts);
 
   return {
-    // No synthesis call: the layer planner already produced a whole-PR sentence
-    // and an ordering rationale, and paying for another round-trip to rewrite
-    // them would add latency for nothing.
-    summary: plan.summary,
+    // The planner's sentence was written from the file list before any layer
+    // was read. Once every layer is in, a synthesis restates what they found;
+    // prefer it while it still describes these exact batches.
+    summary: synthesis?.summary || plan.summary,
     tour: touredTitles.length
       ? `${plan.strategy} Toured layer by layer: ${touredTitles.join(" → ")}.`
       : plan.strategy,
-    ...aggregateVerdict(verdicts),
+    ...verdict,
+    ...(synthesis?.verdictReason && verdict.verdict
+      ? { verdictReason: synthesis.verdictReason }
+      : {}),
     steps,
     layers,
   };

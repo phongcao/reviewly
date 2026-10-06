@@ -1,4 +1,6 @@
+import { MermaidDiagram } from "@/components/mermaid-diagram";
 import { TooltipFor } from "@/components/tooltip-for";
+import { CodeSpans } from "@/components/tour/code-spans";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { layerBudget } from "@/lib/ai/budget";
@@ -6,7 +8,9 @@ import { type ContextOptions, type ReviewContext, buildLayerContext } from "@/li
 import { buildLayeredSystem } from "@/lib/ai/prompts";
 import { useAiAvailable } from "@/lib/ai/use-ai-available";
 import { useDeepTourRunner } from "@/lib/ai/use-deep-tour";
+import { type EdgeSource, loadEdgeTexts } from "@/lib/edge-sources";
 import { relativeTime } from "@/lib/format";
+import { type LayerEdge, layerEdges, layerMermaid, orderViolations } from "@/lib/layer-edges";
 import {
   type LayerPlan,
   type LayerStats,
@@ -34,6 +38,7 @@ import { useDeepTour } from "@/stores/deep-tour";
 import { useDeepTourGen } from "@/stores/deep-tour-gen";
 import { type LayersEntry, useLayers } from "@/stores/layers";
 import { useLayersGen } from "@/stores/layers-gen";
+import { useLocalRepos } from "@/stores/local-repos";
 import { useReviewPrefs } from "@/stores/review-prefs";
 import { useUi } from "@/stores/ui";
 import { useViewedFiles } from "@/stores/viewed-files";
@@ -44,6 +49,7 @@ import {
   ChevronUp,
   Compass,
   Layers,
+  Network,
   RefreshCw,
   SplitSquareVertical,
   X,
@@ -169,6 +175,49 @@ export function useLayerScope({
   }, [plan, stats, files, headSha, entry?.active, entry?.headSha, select, advance]);
 }
 
+/** Import links between a plan's layers, and the ones that run against the
+ * reading order. */
+export interface LayerLinks {
+  edges: LayerEdge[];
+  violations: LayerEdge[];
+  source: EdgeSource;
+}
+
+/**
+ * Compute the plan's layer links after first paint. Reads each changed file
+ * from the clone when there is one, else from the diff. Re-runs only when the
+ * plan or the file list changes — both are memoized upstream.
+ */
+export function useLayerLinks(
+  plan: LayerPlan | null,
+  files: PullFile[],
+  cwd: string | null,
+): LayerLinks | null {
+  const [links, setLinks] = useState<LayerLinks | null>(null);
+  useEffect(() => {
+    if (!plan) {
+      setLinks(null);
+      return;
+    }
+    let cancelled = false;
+    // A macrotask, so the bar paints before any file is read.
+    const t = setTimeout(() => {
+      loadEdgeTexts(files, cwd)
+        .then(({ texts, source, aliases }) => {
+          if (cancelled) return;
+          const edges = layerEdges(plan, texts, aliases);
+          setLinks({ edges, violations: orderViolations(plan, edges), source });
+        })
+        .catch(() => {});
+    }, 0);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [plan, files, cwd]);
+  return links;
+}
+
 interface BarProps {
   scope: LayerScope;
   prKey: string;
@@ -215,6 +264,13 @@ export function LayerBar(props: BarProps) {
   const tourGen = useDeepTourGen((s) => s.byPr[prKey]);
   const compact = useUi((s) => s.compactChrome);
   const toggleCompact = useUi((s) => s.toggleCompactChrome);
+  const localRepos = useLocalRepos((s) => s.repos);
+  const cwd = useMemo(() => {
+    const [owner, repo] = prKey.split("#")[0].split("/");
+    return localRepos.find((r) => r.owner === owner && r.repo === repo)?.path ?? null;
+  }, [prKey, localRepos]);
+  const links = useLayerLinks(scope.plan, files, cwd);
+  const [mapOpen, setMapOpen] = useState(false);
 
   // In compact mode, entering a layer still unfolds its briefing — that's the
   // moment it's worth reading — until the reviewer moves on to another file.
@@ -379,6 +435,13 @@ export function LayerBar(props: BarProps) {
   }
 
   const { plan, active, index, stats } = scope;
+  // Foundations the active layer imports from a layer read later.
+  const lateFoundations = (links?.violations ?? [])
+    .filter((e) => e.to === active?.id)
+    .map((e) => plan.layers.findIndex((l) => l.id === e.from) + 1)
+    .filter((n) => n > 0)
+    .sort((a, b) => a - b);
+  const violated = new Set((links?.violations ?? []).map((e) => e.to));
   const activeStats = stats[index];
   const remaining = stats.filter((s) => !s.done).length;
   // The plan stopped describing this PR: everything ended up in the catch-all.
@@ -501,6 +564,12 @@ export function LayerBar(props: BarProps) {
                   {s.done ? <Check className="size-2.5" /> : i + 1}
                 </span>
                 <span className="max-w-[11rem] truncate">{layer.title}</span>
+                {violated.has(layer.id) && (
+                  <AlertTriangle
+                    className="size-3 shrink-0 text-warning"
+                    aria-label="Imports from a later layer"
+                  />
+                )}
                 {RISK_DOT[layer.risk] && (
                   <span
                     className={cn("size-1.5 shrink-0 rounded-full", RISK_DOT[layer.risk])}
@@ -529,6 +598,17 @@ export function LayerBar(props: BarProps) {
               </span>
             </TooltipFor>
           )}
+          <TooltipFor label={mapOpen ? "Hide dependency map" : "Dependency map"}>
+            <Button
+              size="icon-xs"
+              variant={mapOpen ? "secondary" : "ghost"}
+              aria-label="Dependency map"
+              aria-expanded={mapOpen}
+              onClick={() => setMapOpen((o) => !o)}
+            >
+              <Network className="size-3.5" />
+            </Button>
+          </TooltipFor>
           <TooltipFor label="Split this PR again">
             <Button
               size="icon-xs"
@@ -560,6 +640,31 @@ export function LayerBar(props: BarProps) {
         </div>
       )}
 
+      {mapOpen && (
+        <div className="mt-2 rounded-md border border-hairline bg-foreground/[0.02] p-2.5">
+          <p className="text-2xs text-muted-foreground">
+            {!links
+              ? "Reading imports…"
+              : links.source === "clone"
+                ? "Edges read from your local clone, which may not be at the PR head."
+                : "Edges from the diff only; some links may be missing."}
+          </p>
+          {links &&
+            (links.edges.length === 0 ? (
+              <p className="mt-1.5 text-xs text-muted-foreground">
+                No import links found between layers.
+              </p>
+            ) : (
+              // The bar sits above the diff and doesn't scroll — cap the map so
+              // a tall graph scrolls in place instead of pushing the diff away.
+              <MermaidDiagram
+                className="mt-1.5 max-h-[45vh] overflow-y-auto"
+                code={layerMermaid(plan, links.edges)}
+              />
+            ))}
+        </div>
+      )}
+
       {/* Briefing for the layer in front of the reviewer — one line when compact. */}
       {active &&
         (expanded ? (
@@ -568,7 +673,13 @@ export function LayerBar(props: BarProps) {
               <div className="flex flex-wrap items-center gap-2">{layerChip}</div>
               {active.intent && (
                 <p className="mt-1 line-clamp-2 text-sm leading-6 text-muted-foreground">
-                  {active.intent}
+                  <CodeSpans text={active.intent} />
+                </p>
+              )}
+              {lateFoundations.length > 0 && (
+                <p className="mt-1 flex items-center gap-1.5 text-xs text-warning">
+                  <AlertTriangle className="size-3 shrink-0" />
+                  {orderHint(lateFoundations)}
                 </p>
               )}
               {active.focus.length > 0 && (
@@ -579,7 +690,7 @@ export function LayerBar(props: BarProps) {
                       className="flex items-center gap-1.5 text-xs leading-5 text-muted-foreground"
                     >
                       <span className="size-1 shrink-0 rounded-full bg-muted-foreground/50" />
-                      {f}
+                      <CodeSpans text={f} />
                     </li>
                   ))}
                 </ul>
@@ -598,7 +709,7 @@ export function LayerBar(props: BarProps) {
               className="min-w-0 flex-1 truncate text-xs text-muted-foreground"
               title={active.intent || undefined}
             >
-              {active.intent}
+              <CodeSpans text={active.intent} />
             </span>
             <div className="flex shrink-0 items-center gap-1.5">
               {tourButton("xs")}
@@ -609,6 +720,16 @@ export function LayerBar(props: BarProps) {
         ))}
     </Shell>
   );
+}
+
+/** "Imports from layer 4, which comes later. Consider reading layer 4 first."
+ * Advice only: the planner's order may be on purpose. */
+export function orderHint(layers: number[]): string {
+  if (layers.length === 1) {
+    return `Imports from layer ${layers[0]}, which comes later. Consider reading layer ${layers[0]} first.`;
+  }
+  const list = `${layers.slice(0, -1).join(", ")} and ${layers[layers.length - 1]}`;
+  return `Imports from layers ${list}, which come later. Consider reading them first.`;
 }
 
 function Shell({ children }: { children: ReactNode }) {

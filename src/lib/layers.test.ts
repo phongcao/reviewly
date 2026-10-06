@@ -214,6 +214,23 @@ describe("heuristicLayers", () => {
     }
   });
 
+  it("reads frontend route pages with the UI, and keeps backend routes in API", () => {
+    // A `.tsx` page under `routes/` imports components, so it reads after them.
+    const cases: [string, string][] = [
+      ["src/routes/dashboard.tsx", "ui"],
+      ["app/pages/index.jsx", "ui"],
+      ["web/routes/+page.svelte", "ui"],
+      ["src/routes/pr-filter-model.ts", "api"],
+      ["server/routes/users.py", "api"],
+      ["src-tauri/src/commands/git.rs", "api"],
+      ["src/api/client.ts", "api"],
+    ];
+    for (const [path, bucket] of cases) {
+      const out = heuristicLayers([file(path)]);
+      expect(out.layers[0]?.id, `${path} should land in ${bucket}`).toBe(bucket);
+    }
+  });
+
   // Deliberate current behaviour, not an oversight: `focus.ts` treats `.d.ts` as
   // generated ("declarations are often generated"), and the `generated` bucket is
   // matched before `types`. So a hand-written declaration file is classified as
