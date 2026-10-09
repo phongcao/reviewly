@@ -180,17 +180,65 @@ fn add_effort(cmd: &mut Command, effort: Option<&str>) {
     }
 }
 
-/// Limit a Claude run to reading the repo. `--allowedTools` alone only
-/// pre-approves these; it doesn't remove anything, so a user whose permission
-/// mode allows more (e.g. `auto`) let a run use Bash. `--tools` sets the run's
-/// only built-in tools, and `--strict-mcp-config` with no `--mcp-config` drops
-/// the user's MCP servers. `LS` is gone from current CLIs but kept for older ones.
-fn add_read_only_tools(cmd: &mut Command) {
+/// Claude's read-only repo tools. `LS` is gone from current CLIs but kept for
+/// older ones.
+const CLAUDE_REPO_TOOLS: [&str; 4] = ["Read", "Grep", "Glob", "LS"];
+
+/// Claude's web tools, offered to the chat only — reviews stay repo-only.
+const CLAUDE_WEB_TOOLS: [&str; 2] = ["WebSearch", "WebFetch"];
+
+/// The only hosts the chat's WebFetch may read: official docs and package
+/// registries. A fetch is a request whose URL the model writes, so an open
+/// WebFetch could be talked (by a page, or by text in the PR) into carrying
+/// diff content to any server. Hosts match exactly — list subdomains too.
+const WEB_FETCH_DOMAINS: [&str; 21] = [
+    "learn.microsoft.com",
+    "azure.microsoft.com",
+    "devblogs.microsoft.com",
+    "docs.github.com",
+    "github.com",
+    "raw.githubusercontent.com",
+    "docs.aws.amazon.com",
+    "cloud.google.com",
+    "ai.google.dev",
+    "platform.openai.com",
+    "docs.claude.com",
+    "developer.mozilla.org",
+    "docs.python.org",
+    "pypi.org",
+    "www.npmjs.com",
+    "nodejs.org",
+    "docs.rs",
+    "crates.io",
+    "doc.rust-lang.org",
+    "pkg.go.dev",
+    "kubernetes.io",
+];
+
+/// `--allowedTools` rules for the chat's web tools: search anywhere, fetch
+/// only from `WEB_FETCH_DOMAINS`.
+fn web_allowed_rules() -> Vec<String> {
+    std::iter::once("WebSearch".to_string())
+        .chain(WEB_FETCH_DOMAINS.iter().map(|d| format!("WebFetch(domain:{d})")))
+        .collect()
+}
+
+/// Limit a Claude run to exactly `tools`, pre-approved by the `allowed` rules.
+/// `--allowedTools` alone only pre-approves; it doesn't remove anything, so a
+/// user whose permission mode allows more (e.g. `auto`) let a run use Bash.
+/// `--tools` sets the run's only built-in tools, and `--strict-mcp-config` with
+/// no `--mcp-config` drops the user's MCP servers.
+fn add_claude_tools(cmd: &mut Command, tools: &[&str], allowed: &[String]) {
     cmd.arg("--tools")
-        .arg("Read,Grep,Glob,LS")
+        .arg(tools.join(","))
         .arg("--allowedTools")
-        .arg("Read Grep Glob LS")
+        .arg(allowed.join(" "))
         .arg("--strict-mcp-config");
+}
+
+/// Limit a Claude run to reading the repo.
+fn add_read_only_tools(cmd: &mut Command) {
+    add_claude_tools(cmd, &CLAUDE_REPO_TOOLS, &CLAUDE_REPO_TOOLS.map(String::from));
 }
 
 /// The model that did the bulk of a Claude run, from the `modelUsage` map in
@@ -1030,6 +1078,7 @@ pub async fn ai_stream(
     api_key: Option<String>,
     timeout_secs: Option<u64>,
     effort: Option<String>,
+    web_search: Option<bool>,
 ) -> AppResult<()> {
     {
         let mut set = state.ai_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1057,6 +1106,7 @@ pub async fn ai_stream(
             api_key,
             timeout_secs,
             effort.as_deref(),
+            web_search.unwrap_or(false),
         )
         .await;
         if let Ok(mut s) = inflight.lock() {
@@ -1128,10 +1178,12 @@ async fn stream_provider(
     api_key: Option<String>,
     timeout_secs: Option<u64>,
     effort: Option<&str>,
+    web_search: bool,
 ) -> AppResult<(String, Option<f64>)> {
     match provider {
         "claude" => {
-            stream_claude(app, key, prompt, cwd, model.as_deref(), timeout_secs, effort).await
+            stream_claude(app, key, prompt, cwd, model.as_deref(), timeout_secs, effort, web_search)
+                .await
         }
         "openai" => stream_openai(app, key, prompt, base_url, model, api_key, timeout_secs).await,
         "copilot" => {
@@ -1147,6 +1199,7 @@ async fn stream_provider(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_claude(
     app: &AppHandle,
     key: &str,
@@ -1155,6 +1208,7 @@ async fn stream_claude(
     model: Option<&str>,
     timeout_secs: Option<u64>,
     effort: Option<&str>,
+    web_search: bool,
 ) -> AppResult<(String, Option<f64>)> {
     let mut cmd = cli_command("claude");
     // Prompt over stdin (not argv) so a large PR context can't hit the OS
@@ -1171,9 +1225,24 @@ async fn stream_claude(
     add_model(&mut cmd, "--model", model);
     add_effort(&mut cmd, effort);
     // Same read-only repo access as run_claude: the chat should be able to
-    // open what the (budget-limited) diff leaves out.
+    // open what the (budget-limited) diff leaves out. With web search on it
+    // can also look up what's newer than the model (API versions, retirements).
+    let mut tools: Vec<&str> = Vec::new();
+    let mut allowed: Vec<String> = Vec::new();
     if has_repo(cwd) {
-        add_read_only_tools(&mut cmd);
+        tools.extend(CLAUDE_REPO_TOOLS);
+        allowed.extend(CLAUDE_REPO_TOOLS.map(String::from));
+    }
+    if web_search {
+        tools.extend(CLAUDE_WEB_TOOLS);
+        allowed.extend(web_allowed_rules());
+        // The domain rules only pre-approve. `dontAsk` denies every call they
+        // don't cover, so a user's `auto` or bypass mode can't approve a fetch
+        // to some other host.
+        cmd.arg("--permission-mode").arg("dontAsk");
+    }
+    if !tools.is_empty() {
+        add_claude_tools(&mut cmd, &tools, &allowed);
     }
     apply_cwd(&mut cmd, cwd);
     let mut child = cmd
@@ -1439,6 +1508,16 @@ mod tests {
         let mut run = CopilotRun::default();
         feed_all(&mut run, "Not signed in\n{\"type\":\"result\",\"exitCode\":1}");
         assert_eq!(run.detail(b""), "Not signed in");
+    }
+
+    #[test]
+    fn web_rules_search_anywhere_but_fetch_only_listed_hosts() {
+        let rules = web_allowed_rules();
+        assert_eq!(rules[0], "WebSearch");
+        assert!(rules.contains(&"WebFetch(domain:learn.microsoft.com)".to_string()));
+        // A bare `WebFetch` rule would approve every host.
+        assert!(!rules.contains(&"WebFetch".to_string()));
+        assert!(rules.iter().all(|r| !r.contains(' ')));
     }
 
     #[test]

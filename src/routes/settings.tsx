@@ -34,6 +34,7 @@ import {
   EFFORT_PROVIDERS,
   MODEL_SUGGESTIONS,
   PROVIDER_LABEL,
+  WEB_PROVIDERS,
   useAiProvider,
 } from "@/stores/ai";
 import { LANDING_OPTIONS, useAppBehavior } from "@/stores/app-behavior";
@@ -219,6 +220,7 @@ export function SettingsPage() {
 
               {EFFORT_PROVIDERS.includes(provider) && <AiEffortConfig provider={provider} />}
               <AiTimeoutConfig />
+              {WEB_PROVIDERS.includes(provider) && <ChatWebSearchConfig />}
 
               <AiInstructions />
             </Card>
@@ -1045,6 +1047,22 @@ function AiTimeoutConfig() {
           ))}
         </SelectContent>
       </Select>
+    </div>
+  );
+}
+
+/** Web search for the PR chat (Claude only). Reviews stay repo-only either way. */
+function ChatWebSearchConfig() {
+  const on = useAiProvider((s) => s.chatWebSearch);
+  const setOn = useAiProvider((s) => s.setChatWebSearch);
+  return (
+    <div className="mt-4 border-t border-hairline pt-4">
+      <SettingToggle
+        label="Web search in chat"
+        description="Let Ask AI search the web for up-to-date facts like API versions or model retirements. It can only open pages on official docs sites and package registries. Search queries go to the web, so turn this off for sensitive repos."
+        checked={on}
+        onChange={setOn}
+      />
     </div>
   );
 }

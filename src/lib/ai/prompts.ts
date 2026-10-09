@@ -650,6 +650,17 @@ You are running inside a local checkout of this repository and can Read / Grep i
 There is no clone of this repository available: you can see ONLY the pull-request metadata and the diff below, which may be truncated. When the answer depends on code you can't see, say exactly what you couldn't see — never guess at it — and mention that linking the repository in Reviewly's Repositories tab would let you read it.`;
 }
 
+/** Appended to CHAT_SYSTEM when the chat has web search, so it uses it for
+ * facts that move faster than the model's training (and says when it did). */
+export function chatWebClause(web: boolean): string {
+  return web
+    ? `
+
+# Web search
+You can search the web (WebSearch) and read pages (WebFetch). Use them when the answer depends on facts that may have changed since your training — API versions, model or service availability and retirements, library releases, deprecations, pricing, CVEs — instead of answering from memory or saying you can't check. WebFetch only works on a fixed list of official docs sites and package registries; if a fetch is denied, answer from the search results instead of retrying other hosts. Prefer official docs and changelogs, cite the URLs you relied on, and say when a source's date is unclear. Never put secrets, tokens or private code from the PR into a search query or URL.`
+    : "";
+}
+
 /** Commit-message draft prompt — prepended to the staged diff. */
 export const COMMIT_PROMPT =
   "Write a single git commit message for the staged diff below. Conventional-commits style: a concise imperative subject under 72 chars, optionally a short body explaining why. Return ONLY the message — no quotes, no fences, no preamble.\n\n";

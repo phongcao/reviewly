@@ -6,10 +6,10 @@ import { type AiAction, actionTitle, parseActions } from "@/lib/ai-actions";
 import { buildFocusedContext, echoRefs, refForFile, refLabel, searchPaths } from "@/lib/ai/attach";
 import type { PrContextRef } from "@/lib/ai/attach";
 import { attachContext, clearContext, removeContext } from "@/lib/ai/attach-bridge";
-import { CHAT_SYSTEM, chatCheckoutClause } from "@/lib/ai/prompts";
+import { CHAT_SYSTEM, chatCheckoutClause, chatWebClause } from "@/lib/ai/prompts";
 import { type PullFile, invoke } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
-import { PROVIDER_LABEL, aiInvokeArgs, useAiProvider } from "@/stores/ai";
+import { PROVIDER_LABEL, aiInvokeArgs, chatWebSearchOn, useAiProvider } from "@/stores/ai";
 import { type ChatMessage, useAiChat, whenChatHydrated } from "@/stores/ai-chat";
 import { useLocalRepos } from "@/stores/local-repos";
 import { useReviewPrefs } from "@/stores/review-prefs";
@@ -177,6 +177,7 @@ export function AiReview({ prKey, context, executeAction, files }: Props) {
     const custom = aiInstructions.trim()
       ? `\n\n# Reviewer's instructions (follow these)\n${aiInstructions.trim()}`
       : "";
+    const webSearch = chatWebSearchOn();
     setStreamText("");
     setStreaming(true);
     streamingRef.current = true;
@@ -184,7 +185,8 @@ export function AiReview({ prKey, context, executeAction, files }: Props) {
       key: prKey,
       ...aiInvokeArgs(),
       cwd,
-      prompt: `${CHAT_SYSTEM}${chatCheckoutClause(!!cwd)}${custom}${focused}\n\n# Pull request\n${context}\n\n# Conversation\n${transcript}\n\nAssistant:`,
+      webSearch,
+      prompt: `${CHAT_SYSTEM}${chatCheckoutClause(!!cwd)}${chatWebClause(webSearch)}${custom}${focused}\n\n# Pull request\n${context}\n\n# Conversation\n${transcript}\n\nAssistant:`,
     }).catch((e) => {
       if (!streamingRef.current) return;
       streamingRef.current = false;

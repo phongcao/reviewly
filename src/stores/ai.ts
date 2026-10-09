@@ -89,6 +89,10 @@ interface State {
    * automatic (the backend picks 3 min, or 7 min when the PR's clone is present). */
   aiTimeoutSecs: number | null;
   setAiTimeoutSecs: (secs: number | null) => void;
+  /** Let the PR chat search and fetch from the web (Claude only — the other
+   * providers have no web tool we can enable). Reviews never get it. */
+  chatWebSearch: boolean;
+  setChatWebSearch: (on: boolean) => void;
 }
 
 export const useAiProvider = create<State>()(
@@ -107,10 +111,21 @@ export const useAiProvider = create<State>()(
       setClaudeEffort: (claudeEffort) => set({ claudeEffort }),
       aiTimeoutSecs: null,
       setAiTimeoutSecs: (aiTimeoutSecs) => set({ aiTimeoutSecs }),
+      chatWebSearch: true,
+      setChatWebSearch: (chatWebSearch) => set({ chatWebSearch }),
     }),
     { name: "reviewly.ai", storage: sqlStorage<State>() },
   ),
 );
+
+/** Providers whose chat can search the web. */
+export const WEB_PROVIDERS: AiProvider[] = ["claude"];
+
+/** Whether the PR chat should get web search on this turn. */
+export function chatWebSearchOn(): boolean {
+  const s = useAiProvider.getState();
+  return s.chatWebSearch && WEB_PROVIDERS.includes(s.provider);
+}
 
 /**
  * Extra invoke args for the `ai_review` / `ai_review_bg` commands. Carries the
