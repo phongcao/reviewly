@@ -23,6 +23,7 @@ import { AboutDialog } from "@/components/about-dialog";
 import { SettingsDialog } from "@/components/settings-dialog";
 import { ShortcutsCheatsheet } from "@/components/shortcuts-cheatsheet";
 import { WhatsNewDialog } from "@/components/whats-new-dialog";
+import { useReviewDraftBridge } from "@/lib/review-draft-bridge";
 import { invoke } from "@/lib/tauri";
 import { ACCENTS, useAppearance } from "@/stores/appearance";
 import { resolveTheme, useTheme } from "@/stores/theme";
@@ -92,6 +93,7 @@ export function AppLayout({ children }: { children: ReactNode }) {
   useRepoTourEvents();
   useQuestionEvents();
   useDependabotEvents();
+  useReviewDraftBridge();
   useNativeChrome();
   useNotifSync();
   useUpdater();

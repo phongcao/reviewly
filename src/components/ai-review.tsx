@@ -590,6 +590,8 @@ function ActionCard({
   const Icon = tone.icon;
   const body = actionBody(action);
   const done = status === "done";
+  // Inline comments join the pending review rather than posting on their own.
+  const pending = action.type === "inline_comment";
 
   async function run() {
     setStatus("running");
@@ -630,7 +632,7 @@ function ActionCard({
         {done ? (
           <span className="inline-flex items-center gap-1 text-xs text-success">
             <Check className="size-3.5" strokeWidth={2.5} />
-            Posted
+            {pending ? "Added to review" : "Posted"}
           </span>
         ) : (
           <Button
@@ -639,7 +641,7 @@ function ActionCard({
             loading={status === "running"}
             onClick={run}
           >
-            Confirm & post
+            {pending ? "Add to review" : "Confirm & post"}
           </Button>
         )}
       </div>

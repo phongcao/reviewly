@@ -2,7 +2,7 @@ import { AiReview } from "@/components/ai-review";
 import type { AiAction } from "@/lib/ai-actions";
 import { useAttachBridge } from "@/lib/ai/attach-bridge";
 import { buildReviewContext } from "@/lib/ai/context";
-import { parsePatch } from "@/lib/diff";
+import { addToPendingReview } from "@/lib/review-draft-bridge";
 import { type PullDetail, type PullFile, invoke } from "@/lib/tauri";
 import { useQuery } from "@tanstack/react-query";
 import { useParams } from "@tanstack/react-router";
@@ -69,36 +69,16 @@ export function ChatWindowPage() {
         });
         break;
       case "inline_comment": {
-        if (!headSha) throw new Error("PR head commit unavailable — reopen the chat.");
-        const target = (files.data ?? []).find((f) => f.filename === a.path);
-        const commentable =
-          !!target?.patch &&
-          parsePatch(target.patch).some((h) =>
-            h.lines.some((l) => l.kind !== "hunk" && l.newLine === a.line),
-          );
-        if (!commentable) {
+        // Sent to the main window's pending review — edited and submitted there.
+        const where = await addToPendingReview({ owner, repo, number }, files.data ?? [], a);
+        if (where === "body") {
           toast.warning(
-            `Line ${a.line} isn't in ${a.path.split("/").pop()}'s diff — posting as a file comment.`,
+            `Line ${a.line} isn't in ${a.path.split("/").pop()}'s diff — added to the review summary instead.`,
           );
-          await invoke("gh_create_issue_comment", {
-            owner,
-            repo,
-            number,
-            body: `**${a.path}:${a.line}**\n\n${a.body}`,
-          });
-          break;
+        } else {
+          toast.success("Added to your pending review");
         }
-        await invoke("gh_create_review_comment", {
-          owner,
-          repo,
-          number,
-          commitId: headSha,
-          path: a.path,
-          line: a.line,
-          side: a.side,
-          body: a.body,
-        });
-        break;
+        return;
       }
       case "label": {
         const names = new Set((detail.data?.labels ?? []).map((l) => l.name));

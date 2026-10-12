@@ -1259,6 +1259,9 @@ async fn stream_claude(
     // model) as plain text there, so keep them to explain an empty run.
     let mut noise = String::new();
     let mut cost: Option<f64> = None;
+    // The CLI reports a failed run (e.g. an unreadable tool call) as a normal
+    // `result` with `is_error` set; without this its message reads as the answer.
+    let mut failed: Option<(String, Option<String>)> = None;
 
     let read = async {
         while let Some(line) = lines
@@ -1301,6 +1304,13 @@ async fn stream_claude(
                         }
                     }
                     cost = v.get("total_cost_usd").and_then(|c| c.as_f64());
+                    if v.get("is_error").and_then(serde_json::Value::as_bool) == Some(true) {
+                        let reason = v
+                            .get("terminal_reason")
+                            .and_then(|r| r.as_str())
+                            .map(String::from);
+                        failed = Some((full.clone(), reason));
+                    }
                 }
                 _ => {}
             }
@@ -1319,11 +1329,28 @@ async fn stream_claude(
         }
     }
     let status = child.wait().await.ok();
+    if let Some((text, reason)) = failed {
+        return Err(stream_failure(&text, reason.as_deref()));
+    }
     if full.is_empty() {
         let code = status.map(|s| exit_code(&s)).unwrap_or_else(|| "?".to_string());
         return Err(cli_error("claude", &code, noise.trim()));
     }
     Ok((full, cost))
+}
+
+/// The error for a Claude chat run the CLI itself marked as failed.
+fn stream_failure(text: &str, reason: Option<&str>) -> AppError {
+    // The model emitted a tool call the CLI couldn't parse, twice. It's a
+    // one-off sampling failure, so a fresh run usually goes through.
+    if reason == Some("malformed_tool_use_exhausted") || text.contains("tool call could not be parsed")
+    {
+        return AppError::Other(
+            "Claude produced a tool call it couldn't read, even after retrying. Click Regenerate to try again."
+                .into(),
+        );
+    }
+    cli_error("claude", "0", text)
 }
 
 async fn stream_openai(
@@ -1449,6 +1476,17 @@ mod tests {
         assert_eq!(text, "Not logged in");
         assert!(is_error);
         assert_eq!(model, None);
+    }
+
+    #[test]
+    fn unreadable_tool_call_asks_for_a_regenerate() {
+        let by_reason = stream_failure("", Some("malformed_tool_use_exhausted")).to_string();
+        assert!(by_reason.contains("Regenerate"));
+        let by_text =
+            stream_failure("The model's tool call could not be parsed (retry also failed).", None)
+                .to_string();
+        assert!(by_text.contains("Regenerate"));
+        assert!(!stream_failure("Not logged in", None).to_string().contains("Regenerate"));
     }
 
     #[test]

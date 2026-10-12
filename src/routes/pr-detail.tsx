@@ -42,7 +42,6 @@ import { UserHoverCard } from "@/components/user-hover-card";
 import type { AiAction } from "@/lib/ai-actions";
 import { useAttachBridge } from "@/lib/ai/attach-bridge";
 import { type ContextOptions, type ReviewContext, buildReviewContext } from "@/lib/ai/context";
-import { parsePatch } from "@/lib/diff";
 import { isTestFile } from "@/lib/focus";
 import { relativeTime } from "@/lib/format";
 import { isImagePath } from "@/lib/images";
@@ -50,12 +49,19 @@ import { celebrate } from "@/lib/kite-release";
 import { isMarkdownPath } from "@/lib/markdown";
 import { type NavEntry, useNavHistory } from "@/lib/nav-history";
 import type { ReviewLocation } from "@/lib/review-context";
+import {
+  addToPendingReview,
+  canAnchor,
+  isCommentableLine,
+  locatedNote,
+} from "@/lib/review-draft-bridge";
 import type {
   ActionsJob,
   ActionsStep,
   CheckAnnotation,
   CheckRun,
   CheckRunsResponse,
+  DraftComment,
   IssueComment,
   Label,
   PullDetail,
@@ -789,6 +795,56 @@ export function PRDetailPage() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // Guided Review's "Add": its steps are AI-anchored, so check the line is in
+  // the diff (same fallback as the chat's drafted comments).
+  function addGuidedComment(c: DraftComment) {
+    if (c.line == null) return addComment(prKey, c);
+    void addToPendingReview(prKey, fileList, { ...c, line: c.line, side: "RIGHT" }).then(
+      (where) => {
+        if (where === "body") {
+          toast.warning(
+            `Line ${c.line} isn't in ${c.path.split("/").pop()}'s diff — added to the review summary instead.`,
+          );
+        }
+      },
+    );
+  }
+
+  // Post an inline comment straight to GitHub (Guided Review's "Post").
+  async function postInlineComment(c: { path: string; line: number; body: string }) {
+    if (!headSha) throw new Error("PR head commit unavailable — reload and try again.");
+    // An inline comment only sticks on a line that's actually in the diff;
+    // an off / hallucinated anchor 422s. If the line isn't commentable, fall
+    // back to a file-level comment (with the path:line in the body) so the
+    // note still lands instead of erroring out.
+    if (!isCommentableLine(fileList, c.path, c.line)) {
+      toast.warning(
+        `Line ${c.line} isn't in ${c.path.split("/").pop()}'s diff — posting as a file comment.`,
+      );
+      await invoke("gh_create_issue_comment", {
+        owner,
+        repo,
+        number,
+        body: `**${c.path}:${c.line}**\n\n${c.body}`,
+      });
+      qc.invalidateQueries({ queryKey: ["pull-issue-comments", owner, repo, number] });
+    } else {
+      await invoke("gh_create_review_comment", {
+        owner,
+        repo,
+        number,
+        commitId: headSha,
+        path: c.path,
+        line: c.line,
+        side: "RIGHT",
+        body: c.body,
+      });
+      qc.invalidateQueries({ queryKey: ["pull-review-comments", owner, repo, number] });
+      qc.invalidateQueries({ queryKey: ["pull-review-threads-gql", owner, repo, number] });
+    }
+    toast.success("Posted to GitHub");
+  }
+
   // Execute an AI-proposed action with the app's authenticated commands.
   async function executeAiAction(a: AiAction): Promise<void> {
     switch (a.type) {
@@ -811,43 +867,17 @@ export function PRDetailPage() {
         break;
       }
       case "inline_comment": {
-        if (!headSha) throw new Error("PR head commit unavailable — reload and try again.");
-        // An inline comment only sticks on a line that's actually in the diff;
-        // an off / hallucinated anchor 422s. If the line isn't commentable, fall
-        // back to a file-level comment (with the path:line in the body) so the
-        // note still lands instead of erroring out.
-        const target = fileList.find((f) => f.filename === a.path);
-        const commentable =
-          !!target?.patch &&
-          parsePatch(target.patch).some((h) =>
-            h.lines.some((l) => l.kind !== "hunk" && l.newLine === a.line),
-          );
-        if (!commentable) {
+        // Lands in the pending review (like a comment typed in the diff) so the
+        // reviewer can edit or drop it before submitting — not posted directly.
+        const where = await addToPendingReview(prKey, fileList, a);
+        if (where === "body") {
           toast.warning(
-            `Line ${a.line} isn't in ${a.path.split("/").pop()}'s diff — posting as a file comment.`,
+            `Line ${a.line} isn't in ${a.path.split("/").pop()}'s diff — added to the review summary instead.`,
           );
-          await invoke("gh_create_issue_comment", {
-            owner,
-            repo,
-            number,
-            body: `**${a.path}:${a.line}**\n\n${a.body}`,
-          });
-          qc.invalidateQueries({ queryKey: ["pull-issue-comments", owner, repo, number] });
-          break;
+        } else {
+          toast.success("Added to your pending review");
         }
-        await invoke("gh_create_review_comment", {
-          owner,
-          repo,
-          number,
-          commitId: headSha,
-          path: a.path,
-          line: a.line,
-          side: a.side,
-          body: a.body,
-        });
-        qc.invalidateQueries({ queryKey: ["pull-review-comments", owner, repo, number] });
-        qc.invalidateQueries({ queryKey: ["pull-review-threads-gql", owner, repo, number] });
-        break;
+        return;
       }
       case "label": {
         const names = new Set(labels.map((l) => l.name));
@@ -933,8 +963,20 @@ export function PRDetailPage() {
 
   const submit = useMutation({
     mutationFn: async (event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES") => {
-      const body = draft?.body ?? "";
-      const comments = (draft?.comments ?? []).map(toSubmittable);
+      // A comment on a line that isn't in the diff (a renamed-only file, or a
+      // line a later push removed) would 422 the whole review, so it rides in
+      // the summary instead, labeled with its path:line.
+      const pending = draft?.comments ?? [];
+      const loose = pending.filter((c) => !canAnchor(fileList, c));
+      const comments = pending.filter((c) => canAnchor(fileList, c)).map(toSubmittable);
+      const body = [draft?.body ?? "", ...loose.map(locatedNote)]
+        .filter((s) => s.trim())
+        .join("\n\n");
+      if (loose.length) {
+        toast.warning(
+          `${loose.length} comment${loose.length === 1 ? " isn't" : "s aren't"} on a line in the diff — included in the review summary instead.`,
+        );
+      }
       // Non-blocking nudge (item 22): requesting changes with no summary is
       // usually a mistake, but we still let it through — just warn.
       if (event === "REQUEST_CHANGES" && !body.trim()) {
@@ -1519,16 +1561,8 @@ export function PRDetailPage() {
             headSha={headSha}
             prTitle={d.title}
             prUrl={d.html_url}
-            onAddComment={(c) => addComment(prKey, c)}
-            onPostComment={(c) =>
-              executeAiAction({
-                type: "inline_comment",
-                path: c.path,
-                line: c.line,
-                body: c.body,
-                side: "RIGHT",
-              })
-            }
+            onAddComment={addGuidedComment}
+            onPostComment={postInlineComment}
             onOpenFile={(path, line) => {
               setActiveFile(path);
               if (line != null) {
