@@ -1,5 +1,5 @@
 import { parsePatch } from "@/lib/diff";
-import type { CompareCommit, CompareResult, PullFile, Review } from "@/lib/tauri";
+import type { CompareCommit, CompareResult, PullFile, Review, ReviewThread } from "@/lib/tauri";
 
 /**
  * "What changed since my last review?"
@@ -21,15 +21,41 @@ import type { CompareCommit, CompareResult, PullFile, Review } from "@/lib/tauri
 /** Review states that mean the viewer actually looked at the code. */
 const MEANINGFUL = new Set(["APPROVED", "CHANGES_REQUESTED", "COMMENTED"]);
 
-/** The viewer's newest submitted review, or null. */
+/**
+ * Reviews that are only thread replies. GitHub files every reply as its own
+ * COMMENTED review pinned to the current head, so counting one would make a
+ * quick "done, thanks" reset the baseline without the code being looked at.
+ */
+function replyOnlyReviews(reviews: Review[], comments: ReviewThread[]): Set<number> {
+  const replies = new Map<number, boolean>();
+  for (const c of comments) {
+    if (c.pull_request_review_id == null) continue;
+    const prev = replies.get(c.pull_request_review_id) ?? true;
+    replies.set(c.pull_request_review_id, prev && c.in_reply_to_id != null);
+  }
+  const out = new Set<number>();
+  for (const r of reviews) {
+    if (r.state === "COMMENTED" && !r.body?.trim() && replies.get(r.id)) out.add(r.id);
+  }
+  return out;
+}
+
+/**
+ * The viewer's newest submitted review, or null. `comments` (the PR's review
+ * comments) lets thread replies be told apart from real reviews.
+ */
 export function lastReview(
   reviews: Review[],
   viewerLogin: string | null | undefined,
+  comments: ReviewThread[] = [],
+  needCommit = false,
 ): Review | null {
   if (!viewerLogin) return null;
+  const skip = replyOnlyReviews(reviews, comments);
   let best: Review | null = null;
   for (const r of reviews) {
-    if (r.user.login !== viewerLogin || !MEANINGFUL.has(r.state)) continue;
+    if (r.user.login !== viewerLogin || !MEANINGFUL.has(r.state) || skip.has(r.id)) continue;
+    if (needCommit && !r.commit_id) continue;
     if (!best || +new Date(r.submitted_at ?? 0) > +new Date(best.submitted_at ?? 0)) best = r;
   }
   return best;
@@ -39,14 +65,9 @@ export function lastReview(
 export function lastReviewedSha(
   reviews: Review[],
   viewerLogin: string | null | undefined,
+  comments: ReviewThread[] = [],
 ): string | null {
-  if (!viewerLogin) return null;
-  let best: Review | null = null;
-  for (const r of reviews) {
-    if (r.user.login !== viewerLogin || !MEANINGFUL.has(r.state) || !r.commit_id) continue;
-    if (!best || +new Date(r.submitted_at ?? 0) > +new Date(best.submitted_at ?? 0)) best = r;
-  }
-  return best?.commit_id ?? null;
+  return lastReview(reviews, viewerLogin, comments, true)?.commit_id ?? null;
 }
 
 /** gone: GitHub no longer has the reviewed commit. error: the request failed. */

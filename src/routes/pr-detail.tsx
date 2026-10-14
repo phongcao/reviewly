@@ -10,7 +10,7 @@ import { FollowUpsPanel } from "@/components/followups-panel";
 import { GuidedReview } from "@/components/guided-review";
 import { LabelPicker } from "@/components/label-picker";
 import { LayerBar, useLayerScope } from "@/components/layered-review";
-import { MarkdownBody } from "@/components/markdown-body";
+import { MarkdownBody, MarkdownRepoContext } from "@/components/markdown-body";
 import { PrActions } from "@/components/pr-actions";
 import { ReactionsBar } from "@/components/reactions-bar";
 import { ReviewContextPane } from "@/components/review-context-pane";
@@ -204,6 +204,17 @@ function mergeReview(
 }
 
 export function PRDetailPage() {
+  const { owner, repo } = useParams({ from: "/prs/$owner/$repo/$number" });
+  // `#123` in any markdown on this page links into this repo.
+  const repoRef = useMemo(() => ({ owner, repo }), [owner, repo]);
+  return (
+    <MarkdownRepoContext.Provider value={repoRef}>
+      <PRDetail />
+    </MarkdownRepoContext.Provider>
+  );
+}
+
+function PRDetail() {
   const { owner, repo, number: numberStr } = useParams({ from: "/prs/$owner/$repo/$number" });
   const number = Number(numberStr);
   const navigate = useNavigate();
@@ -361,8 +372,8 @@ export function PRDetailPage() {
   // The viewer's own latest review verdict, so the header button reflects that
   // they've already reviewed (instead of always reading "Review" / undone).
   const myReviewState = useMemo(
-    () => lastReview(reviews.data ?? [], viewerLogin)?.state ?? null,
-    [reviews.data, viewerLogin],
+    () => lastReview(reviews.data ?? [], viewerLogin, threads.data)?.state ?? null,
+    [reviews.data, viewerLogin, threads.data],
   );
 
   // GraphQL node id is needed for draft↔ready and thread-resolve mutations.
@@ -526,6 +537,7 @@ export function PRDetailPage() {
     prBaseSha: detail.data?.base.sha,
     prFiles: fileList,
     reviews: reviews.data,
+    comments: threads.data,
     viewerLogin,
   });
   const sinceFilterPref = usePrView((s) => s.sinceReview?.[prViewKey]);

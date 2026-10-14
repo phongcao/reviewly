@@ -1,9 +1,18 @@
 import { GhAttachment, isGhAttachmentUrl } from "@/components/gh-attachment";
 import { MermaidDiagram } from "@/components/mermaid-diagram";
+import { type RepoRef, remarkGithubRefs } from "@/lib/github-refs";
 import { safeOpenUrl } from "@/lib/ui";
 import { cn } from "@/lib/utils";
 import type { Element, Root, RootContent } from "hast";
-import { Children, type ComponentPropsWithoutRef, type ReactNode, isValidElement } from "react";
+import {
+  Children,
+  type ComponentPropsWithoutRef,
+  type ReactNode,
+  createContext,
+  isValidElement,
+  useContext,
+  useMemo,
+} from "react";
 import ReactMarkdown, { type ExtraProps, type Options, type UrlTransform } from "react-markdown";
 import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
@@ -26,6 +35,13 @@ interface Props {
   sourceLines?: boolean;
 }
 
+/**
+ * The repository bare `#123` references in a body link to. Provide it around a
+ * PR (or anything else scoped to one repo); without it only `owner/repo#123`
+ * and `@user` are linked.
+ */
+export const MarkdownRepoContext = createContext<RepoRef | null>(null);
+
 // Allow GitHub-flavored details/summary and the usual rehype-sanitize defaults.
 const schema = {
   ...defaultSchema,
@@ -36,7 +52,12 @@ const schema = {
   },
 };
 
-function ExternalLink({ href, children, ...rest }: ComponentPropsWithoutRef<"a">) {
+function ExternalLink({
+  href,
+  children,
+  node: _node,
+  ...rest
+}: ComponentPropsWithoutRef<"a"> & ExtraProps) {
   // remark-gfm autolinks bare URLs as `<a href="X">X</a>`. When that URL is a
   // GitHub user-attachment (image or video), render the actual media instead
   // so users see the screenshot/recording inline like on github.com.
@@ -138,17 +159,23 @@ const components = {
 /**
  * Render a GitHub-style markdown body (review body, comment, issue) with
  * the project's `.prose-reviewly` theme. Supports embedded HTML like
- * `<details>` blocks, renders ```mermaid fences as diagrams, silently drops
+ * `<details>` blocks, renders ```mermaid fences as diagrams, links `#123` /
+ * `owner/repo#123` / `@user` references, silently drops
  * HTML comments, routes all link
  * clicks to the OS browser, and proxies GitHub-hosted media through Rust
  * with our auth token so screenshots/videos load.
  */
 export function MarkdownBody({ children, className, urlTransform, sourceLines }: Props) {
+  const repo = useContext(MarkdownRepoContext);
+  const remarkPlugins = useMemo<NonNullable<Options["remarkPlugins"]>>(
+    () => [remarkGfm, [remarkGithubRefs, repo]],
+    [repo],
+  );
   if (!children) return null;
   return (
     <div className={cn("prose-reviewly", className)}>
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
+        remarkPlugins={remarkPlugins}
         rehypePlugins={sourceLines ? rehypePluginsWithLines : rehypePlugins}
         components={components}
         urlTransform={urlTransform}

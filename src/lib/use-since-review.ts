@@ -5,7 +5,7 @@ import {
   needsOldPrFiles,
   sinceReview,
 } from "@/lib/since-review";
-import type { CompareResult, PullFile, Review } from "@/lib/tauri";
+import type { CompareResult, PullFile, Review, ReviewThread } from "@/lib/tauri";
 import { invoke } from "@/lib/tauri";
 import { useViewedFiles, viewedKey } from "@/stores/viewed-files";
 import { useQuery } from "@tanstack/react-query";
@@ -40,14 +40,19 @@ export function useSinceReview(o: {
   prBaseSha: string | null | undefined;
   prFiles: PullFile[];
   reviews: Review[] | undefined;
+  /** The PR's review comments, to skip reviews that are only thread replies. */
+  comments: ReviewThread[] | undefined;
   viewerLogin: string | null | undefined;
 }): { state: SinceReview; review: Review | null } {
-  const { owner, repo, number, headSha, prBaseSha, prFiles, reviews, viewerLogin } = o;
+  const { owner, repo, number, headSha, prBaseSha, prFiles, reviews, comments, viewerLogin } = o;
   const baseSha = useMemo(
-    () => lastReviewedSha(reviews ?? [], viewerLogin),
-    [reviews, viewerLogin],
+    () => lastReviewedSha(reviews ?? [], viewerLogin, comments),
+    [reviews, viewerLogin, comments],
   );
-  const review = useMemo(() => lastReview(reviews ?? [], viewerLogin), [reviews, viewerLogin]);
+  const review = useMemo(
+    () => lastReview(reviews ?? [], viewerLogin, comments),
+    [reviews, viewerLogin, comments],
+  );
 
   const range = useQuery(compareQuery(owner, repo, baseSha, headSha ?? null));
   // After a force-push: the PR's own changes as they were at the reviewed head.

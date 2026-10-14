@@ -7,7 +7,7 @@ import {
   rebasedChanges,
   sinceReview,
 } from "@/lib/since-review";
-import type { CompareResult, PullFile, Review } from "@/lib/tauri";
+import type { CompareResult, PullFile, Review, ReviewThread } from "@/lib/tauri";
 import { describe, expect, it } from "vitest";
 
 const file = (filename: string, patch: string | null, o: Partial<PullFile> = {}): PullFile => ({
@@ -69,6 +69,26 @@ describe("lastReviewedSha", () => {
     const r = [...reviews, review("me", "COMMENTED", "2026-10-07T00:00:00Z", null)];
     expect(lastReviewedSha(r, "me")).toBe("bbb2222");
     expect(lastReview(r, "me")?.commit_id).toBeNull();
+  });
+
+  it("skips reviews that are only thread replies", () => {
+    const reply = { ...review("me", "COMMENTED", "2026-10-08T00:00:00Z", "eee5555"), id: 7 };
+    const real = { ...review("me", "COMMENTED", "2026-10-09T00:00:00Z", "fff6666"), id: 8 };
+    const comment = (reviewId: number, inReplyTo: number | null) =>
+      ({ pull_request_review_id: reviewId, in_reply_to_id: inReplyTo }) as ReviewThread;
+
+    // GitHub files each reply as its own empty COMMENTED review.
+    const replies = [comment(7, 101)];
+    expect(lastReviewedSha([...reviews, reply], "me", replies)).toBe("bbb2222");
+    expect(lastReview([...reviews, reply], "me", replies)?.state).toBe("CHANGES_REQUESTED");
+
+    // A review with a new comment, or a body, still counts.
+    expect(lastReviewedSha([...reviews, real], "me", [comment(8, 101), comment(8, null)])).toBe(
+      "fff6666",
+    );
+    expect(lastReviewedSha([...reviews, { ...reply, body: "LGTM" }], "me", replies)).toBe(
+      "eee5555",
+    );
   });
 });
 
