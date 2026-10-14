@@ -9,6 +9,8 @@ export interface SegmentedOption<T extends string> {
   count?: number;
   /** Status tone className applied to the icon + count (e.g. "text-success"). */
   tone?: string;
+  /** Hover hint, for when the label alone doesn't say what the option does. */
+  title?: string;
 }
 
 /**
@@ -37,6 +39,8 @@ export function Segmented<T extends string>({
         <button
           key={o.value}
           type="button"
+          title={o.title}
+          aria-pressed={value === o.value}
           onClick={() => onChange(o.value)}
           className={cn(
             "inline-flex h-6 items-center gap-1.5 rounded-md px-2 text-xs transition-colors",

@@ -259,6 +259,8 @@ export interface ReviewThread {
   diff_hunk: string | null;
   path: string;
   commit_id: string;
+  /** The commit the comment was first made on; `commit_id` moves with the head. */
+  original_commit_id?: string | null;
   user: UserRef;
   body: string;
   created_at: string;
@@ -278,6 +280,27 @@ export interface Review {
   html_url: string;
   submitted_at: string | null;
   commit_id: string | null;
+}
+
+export interface CompareCommit {
+  sha: string;
+  /** First line of the commit message. */
+  subject: string;
+  author: string | null;
+  date: string | null;
+}
+
+/** `gh_compare_commits` — `base...head`. `status` is GitHub's: "ahead",
+ *  "identical", "behind" or "diverged" (history rewritten). */
+export interface CompareResult {
+  status: string;
+  ahead_by: number;
+  behind_by: number;
+  total_commits: number;
+  commits: CompareCommit[];
+  files: PullFile[];
+  /** GitHub caps a comparison at 300 files; more may be missing. */
+  files_truncated: boolean;
 }
 
 export interface DependabotAlert {
@@ -333,6 +356,10 @@ export interface ReviewThreadGraphQL {
   line: number | null;
   original_line: number | null;
   comment_ids: number[];
+  /** Who resolved the thread, when it is resolved. */
+  resolved_by?: string | null;
+  /** The thread's line no longer exists at the head. */
+  is_outdated?: boolean;
 }
 
 export interface DraftComment {

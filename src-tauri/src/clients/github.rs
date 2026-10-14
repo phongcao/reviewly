@@ -556,13 +556,29 @@ pub async fn list_review_comments(
     repo: &str,
     number: u64,
 ) -> AppResult<Vec<ReviewThread>> {
-    let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/comments");
-    let res = auth_request(state, token, reqwest::Method::GET, &url)
-        .query(&[("per_page", "100")])
-        .send()
-        .await?;
-    let res = check(res).await?;
-    Ok(res.json().await?)
+    // Paged like `list_pull_files`: a busy PR passes 100 comments, and the
+    // follow-up check needs every thread the viewer started.
+    let mut out: Vec<ReviewThread> = Vec::new();
+    let mut page = 1u32;
+    loop {
+        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/comments");
+        let res = auth_request(state, token, reqwest::Method::GET, &url)
+            .query(&[
+                ("per_page", "100".to_string()),
+                ("page", page.to_string()),
+            ])
+            .send()
+            .await?;
+        let res = check(res).await?;
+        let batch: Vec<ReviewThread> = res.json().await?;
+        let done = batch.len() < 100;
+        out.extend(batch);
+        if done || page >= 30 {
+            break;
+        }
+        page += 1;
+    }
+    Ok(out)
 }
 
 pub async fn list_issue_comments(
@@ -732,6 +748,130 @@ pub async fn list_commits(
         .await?;
     let res = check(res).await?;
     Ok(res.json().await?)
+}
+
+/// GitHub returns at most this many files for a comparison, on the first page
+/// only. A result with this many may be missing files.
+const COMPARE_FILE_CAP: usize = 300;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompareCommit {
+    pub sha: String,
+    /// First line of the commit message.
+    pub subject: String,
+    pub author: Option<String>,
+    pub date: Option<DateTime<Utc>>,
+}
+
+/// Two commits compared with `base...head`. `status` is GitHub's: "ahead"
+/// (head builds on base), "identical", "behind" or "diverged" (history was
+/// rewritten, e.g. a force-push).
+#[derive(Debug, Clone, Serialize)]
+pub struct Compare {
+    pub status: String,
+    pub ahead_by: u64,
+    pub behind_by: u64,
+    pub total_commits: u64,
+    pub commits: Vec<CompareCommit>,
+    pub files: Vec<PullFile>,
+    pub files_truncated: bool,
+}
+
+#[derive(Deserialize)]
+struct CompareRaw {
+    status: String,
+    ahead_by: u64,
+    behind_by: u64,
+    total_commits: u64,
+    #[serde(default)]
+    commits: Vec<CompareCommitRaw>,
+    #[serde(default)]
+    files: Option<Vec<PullFile>>,
+}
+
+#[derive(Deserialize)]
+struct CompareCommitRaw {
+    sha: String,
+    commit: CompareCommitInner,
+    author: Option<CompareLogin>,
+}
+
+#[derive(Deserialize)]
+struct CompareCommitInner {
+    message: String,
+    author: Option<CompareGitAuthor>,
+}
+
+#[derive(Deserialize)]
+struct CompareGitAuthor {
+    name: Option<String>,
+    date: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize)]
+struct CompareLogin {
+    login: String,
+}
+
+impl From<CompareRaw> for Compare {
+    fn from(r: CompareRaw) -> Self {
+        let files = r.files.unwrap_or_default();
+        Compare {
+            status: r.status,
+            ahead_by: r.ahead_by,
+            behind_by: r.behind_by,
+            total_commits: r.total_commits,
+            files_truncated: files.len() >= COMPARE_FILE_CAP,
+            commits: r
+                .commits
+                .into_iter()
+                .map(|c| CompareCommit {
+                    subject: c.commit.message.lines().next().unwrap_or("").to_string(),
+                    author: c
+                        .author
+                        .map(|a| a.login)
+                        .or_else(|| c.commit.author.as_ref().and_then(|a| a.name.clone())),
+                    date: c.commit.author.and_then(|a| a.date),
+                    sha: c.sha,
+                })
+                .collect(),
+            files,
+        }
+    }
+}
+
+fn is_sha(s: &str) -> bool {
+    (7..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Compare two commits (`base...head`). Returns `None` when GitHub can't
+/// compare them: after a force-push the old commit can be garbage-collected
+/// (404), or the two have no common history (422).
+pub async fn compare_commits(
+    state: &AppState,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    base: &str,
+    head: &str,
+) -> AppResult<Option<Compare>> {
+    if !is_sha(base) || !is_sha(head) {
+        return Err(AppError::Other(format!("not a commit sha: {base}...{head}")));
+    }
+    let url = format!("{API}/repos/{owner}/{repo}/compare/{base}...{head}");
+    // Files come only on the first page; 100 commits is plenty to list.
+    let res = auth_request(state, token, reqwest::Method::GET, &url)
+        .query(&[("per_page", "100")])
+        .send()
+        .await?;
+    match check(res).await {
+        Ok(res) => {
+            let raw: CompareRaw = res.json().await?;
+            Ok(Some(raw.into()))
+        }
+        Err(AppError::Upstream { status: 404 | 422, .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 pub async fn list_checks(
@@ -935,6 +1075,43 @@ mod tests {
         assert_eq!(secondary_backoff(3), 480);
         assert_eq!(secondary_backoff(4), SECONDARY_MAX_WAIT);
         assert_eq!(secondary_backoff(u32::MAX), SECONDARY_MAX_WAIT);
+    }
+
+    #[test]
+    fn compare_keeps_first_message_line_and_flags_truncation() {
+        let json = r#"{
+            "status": "ahead", "ahead_by": 2, "behind_by": 0, "total_commits": 2,
+            "commits": [
+                {"sha": "aaa1111", "commit": {"message": "Fix null check\n\nbody", "author": {"name": "Ann", "date": "2026-10-01T10:00:00Z"}}, "author": {"login": "ann"}},
+                {"sha": "bbb2222", "commit": {"message": "Tidy", "author": {"name": "Bob", "date": null}}, "author": null}
+            ],
+            "files": [{"sha": "f1", "filename": "a.ts", "status": "modified", "additions": 1, "deletions": 0, "changes": 1, "patch": "@@ -1 +1,2 @@\n a\n+b"}]
+        }"#;
+        let c: Compare = serde_json::from_str::<CompareRaw>(json).unwrap().into();
+        assert_eq!(c.status, "ahead");
+        assert_eq!(c.commits[0].subject, "Fix null check");
+        assert_eq!(c.commits[0].author.as_deref(), Some("ann"));
+        assert_eq!(c.commits[1].author.as_deref(), Some("Bob"));
+        assert_eq!(c.files.len(), 1);
+        assert!(!c.files_truncated);
+    }
+
+    #[test]
+    fn compare_without_files_is_empty_not_an_error() {
+        let json = r#"{"status": "diverged", "ahead_by": 3, "behind_by": 1, "total_commits": 3}"#;
+        let c: Compare = serde_json::from_str::<CompareRaw>(json).unwrap().into();
+        assert_eq!(c.status, "diverged");
+        assert!(c.files.is_empty());
+        assert!(c.commits.is_empty());
+    }
+
+    #[test]
+    fn compare_rejects_non_sha_refs() {
+        assert!(is_sha("abc1234"));
+        assert!(is_sha(&"a".repeat(40)));
+        assert!(!is_sha("main"));
+        assert!(!is_sha("abc12../x"));
+        assert!(!is_sha("abc"));
     }
 
     #[test]

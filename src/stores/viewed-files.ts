@@ -47,6 +47,12 @@ interface State {
    * Returns how many keys were touched.
    */
   importViewed: (viewed: Record<string, Record<string, true>>) => number;
+  /**
+   * Copy viewed marks from one head to another for the paths `keep` accepts:
+   * files the new commits didn't touch were already read. A union, so running
+   * it again changes nothing. Returns how many marks were added.
+   */
+  carryForward: (fromKey: string, toKey: string, keep: (path: string) => boolean) => number;
 }
 
 export function viewedKey(owner: string, repo: string, number: number, sha: string): string {
@@ -83,6 +89,21 @@ export const useViewedFiles = create<State>()(
         }
         if (touched > 0) set({ viewed: next });
         return touched;
+      },
+      carryForward: (fromKey, toKey, keep) => {
+        if (fromKey === toKey) return 0;
+        const from = get().viewed[fromKey];
+        if (!from) return 0;
+        const to = get().viewed[toKey] ?? {};
+        const next = { ...to };
+        let added = 0;
+        for (const path of Object.keys(from)) {
+          if (next[path] || !keep(path)) continue;
+          next[path] = true;
+          added++;
+        }
+        if (added > 0) set({ viewed: { ...get().viewed, [toKey]: next } });
+        return added;
       },
 
       collapsed: {},

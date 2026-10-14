@@ -6,6 +6,7 @@ import { DiffFindBar } from "@/components/diff-find-bar";
 import { DiffViewer } from "@/components/diff-viewer";
 import { EmptyState } from "@/components/empty-state";
 import { FileTree } from "@/components/file-tree";
+import { FollowUpsPanel } from "@/components/followups-panel";
 import { GuidedReview } from "@/components/guided-review";
 import { LabelPicker } from "@/components/label-picker";
 import { LayerBar, useLayerScope } from "@/components/layered-review";
@@ -16,6 +17,11 @@ import { ReviewContextPane } from "@/components/review-context-pane";
 import { ReviewSubmitPopover, reviewStateToEvent } from "@/components/review-submit-dialog";
 import { ReviewThreadGroup } from "@/components/review-thread";
 import { Segmented } from "@/components/segmented";
+import {
+  type SinceDiff,
+  SinceReviewBanner,
+  type SinceView,
+} from "@/components/since-review-banner";
 import { StackRail } from "@/components/stack-rail";
 import { TooltipFor } from "@/components/tooltip-for";
 import {
@@ -43,6 +49,7 @@ import type { AiAction } from "@/lib/ai-actions";
 import { useAttachBridge } from "@/lib/ai/attach-bridge";
 import { type ContextOptions, type ReviewContext, buildReviewContext } from "@/lib/ai/context";
 import { isTestFile } from "@/lib/focus";
+import { myThreads } from "@/lib/followups";
 import { relativeTime } from "@/lib/format";
 import { isImagePath } from "@/lib/images";
 import { celebrate } from "@/lib/kite-release";
@@ -55,6 +62,7 @@ import {
   isCommentableLine,
   locatedNote,
 } from "@/lib/review-draft-bridge";
+import { commentableNewLines, lastReview } from "@/lib/since-review";
 import type {
   ActionsJob,
   ActionsStep,
@@ -73,6 +81,7 @@ import type {
 } from "@/lib/tauri";
 import { invoke } from "@/lib/tauri";
 import { safeOpenUrl, toastError, toastRetry } from "@/lib/ui";
+import { useSinceReview } from "@/lib/use-since-review";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/stores/auth";
 import { useEditorPrefs } from "@/stores/editor-prefs";
@@ -107,6 +116,7 @@ import {
   GitPullRequest,
   Layers,
   MessageSquare,
+  MessageSquareText,
   OctagonX,
   PanelLeft,
   PanelRight,
@@ -152,6 +162,9 @@ const EMPTY_CONTEXT: ReviewContext = {
   text: "",
   size: { files: 0, churn: 0, shownFiles: 0, shownChurn: 0, coverage: 1 },
 };
+
+/** How often an open PR re-reads its comments and threads. */
+const CONVERSATION_POLL_MS = 60_000;
 
 function mergeReview(
   qc: ReturnType<typeof useQueryClient>,
@@ -319,10 +332,15 @@ export function PRDetailPage() {
     staleTime: 60_000,
   });
 
+  // Conversation queries poll while the PR is open, so a reply lands without a
+  // manual refresh. The background poller can't cover this: it only watches
+  // PRs requesting your review (which stops once you've reviewed) and watched
+  // repos. Paused while the window is hidden (TanStack's default).
   const threads = useQuery({
     queryKey: ["pull-review-comments", owner, repo, number],
     queryFn: () => invoke<ReviewThread[]>("gh_list_review_comments", { owner, repo, number }),
     staleTime: 30_000,
+    refetchInterval: CONVERSATION_POLL_MS,
   });
 
   // GraphQL thread data (resolve state + node ids) powers reply/resolve in both
@@ -331,6 +349,7 @@ export function PRDetailPage() {
     queryKey: ["pull-review-threads-gql", owner, repo, number],
     queryFn: () => invoke<ReviewThreadGraphQL[]>("gh_list_review_threads", { owner, repo, number }),
     staleTime: 30_000,
+    refetchInterval: CONVERSATION_POLL_MS,
   });
 
   const reviews = useQuery({
@@ -341,13 +360,10 @@ export function PRDetailPage() {
 
   // The viewer's own latest review verdict, so the header button reflects that
   // they've already reviewed (instead of always reading "Review" / undone).
-  const myReviewState = useMemo(() => {
-    const meaningful = new Set(["APPROVED", "CHANGES_REQUESTED", "COMMENTED"]);
-    const mine = (reviews.data ?? [])
-      .filter((r) => r.user.login === viewerLogin && meaningful.has(r.state))
-      .sort((a, b) => +new Date(b.submitted_at ?? 0) - +new Date(a.submitted_at ?? 0));
-    return mine[0]?.state ?? null;
-  }, [reviews.data, viewerLogin]);
+  const myReviewState = useMemo(
+    () => lastReview(reviews.data ?? [], viewerLogin)?.state ?? null,
+    [reviews.data, viewerLogin],
+  );
 
   // GraphQL node id is needed for draft↔ready and thread-resolve mutations.
   const nodeId = useQuery({
@@ -499,15 +515,91 @@ export function PRDetailPage() {
     headSha,
     viewedKey: vk,
   });
-  const scopedFiles = layers.active ? layers.scopedFiles : fileList;
-  // Inside a layer, a file from another layer must never stay open — otherwise
-  // the diff pane and the tree disagree about what's being reviewed.
-  const current = layers.active
-    ? activeFile && scopedFiles.some((f) => f.filename === activeFile)
-      ? activeFile
-      : (scopedFiles[0]?.filename ?? null)
-    : (activeFile ?? fileList[0]?.filename ?? null);
+
+  // Since your review: after new pushes, narrow the review loop to the files
+  // that changed since the viewer's last review. Combines with layers.
+  const since = useSinceReview({
+    owner,
+    repo,
+    number,
+    headSha,
+    prBaseSha: detail.data?.base.sha,
+    prFiles: fileList,
+    reviews: reviews.data,
+    viewerLogin,
+  });
+  const sinceFilterPref = usePrView((s) => s.sinceReview?.[prViewKey]);
+  const setSinceFilter = usePrView((s) => s.setSinceReview);
+  const [sinceDiff, setSinceDiff] = useState<SinceDiff>("range");
+  const sinceChanged =
+    since.state.mode === "incremental" || since.state.mode === "rebased"
+      ? since.state.changed
+      : null;
+  const sinceActive = !!sinceChanged && (sinceFilterPref ?? true);
+  const sinceView: SinceView = (sinceFilterPref ?? true) ? sinceDiff : "all";
+  const setSinceView = (v: SinceView) => {
+    setSinceFilter(prViewKey, v !== "all");
+    if (v !== "all") setSinceDiff(v);
+  };
+  // Showing only the new commits' diff: the tree's status letters and +/− bars
+  // describe that same diff, not the PR's, so a file added by the PR but only
+  // touched since reads as the small modification it is.
+  const sinceRangeFiles = useMemo(
+    () =>
+      sinceActive && sinceDiff === "range" && since.state.mode === "incremental"
+        ? new Map(since.state.files.map((f) => [f.filename, f]))
+        : null,
+    [sinceActive, sinceDiff, since.state],
+  );
+
+  const layerFiles = layers.active ? layers.scopedFiles : fileList;
+  const scopedFiles = useMemo(
+    () =>
+      sinceActive && sinceChanged
+        ? layerFiles.filter((f) => sinceChanged.has(f.filename))
+        : layerFiles,
+    [sinceActive, sinceChanged, layerFiles],
+  );
+  // Inside a layer (or the since-review filter), a file outside it must never
+  // stay open — otherwise the diff pane and the tree disagree about what's
+  // being reviewed.
+  const sinceInLayer =
+    layers.active && sinceChanged
+      ? layerFiles.filter((f) => sinceChanged.has(f.filename)).length
+      : null;
+  const current =
+    layers.active || sinceActive
+      ? activeFile && scopedFiles.some((f) => f.filename === activeFile)
+        ? activeFile
+        : (scopedFiles[0]?.filename ?? null)
+      : (activeFile ?? fileList[0]?.filename ?? null);
   const currentFile = fileList.find((f) => f.filename === current) ?? null;
+  // Incremental since-review diff: the range patch replaces the PR patch, and
+  // only lines in the PR's own diff take new comments (GitHub rejects others).
+  const rangeFile = (currentFile && sinceRangeFiles?.get(currentFile.filename)) ?? null;
+  const currentPatch = currentFile?.patch;
+  const commentableRight = useMemo(
+    () => (rangeFile ? commentableNewLines(currentPatch) : null),
+    [rangeFile, currentPatch],
+  );
+
+  // Your comments: the threads the viewer started, and whether later pushes
+  // addressed them. The check itself runs only from the panel.
+  const [followUpsOpen, setFollowUpsOpen] = useState(false);
+  const followUps = useMemo(
+    () => myThreads(reviewThreadsGql.data ?? [], threads.data ?? [], viewerLogin),
+    [reviewThreadsGql.data, threads.data, viewerLogin],
+  );
+  // Jump from the panel to a line. A file the since-review filter hides turns
+  // the filter off — otherwise `current` would snap back into the filtered set.
+  const jumpToLine = (path: string, line: number | null) => {
+    if (sinceActive && sinceChanged && !sinceChanged.has(path)) setSinceFilter(prViewKey, false);
+    setActiveFile(path);
+    if (line != null) {
+      setFocusLine(line);
+      setFocusNonce((n) => n + 1);
+    }
+  };
 
   // Back / forward between the tour and the files it links to (and any other
   // file you open). Only once a file has been picked — the first-file fallback
@@ -592,6 +684,13 @@ export function PRDetailPage() {
   const visibleFiles = fileFilter.trim()
     ? scopedFiles.filter((f) => f.filename.toLowerCase().includes(fileFilter.trim().toLowerCase()))
     : scopedFiles;
+  const treeFiles = useMemo(
+    () =>
+      sinceRangeFiles
+        ? visibleFiles.map((f) => sinceRangeFiles.get(f.filename) ?? f)
+        : visibleFiles,
+    [visibleFiles, sinceRangeFiles],
+  );
   const autoMarkViewed = useReviewPrefs((s) => s.autoMarkViewed);
   const autoReadyOnReview = useReviewPrefs((s) => s.autoReadyOnReview);
   const diffDensity = useReviewPrefs((s) => s.diffDensity);
@@ -1403,6 +1502,25 @@ export function PRDetailPage() {
                   </button>
                 </TooltipFor>
               )}
+              {view !== "guided" && followUps.length > 0 && (
+                <TooltipFor label="Your comments — check whether new pushes addressed them">
+                  <button
+                    type="button"
+                    onClick={() => setFollowUpsOpen((o) => !o)}
+                    aria-label="Your comments"
+                    aria-pressed={followUpsOpen}
+                    className={cn(
+                      "flex h-7 items-center gap-1 rounded-md px-1.5 text-xs tabular-nums transition-colors",
+                      followUpsOpen
+                        ? "bg-primary/15 text-primary"
+                        : "text-muted-foreground hover:bg-foreground/[0.05] hover:text-foreground",
+                    )}
+                  >
+                    <MessageSquareText className="size-3.5" />
+                    {followUps.length}
+                  </button>
+                </TooltipFor>
+              )}
               {view !== "guided" && (
                 <TooltipFor label="Focus mode hides lockfiles, generated, snapshots, renames, and format-only changes">
                   <button
@@ -1595,6 +1713,18 @@ export function PRDetailPage() {
         )}
 
         {tab === "files" && view !== "guided" && (
+          <SinceReviewBanner
+            state={since.state}
+            review={since.review}
+            view={sinceView}
+            onView={setSinceView}
+            inLayer={sinceInLayer}
+            myThreads={followUps.length}
+            onCheckComments={() => setFollowUpsOpen(true)}
+          />
+        )}
+
+        {tab === "files" && view !== "guided" && (
           <ResizablePanelGroup
             direction="horizontal"
             className="flex-1 min-h-0"
@@ -1632,7 +1762,7 @@ export function PRDetailPage() {
                 </div>
                 <div className="min-h-0 flex-1">
                   <FileTree
-                    files={visibleFiles}
+                    files={treeFiles}
                     active={current}
                     onSelect={setActiveFile}
                     loading={files.isLoading && fileList.length === 0}
@@ -1650,7 +1780,8 @@ export function PRDetailPage() {
                   {currentFile ? (
                     <DiffViewer
                       path={currentFile.filename}
-                      patch={currentFile.patch}
+                      patch={rangeFile ? rangeFile.patch : currentFile.patch}
+                      commentableRight={commentableRight}
                       // Layered review is a mode on top of a layout, not a
                       // layout of its own — keep rendering the diff the way the
                       // reviewer last chose.
@@ -1684,7 +1815,9 @@ export function PRDetailPage() {
                       baseSha={detail.data?.base.sha}
                       status={currentFile.status}
                       previousPath={currentFile.previous_filename}
-                      viewedKey={vk}
+                      // Gap expansions and scroll are indexed by this diff's
+                      // hunks, so the since-review diff keeps its own.
+                      viewedKey={rangeFile && vk ? `${vk}#since` : vk}
                       fileLinesLoading={fileContent.isLoading && fileContent.dataUpdatedAt === 0}
                       onAskAi={() => {
                         void revealChat();
@@ -1710,6 +1843,29 @@ export function PRDetailPage() {
                     prKey={prViewKey}
                     headSha={headSha ?? null}
                     changedPaths={changedPaths}
+                  />
+                </ResizablePanel>
+              </>
+            )}
+            {followUpsOpen && (
+              <>
+                <ResizableHandle />
+                <ResizablePanel id="followups" order={4} defaultSize={28} minSize={20}>
+                  <FollowUpsPanel
+                    owner={owner}
+                    repo={repo}
+                    number={number}
+                    prKey={prViewKey}
+                    headSha={headSha}
+                    prFiles={fileList}
+                    prAuthor={d.user?.login ?? null}
+                    cwd={localRepo?.path ?? null}
+                    followUps={followUps}
+                    gqlThreads={reviewThreadsGql.data ?? []}
+                    comments={threads.data ?? []}
+                    viewerLogin={viewerLogin}
+                    onJump={jumpToLine}
+                    onClose={() => setFollowUpsOpen(false)}
                   />
                 </ResizablePanel>
               </>
@@ -2204,6 +2360,7 @@ function Conversation({
     queryKey: ["pull-issue-comments", owner, repo, number],
     queryFn: () => invoke<IssueComment[]>("gh_list_issue_comments", { owner, repo, number }),
     staleTime: 30_000,
+    refetchInterval: CONVERSATION_POLL_MS,
   });
   const comments = issueComments.data ?? [];
 

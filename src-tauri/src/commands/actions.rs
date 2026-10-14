@@ -742,6 +742,10 @@ pub struct ReviewThreadGraphQL {
     pub line: Option<u64>,
     pub original_line: Option<u64>,
     pub comment_ids: Vec<u64>,
+    /// Who resolved the thread, when it is resolved.
+    pub resolved_by: Option<String>,
+    /// GitHub's flag for a thread whose line no longer exists at the head.
+    pub is_outdated: bool,
 }
 
 /// List PR review threads with their node IDs and resolved state — needed so
@@ -762,6 +766,8 @@ pub async fn gh_list_review_threads(
                     nodes {
                         id
                         isResolved
+                        isOutdated
+                        resolvedBy { login }
                         path
                         line
                         originalLine
@@ -787,12 +793,18 @@ pub async fn gh_list_review_threads(
         id: String,
         #[serde(rename = "isResolved")]
         is_resolved: bool,
+        #[serde(rename = "isOutdated", default)]
+        is_outdated: bool,
+        #[serde(rename = "resolvedBy")]
+        resolved_by: Option<Login>,
         path: String,
         line: Option<u64>,
         #[serde(rename = "originalLine")]
         original_line: Option<u64>,
         comments: Comments,
     }
+    #[derive(Deserialize)]
+    struct Login { login: String }
     #[derive(Deserialize)]
     struct Comments { nodes: Vec<Comment> }
     #[derive(Deserialize)]
@@ -820,6 +832,8 @@ pub async fn gh_list_review_threads(
             line: t.line,
             original_line: t.original_line,
             comment_ids: t.comments.nodes.into_iter().filter_map(|c| c.database_id).collect(),
+            resolved_by: t.resolved_by.map(|u| u.login),
+            is_outdated: t.is_outdated,
         })
         .collect())
 }

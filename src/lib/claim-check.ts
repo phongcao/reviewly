@@ -17,6 +17,7 @@ import { extractObjects, stripFence, toArray, toInt } from "@/lib/ai/json";
 import { MAX_CLAIMS } from "@/lib/ai/prompts";
 import { type Evidence, findFile } from "@/lib/ai/verify";
 import { parsePatch } from "@/lib/diff";
+import type { FollowUpResult } from "@/lib/followups";
 import type { GuidedStep, StepKind } from "@/lib/guided";
 import type { PullFile } from "@/lib/tauri";
 
@@ -86,13 +87,26 @@ export type CheckRecord =
       unparsed?: boolean;
       checkedAt: number;
       provider: string;
-    };
+    }
+  /** Was one of the reviewer's own comments addressed? Keyed by thread id. */
+  | (FollowUpResult & {
+      type: "followup";
+      /** Newest comment in the thread when checked; a newer one makes it stale. */
+      lastCommentId: number;
+      /** What the fix was held against: the changes since the comment, or —
+       * when GitHub could no longer compare — the PR's whole change. */
+      basis: "since-comment" | "whole-pr";
+      /** Ran inside a local clone. */
+      clone: boolean;
+      checkedAt: number;
+      provider: string;
+    });
 
 /** Which check a stop gets. Concerns and questions are claims about intent and
  * about code outside the diff, so they get the clone-backed concern check;
  * orientation and praise describe what the code does, which a claim check can
  * hold against the patch with no clone. */
-export const checkTypeFor = (kind: StepKind): CheckRecord["type"] =>
+export const checkTypeFor = (kind: StepKind): "concern" | "claims" =>
   kind === "concern" || kind === "question" ? "concern" : "claims";
 
 export interface ClaimCheckContext {
@@ -219,7 +233,7 @@ export type Trust = "verified" | "contradicted" | "unchecked" | "unanchored";
 
 export function stepTrust(evidence: Evidence, check?: CheckRecord): Trust {
   if (evidence === "heuristic") return "unanchored";
-  if (!check) return "unchecked";
+  if (!check || check.type === "followup") return "unchecked";
   if (check.type === "claims") {
     if (check.result === "contradicted") return "contradicted";
     if (check.result === "supported") return "verified";

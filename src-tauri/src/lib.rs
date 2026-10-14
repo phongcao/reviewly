@@ -273,6 +273,7 @@ pub fn run() {
             commands::pulls::gh_get_pull,
             commands::pulls::gh_list_pull_files,
             commands::pulls::gh_list_commits,
+            commands::pulls::gh_compare_commits,
             commands::pulls::gh_list_checks,
             commands::pulls::gh_check_annotations,
             commands::pulls::gh_actions_job,

@@ -398,6 +398,116 @@ export function buildConcernCheckPrompt(step: GuidedStep): string {
     .join("\n");
 }
 
+/** Most characters of one file's changes a follow-up check is sent. */
+export const FOLLOWUP_PATCH_CHARS = 30_000;
+
+export interface FollowUpPromptInput {
+  path: string;
+  /** Where the comment was left, as a line in the commit it was made on. */
+  originalLine: number | null;
+  originalCommit: string | null;
+  reviewer: string;
+  comment: string;
+  /** The code the comment was left on, as GitHub recorded it. */
+  diffHunk: string | null;
+  replies: { author: string; body: string }[];
+  prAuthor: string | null;
+  resolved: boolean;
+  resolvedBy: string | null;
+  outdated: boolean;
+  /** This file's changes since the comment (or the PR's, see `basis`). Null =
+   * the file did not change. */
+  patch: string | null;
+  basis: "since-comment" | "whole-pr";
+  /** Other files changed since the comment, as "path (+a −d)". */
+  otherFiles: string[];
+  clone: boolean;
+  /** The reviewer's custom instructions, already formatted, or "". */
+  custom: string;
+}
+
+/**
+ * Ask whether ONE review comment was addressed. The checker sees the comment,
+ * the code it was on, the replies, and what changed since — and is told that a
+ * reply is a claim, not evidence. `parseFollowUpCheck` enforces that.
+ */
+export function buildFollowUpCheckPrompt(o: FollowUpPromptInput): string {
+  const at = `${o.path}${o.originalLine ? `:${o.originalLine}` : ""}`;
+  const commit = o.originalCommit ? ` (commit \`${o.originalCommit.slice(0, 7)}\`)` : "";
+  const replies = o.replies.length
+    ? o.replies
+        .map((r) => {
+          const who = r.author === o.prAuthor ? `@${r.author} (PR author)` : `@${r.author}`;
+          return `- ${who}: ${r.body.trim().replace(/\n+/g, "\n  ")}`;
+        })
+        .join("\n")
+    : "(no replies)";
+  const state = [
+    o.resolved
+      ? `The thread is resolved${o.resolvedBy ? ` by @${o.resolvedBy}` : ""}.`
+      : "The thread is open.",
+    o.outdated ? "GitHub marks it outdated: the line it was on has changed." : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  const patch =
+    o.patch == null
+      ? "This file has not changed since the comment."
+      : `\`\`\`diff\n${o.patch.length > FOLLOWUP_PATCH_CHARS ? `${o.patch.slice(0, FOLLOWUP_PATCH_CHARS)}\n… (truncated)` : o.patch}\n\`\`\``;
+  const changesHeading =
+    o.basis === "since-comment"
+      ? `## Changes to ${o.path} since the comment`
+      : `## The pull request's whole change to ${o.path}\nGitHub could not compare against the commit the comment was made on (history was rewritten), so this is the PR's full change to the file, not only what changed since the comment.`;
+  const others = o.otherFiles.length ? o.otherFiles.map((f) => `- ${f}`).join("\n") : "(none)";
+  const see = o.clone
+    ? "You are running inside a local checkout of the repository and may read files in it to follow the fix. The checkout may not be at the pull request's head commit: if a file disagrees with the diff above, trust the diff."
+    : "There is NO checkout. You can see ONLY what is above. Code outside it is invisible to you.";
+
+  return `You are checking whether ONE code-review comment was addressed by later commits. You did not write the code or the replies. Do not trust the replies. Check the code.
+
+## The review comment
+By @${o.reviewer} on ${at}${commit}:
+${o.comment.trim()}
+
+## The code it was left on
+\`\`\`diff
+${o.diffHunk ?? "(not recorded)"}
+\`\`\`
+
+## Replies
+${replies}
+
+${state}
+
+${changesHeading}
+${patch}
+
+## Other files changed${o.basis === "since-comment" ? " since the comment" : " in the PR"}
+${others}
+A fix can land in another file. Read it there only if you can see it.
+
+## What you can see
+${see}
+
+## Decide
+- "addressed": the code changed, and the change does what the comment asked, or fixes the problem it named in another way.
+- "partial": the code changed toward it, but part of the request is still not done.
+- "not_addressed": the code does not fix it. A reply that says "fixed" or "done" is NOT evidence. Only changed code is.
+- "declined": the code does not change it, and a reply gives a reason not to. Say in "summary" whether the reason holds.
+- "unclear": what you can see does not settle it.
+
+Also classify the latest reply from someone other than @${o.reviewer} as "replyClaim": "fixed" (says it is done), "declined" (says it will not change), "question" (asks something back), or "none" (no such reply).
+
+For "addressed" or "partial", cite in "evidence" the lines that show the fix: new-file line numbers from a diff above (the \`+\` side of the \`@@\` header). A verdict with no such line is treated as "unclear".
+For "not_addressed" or "partial", put in "followUp" a short, polite reply the reviewer can post: what is still missing. Otherwise leave it out.
+
+${STE_STYLE_CLAUSE}
+Apply this style to "summary" and each evidence "note", not to "followUp".${o.custom}
+
+Reply with ONLY one JSON object — no prose, no code fences:
+{"verdict":"addressed"|"partial"|"not_addressed"|"declined"|"unclear","summary":"1-2 sentences","replyClaim":"fixed"|"declined"|"question"|"none","evidence":[{"path":"path/to/file","line":<new-file line>,"endLine":<optional>,"note":"what this line does for the comment"}],"followUp":"optional reply"}`;
+}
+
 /**
  * The verdict rubric shared by both claim checks.
  *

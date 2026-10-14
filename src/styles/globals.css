@@ -66,6 +66,12 @@
   --warning-foreground: oklch(0.92 0.1 75);
   --info: oklch(0.7 0.16 240);
   --info-foreground: oklch(0.92 0.1 240);
+  /* Text on a soft tint of the tone (e.g. bg-destructive/10) — the
+   * -foreground tokens are for solid fills and wash out on a tint. */
+  --destructive-soft: oklch(0.8 0.13 25);
+  --success-soft: oklch(0.85 0.13 145);
+  --warning-soft: oklch(0.88 0.12 75);
+  --info-soft: oklch(0.82 0.11 240);
 
   /* ── Edges: there are exactly three levels, and no others. ──────────────
    * 1. NONE — the default for anything inline: chips, kbds, counters, pills,
@@ -148,6 +154,10 @@
   --warning-foreground: oklch(0.99 0.02 70);
   --info: oklch(0.54 0.16 245);
   --info-foreground: oklch(0.98 0.02 245);
+  --destructive-soft: oklch(0.48 0.19 25);
+  --success-soft: oklch(0.44 0.12 150);
+  --warning-soft: oklch(0.5 0.12 65);
+  --info-soft: oklch(0.46 0.15 245);
 
   /* Light needs slightly more present structure than dark. */
   --border: oklch(0.5 0.012 70 / 0.45);
@@ -188,6 +198,10 @@
   --color-warning-foreground: var(--warning-foreground);
   --color-info: var(--info);
   --color-info-foreground: var(--info-foreground);
+  --color-destructive-soft: var(--destructive-soft);
+  --color-success-soft: var(--success-soft);
+  --color-warning-soft: var(--warning-soft);
+  --color-info-soft: var(--info-soft);
   --color-border: var(--border);
   --color-hairline: var(--hairline);
   --color-input: var(--input);

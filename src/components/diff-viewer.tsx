@@ -112,6 +112,12 @@ interface Props {
   onAskAi?: () => void;
   /** Opens a location in the review context pane, beside the diff. */
   onPeek?: (loc: ReviewLocation) => void;
+  /**
+   * Set when `patch` is not the PR's own diff (e.g. "since your review"): the
+   * new-file lines GitHub will accept a comment on. Old-side lines then belong
+   * to another commit, so they take no comments and show no threads.
+   */
+  commentableRight?: ReadonlySet<number> | null;
 }
 
 interface GapInfo {
@@ -151,6 +157,8 @@ interface ThreadMeta {
   pending: PendingComment[];
   onEditPending: (id: string) => (body: string) => void;
   onRemovePending: (c: PendingComment) => void;
+  /** See `Props.commentableRight`. Absent = every line takes a comment. */
+  commentableRight?: ReadonlySet<number> | null;
 }
 const ThreadMetaContext = createContext<ThreadMeta | null>(null);
 
@@ -254,6 +262,7 @@ export function DiffViewer({
   viewedKey,
   fileLinesLoading = false,
   onAskAi,
+  commentableRight = null,
 }: Props) {
   const hunks = useMemo(() => parsePatch(patch), [patch]);
 
@@ -817,6 +826,7 @@ export function DiffViewer({
               pending,
               onEditPending,
               onRemovePending,
+              commentableRight,
             }}
           >
             <DiffSelectionToolbar
@@ -877,6 +887,7 @@ export function DiffViewer({
         pending,
         onEditPending,
         onRemovePending,
+        commentableRight,
       }}
     >
       {toolbar}
@@ -1742,12 +1753,7 @@ function RowUnified({
         ...pendingAt(meta?.pending, "RIGHT", line.newLine),
       ];
   const matchingThreads = !isHunk
-    ? threads.filter(
-        (t) =>
-          t.path === path &&
-          ((side === "RIGHT" && t.line === line.newLine) ||
-            (side === "LEFT" && t.original_line === line.oldLine)),
-      )
+    ? threads.filter((t) => threadOnLine(meta, t, path, side, line))
     : [];
   const selected = isInRange(lineNum, side, ui);
   const isPopoverHere =
@@ -1776,11 +1782,19 @@ function RowUnified({
           selected ? "border-l-2 border-l-primary bg-primary/15" : lineBgClass(line.kind),
         )}
       >
-        <Gutter num={line.oldLine} side="LEFT" ui={ui} />
-        <Gutter num={line.newLine} side="RIGHT" ui={ui} />
+        <Gutter
+          num={line.oldLine}
+          side="LEFT"
+          ui={canCommentAt(meta, "LEFT", line.oldLine) ? ui : undefined}
+        />
+        <Gutter
+          num={line.newLine}
+          side="RIGHT"
+          ui={canCommentAt(meta, "RIGHT", line.newLine) ? ui : undefined}
+        />
         <GutterSlot pending={pendingHere.length} />
         <CommentTrigger
-          disabled={lineNum == null}
+          disabled={!canCommentAt(meta, side, lineNum)}
           onClick={(shift) => ui.open({ side, line: lineNum as number }, shift)}
         />
         <span
@@ -1959,12 +1973,7 @@ function Half({
   }
   const lineNum = side === "RIGHT" ? line.newLine : line.oldLine;
   const pendingHere = pendingAt(meta?.pending, side, lineNum);
-  const matchingThreads = threads.filter(
-    (t) =>
-      t.path === path &&
-      ((side === "RIGHT" && t.line === line.newLine) ||
-        (side === "LEFT" && t.original_line === line.oldLine)),
-  );
+  const matchingThreads = threads.filter((t) => threadOnLine(meta, t, path, side, line));
   const selected = isInRange(lineNum, side, ui);
   const isPopoverHere =
     ui.popoverAt != null && ui.popoverAt.side === side && ui.popoverAt.line === lineNum;
@@ -1983,10 +1992,10 @@ function Half({
           selected ? "border-l-2 border-l-primary bg-primary/15" : lineBgClass(line.kind),
         )}
       >
-        <Gutter num={lineNum} side={side} ui={ui} />
+        <Gutter num={lineNum} side={side} ui={canCommentAt(meta, side, lineNum) ? ui : undefined} />
         <GutterSlot pending={pendingHere.length} />
         <CommentTrigger
-          disabled={lineNum == null}
+          disabled={!canCommentAt(meta, side, lineNum)}
           onClick={(shift) => ui.open({ side, line: lineNum as number }, shift)}
         />
         <pre
@@ -2021,6 +2030,31 @@ function Half({
 }
 
 /* ───────────────────── pieces ───────────────────── */
+
+/** Whether a line takes a new review comment (see `Props.commentableRight`). */
+function canCommentAt(
+  meta: ThreadMeta | null,
+  side: Side,
+  line: number | null | undefined,
+): boolean {
+  if (line == null) return false;
+  const only = meta?.commentableRight;
+  if (!only) return true;
+  return side === "RIGHT" && only.has(line);
+}
+
+/** Old-side threads sit on the PR base's line numbers; hide them over another diff. */
+function threadOnLine(
+  meta: ThreadMeta | null,
+  t: ReviewThread,
+  path: string,
+  side: Side,
+  line: DiffLine,
+): boolean {
+  if (t.path !== path) return false;
+  if (side === "RIGHT") return t.line === line.newLine;
+  return !meta?.commentableRight && t.original_line === line.oldLine;
+}
 
 function Gutter({
   num,

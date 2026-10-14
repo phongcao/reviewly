@@ -137,6 +137,20 @@ pub async fn gh_list_commits(
     github::list_commits(&state, &token, &owner, &repo, number).await
 }
 
+/// Compare two commits of a PR, e.g. the head the viewer last reviewed and
+/// the current head. `None` when GitHub can no longer compare them.
+#[tauri::command]
+pub async fn gh_compare_commits(
+    state: State<'_, AppState>,
+    owner: String,
+    repo: String,
+    base: String,
+    head: String,
+) -> AppResult<Option<github::Compare>> {
+    let token = creds::require_token()?;
+    github::compare_commits(&state, &token, &owner, &repo, &base, &head).await
+}
+
 #[tauri::command]
 pub async fn gh_list_checks(
     state: State<'_, AppState>,
