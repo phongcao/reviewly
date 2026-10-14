@@ -697,8 +697,11 @@ async fn run_codex(
     Ok(text)
 }
 
-/// Gemini CLI in non-interactive mode (`gemini -p`). Drop-in like Claude/Codex;
-/// runs inside the PR clone when present so it can read the repo.
+/// Gemini CLI in non-interactive mode. Drop-in like Claude/Codex; runs inside
+/// the PR clone when present so it can read the repo. The prompt goes over
+/// stdin, not `-p <prompt>`: one argv string is capped at 128 KiB on Linux and
+/// the whole command line at ~32K chars on Windows, both well under a large PR
+/// context. With no `-p`, a piped stdin is the prompt and runs headless.
 async fn run_gemini(
     prompt: &str,
     cwd: Option<&str>,
@@ -706,17 +709,16 @@ async fn run_gemini(
     timeout_secs: Option<u64>,
 ) -> AppResult<String> {
     let mut cmd = cli_command("gemini");
-    cmd.arg("-p")
-        .arg(prompt)
-        .stdin(Stdio::null())
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     add_model(&mut cmd, "-m", model);
     apply_cwd(&mut cmd, cwd);
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .map_err(|e| AppError::Other(format!("failed to spawn gemini: {e}")))?;
+    feed_stdin(&mut child, prompt);
     let timeout = resolve_timeout(timeout_secs, run_timeout(cwd));
     let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(res) => res.map_err(|e| AppError::Other(format!("wait gemini: {e}")))?,

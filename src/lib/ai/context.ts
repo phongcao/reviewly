@@ -4,12 +4,10 @@ import type { PullDetail, PullFile } from "@/lib/tauri";
 /** Total character budget for the diff portion of the AI context.
  *
  * Sized for a CLI that takes the prompt on STDIN, which is how this app drives
- * `claude` and `codex` — there is no OS arg-length ceiling on that path, so the
+ * every CLI provider — there is no OS arg-length ceiling on that path, so the
  * limit is the model's context (180k chars is ~45k tokens, comfortable) rather
- * than the spawn. `gemini` is the exception: it takes the prompt as a single
- * argv string, and Linux caps one argument at 128 KiB (`MAX_ARG_STRLEN`), so a
- * context that spends this budget can fail to spawn there. macOS has no
- * per-argument cap, only ~1 MB across all of argv, and is fine.
+ * than the spawn. Keep it that way: an argv-passed prompt would fail to spawn
+ * at this size on Linux (128 KiB per argument) and Windows (~32K chars).
  *
  * Raising this also moves the fan-out line: `coverage` is what fit over what
  * exists, and `shouldFanOut` treats a low value as "reviewing blind". A bigger
@@ -25,8 +23,7 @@ const DIFF_BUDGET = 180_000;
  * the number to raise when big layers come back thin.
  *
  * Two-thirds of the whole-PR budget: a tour fans out into as many as
- * `LAYER_CAP` of these calls, so full parity per slice would multiply. The stdin vs
- * argv caveat on `DIFF_BUDGET` applies here too. */
+ * `LAYER_CAP` of these calls, so full parity per slice would multiply. */
 export const LAYER_DIFF_BUDGET = 120_000;
 
 /** Floor on a single file's share of the budget. Below this a slice is a few
