@@ -10,15 +10,25 @@
  * ambiguity falls toward LESS trust. A reply that says "fixed" is not
  * evidence — only changed code is — so an "addressed" verdict with no cited
  * line inside the changes since the comment is downgraded to "unclear".
+ *
+ * An author may instead defer the fix to a later PR and say so ("tracking
+ * here: #175"). The check reads that issue: "deferred" needs an issue it
+ * actually read and that asks for the work, not just a reply that names one.
  */
 import { extractObjects, stripFence, toArray, toInt } from "@/lib/ai/json";
 import { type Evidence, prCorpus, verifyClaim } from "@/lib/ai/verify";
-import type { PullFile, ReviewThread, ReviewThreadGraphQL } from "@/lib/tauri";
+import type { IssueSummary, PullFile, ReviewThread, ReviewThreadGraphQL } from "@/lib/tauri";
 
-export type FollowUpVerdict = "addressed" | "partial" | "not_addressed" | "declined" | "unclear";
+export type FollowUpVerdict =
+  | "addressed"
+  | "partial"
+  | "not_addressed"
+  | "declined"
+  | "deferred"
+  | "unclear";
 
 /** What the latest reply from someone other than the reviewer says it did. */
-export type ReplyClaim = "fixed" | "declined" | "question" | "none";
+export type ReplyClaim = "fixed" | "declined" | "deferred" | "question" | "none";
 
 /** One thread the viewer started, with everything the check needs. */
 export interface FollowUp {
@@ -118,6 +128,89 @@ export function latestOwnReplyAfterOthers(f: FollowUp): ReviewThread | null {
   return last && last.user.login === f.root.user.login ? last : null;
 }
 
+/** An issue or PR a reply points to, e.g. "tracking here: #175". */
+export interface IssueRef {
+  owner: string;
+  repo: string;
+  number: number;
+}
+
+/** A linked issue as the check read it. */
+export interface LinkedIssue extends IssueRef {
+  /** How the prompt names it: `#175` in this repo, `owner/repo#175` elsewhere. */
+  ref: string;
+  /** Null when it could not be read (no access, deleted, not found). */
+  issue: IssueSummary | null;
+}
+
+/** The issue a "deferred" verdict rests on. */
+export interface Tracking {
+  ref: string;
+  title: string;
+  /** `open` or `closed`, when checked. */
+  state: string;
+  stateReason: string | null;
+  isPull: boolean;
+  url: string;
+  /** The issue asks for all of what the comment asked, or only part of it. */
+  covers: "all" | "part";
+}
+
+/** Most linked issues one check reads. */
+export const MAX_LINKED_ISSUES = 3;
+
+const ISSUE_URL = /https?:\/\/github\.com\/([\w.-]+)\/([\w.-]+)\/(?:issues|pull)\/(\d+)/g;
+// `#175` or `owner/repo#175`, not an HTML entity (`&#39;`) or a URL fragment.
+const SHORT_REF = /(?<![\w&/#])(?:([\w.-]+)\/([\w.-]+))?#(\d+)\b/g;
+
+const sameRepo = (a: { owner: string; repo: string }, b: { owner: string; repo: string }) =>
+  a.owner.toLowerCase() === b.owner.toLowerCase() && a.repo.toLowerCase() === b.repo.toLowerCase();
+
+/** `#175` in the PR's repo, `owner/repo#175` elsewhere. */
+export const issueRefLabel = (r: IssueRef, here: { owner: string; repo: string }): string =>
+  sameRepo(r, here) ? `#${r.number}` : `${r.owner}/${r.repo}#${r.number}`;
+
+/**
+ * Issues and PRs the thread's replies link to, newest reply first, without the
+ * PR itself. Code spans are skipped: `#3` in code is not a reference.
+ */
+export function linkedIssueRefs(
+  f: Pick<FollowUp, "replies">,
+  here: { owner: string; repo: string; number: number },
+): IssueRef[] {
+  const out: IssueRef[] = [];
+  const add = (owner: string, repo: string, n: string) => {
+    const r = { owner, repo, number: Number(n) };
+    if (r.number < 1 || (sameRepo(r, here) && r.number === here.number)) return;
+    if (out.some((o) => o.number === r.number && sameRepo(o, r))) return;
+    out.push(r);
+  };
+  for (let i = f.replies.length - 1; i >= 0; i--) {
+    let text = f.replies[i].body.replace(/```[\s\S]*?```/g, " ").replace(/`[^`\n]*`/g, " ");
+    for (const m of text.matchAll(ISSUE_URL)) add(m[1], m[2], m[3]);
+    text = text.replace(ISSUE_URL, " ");
+    for (const m of text.matchAll(SHORT_REF)) {
+      add(m[1] ?? here.owner, m[2] ?? here.repo, m[3]);
+    }
+  }
+  return out.slice(0, MAX_LINKED_ISSUES);
+}
+
+/** The linked issue the checker named, read or not. */
+function findIssue(name: string, issues: LinkedIssue[]): LinkedIssue | undefined {
+  const url = [...name.matchAll(ISSUE_URL)][0];
+  if (url) {
+    const r = { owner: url[1], repo: url[2] };
+    return issues.find((i) => i.number === Number(url[3]) && sameRepo(i, r));
+  }
+  const m = name.match(/(?:([\w.-]+)\/([\w.-]+))?#?(\d+)\s*$/);
+  if (!m) return undefined;
+  const r = m[1] && m[2] ? { owner: m[1], repo: m[2] } : null;
+  const hits = issues.filter((i) => i.number === Number(m[3]) && (!r || sameRepo(i, r)));
+  // A bare number is only safe when one linked issue has it.
+  return hits.length === 1 ? hits[0] : undefined;
+}
+
 /** One cited line range that shows the fix. */
 export interface FollowUpEvidence {
   path: string;
@@ -134,8 +227,11 @@ export interface FollowUpResult {
   summary: string;
   replyClaim: ReplyClaim;
   evidence: FollowUpEvidence[];
-  /** A ready-to-post reply, when the comment is not (fully) addressed. */
+  /** A ready-to-post reply, when the comment is not (fully) addressed, or the
+   * issue it was deferred to leaves part of it out. */
   followUp?: string;
+  /** For "deferred": the issue that tracks the work. */
+  tracking?: Tracking;
   /** Set when the parser overrode the checker's verdict, and why. */
   downgraded?: string;
   /** The reply held no readable JSON at all. */
@@ -147,17 +243,23 @@ const VERDICTS = new Set<FollowUpVerdict>([
   "partial",
   "not_addressed",
   "declined",
+  "deferred",
   "unclear",
 ]);
-const CLAIMS = new Set<ReplyClaim>(["fixed", "declined", "question", "none"]);
+const CLAIMS = new Set<ReplyClaim>(["fixed", "declined", "deferred", "question", "none"]);
 
 const str = (v: unknown): string => (typeof v === "string" ? v.trim() : "");
 
 /**
  * Parse the checker's reply. `changes` are the files changed since the
- * comment — what a cited fix is held against.
+ * comment — what a cited fix is held against. `issues` are the linked issues
+ * the check was shown — what a deferral is held against.
  */
-export function parseFollowUpCheck(out: string, changes: PullFile[]): FollowUpResult {
+export function parseFollowUpCheck(
+  out: string,
+  changes: PullFile[],
+  issues: LinkedIssue[] = [],
+): FollowUpResult {
   const obj = extractObjects(stripFence(out)).find(
     (o): o is Record<string, unknown> => !!o && typeof o === "object" && "verdict" in o,
   );
@@ -205,13 +307,43 @@ export function parseFollowUpCheck(out: string, changes: PullFile[]): FollowUpRe
     verdict = "unclear";
   }
 
+  let tracking: Tracking | undefined;
+  if (verdict === "deferred") {
+    const t = obj.tracking && typeof obj.tracking === "object" ? obj.tracking : {};
+    const named = str((t as Record<string, unknown>).issue);
+    const hit = named ? findIssue(named, issues) : undefined;
+    if (hit?.issue) {
+      const i = hit.issue;
+      tracking = {
+        ref: hit.ref,
+        title: i.title,
+        state: i.state,
+        stateReason: i.state_reason ?? null,
+        isPull: i.pull_request != null,
+        url: i.html_url,
+        covers: str((t as Record<string, unknown>).covers) === "all" ? "all" : "part",
+      };
+    } else {
+      downgraded =
+        issues.length === 0
+          ? 'The checker said "deferred" but no reply links an issue.'
+          : hit
+            ? `The checker said "deferred" but ${hit.ref} could not be read.`
+            : 'The checker said "deferred" but did not name a linked issue that tracks it.';
+      verdict = "unclear";
+    }
+  }
+
   const followUp = str(obj.followUp);
+  const wantsReply =
+    verdict === "not_addressed" || verdict === "partial" || tracking?.covers === "part";
   return {
     verdict,
     summary: str(obj.summary),
     replyClaim,
     evidence,
-    ...(followUp && (verdict === "not_addressed" || verdict === "partial") ? { followUp } : {}),
+    ...(followUp && wantsReply ? { followUp } : {}),
+    ...(tracking ? { tracking } : {}),
     ...(downgraded ? { downgraded } : {}),
   };
 }
@@ -248,15 +380,18 @@ export function followUpFlags(
  * reviewer first, what's done last:
  *  0. open in the code (not addressed / partly), or a resolve or reply that
  *     the code doesn't back up;
- *  1. needs a judgment call (unclear, declined), or a reply arrived after the
- *     check, so its verdict may be out of date;
+ *  1. needs a judgment call (unclear, declined, or deferred to an issue that
+ *     is closed or covers only part of it) — even once resolved, until the
+ *     reviewer resolves it themselves — or a reply arrived after the check,
+ *     so its verdict may be out of date;
  *  2. unresolved and not checked yet;
- *  3. addressed, not yet resolved;
+ *  3. addressed, or deferred to an open issue that covers all of it, not yet
+ *     resolved;
  *  4. resolved (and not contradicted by a check), or resolved by the reviewer.
  */
 export function followUpRank(
   f: ResolveState,
-  r: Pick<FollowUpResult, "verdict" | "replyClaim"> | null,
+  r: Pick<FollowUpResult, "verdict" | "replyClaim" | "tracking"> | null,
   stale = false,
 ): number {
   if (resolvedByReviewer(f)) return stale ? 1 : 4;
@@ -266,7 +401,14 @@ export function followUpRank(
     return 0;
   }
   if (stale) return 1;
-  if (r.verdict === "unclear" || r.verdict === "declined") return f.resolved ? 4 : 1;
+  // A judgment call stays in view when someone else resolves the thread: the
+  // author closing it doesn't mean the reviewer accepted the reason. The
+  // reviewer resolving it themselves is handled above.
+  if (r.verdict === "deferred") {
+    const tracked = r.tracking?.state === "open" && r.tracking.covers === "all";
+    return tracked ? (f.resolved ? 4 : 3) : 1;
+  }
+  if (r.verdict === "unclear" || r.verdict === "declined") return 1;
   return f.resolved ? 4 : 3;
 }
 
@@ -276,7 +418,7 @@ export const DONE_RANK = 3;
 /** Threads ordered by `followUpRank`, file order kept within a rank. */
 export function sortFollowUps<T extends ResolveState>(
   items: T[],
-  recordOf: (f: T) => Pick<FollowUpResult, "verdict" | "replyClaim"> | null,
+  recordOf: (f: T) => Pick<FollowUpResult, "verdict" | "replyClaim" | "tracking"> | null,
   isStale: (f: T) => boolean = () => false,
 ): { f: T; rank: number }[] {
   return items

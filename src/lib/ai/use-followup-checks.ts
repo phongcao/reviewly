@@ -1,8 +1,14 @@
 import { buildFollowUpCheckPrompt } from "@/lib/ai/prompts";
 import { CHECK_CONCURRENCY } from "@/lib/ai/use-step-checks";
 import type { CheckRecord } from "@/lib/claim-check";
-import { type FollowUp, parseFollowUpCheck } from "@/lib/followups";
-import type { PullFile } from "@/lib/tauri";
+import {
+  type FollowUp,
+  type LinkedIssue,
+  issueRefLabel,
+  linkedIssueRefs,
+  parseFollowUpCheck,
+} from "@/lib/followups";
+import type { IssueSummary, PullFile } from "@/lib/tauri";
 import { invoke } from "@/lib/tauri";
 import { compareQuery } from "@/lib/use-since-review";
 import { aiInvokeArgs, useAiProvider } from "@/stores/ai";
@@ -13,6 +19,9 @@ import { useCallback, useMemo } from "react";
 
 /** Other changed files listed in one follow-up prompt. */
 const MAX_OTHER_FILES = 40;
+
+/** How long a read issue is reused across checks in one batch. */
+const ISSUE_STALE_MS = 60_000;
 
 /** Where follow-up checks live in the step-checks store, per PR head. */
 export const followUpsKey = (prKey: string, headSha: string | undefined) =>
@@ -29,6 +38,7 @@ export type FollowUpRecord = Extract<CheckRecord, { type: "followup" }>;
 export function useFollowUpRunner({
   owner,
   repo,
+  number,
   prKey,
   headSha,
   prFiles,
@@ -37,6 +47,7 @@ export function useFollowUpRunner({
 }: {
   owner: string;
   repo: string;
+  number: number;
   prKey: string;
   headSha: string | undefined;
   prFiles: PullFile[];
@@ -69,6 +80,26 @@ export function useFollowUpRunner({
     [qc, owner, repo, headSha, prFiles],
   );
 
+  /** The issues the thread's replies link to, read from GitHub. One that
+   * can't be read stays in the list, so the checker knows it was named. */
+  const linkedIssues = useCallback(
+    (f: FollowUp): Promise<LinkedIssue[]> =>
+      Promise.all(
+        linkedIssueRefs(f, { owner, repo, number }).map(async (r) => ({
+          ...r,
+          ref: issueRefLabel(r, { owner, repo }),
+          issue: await qc
+            .fetchQuery({
+              queryKey: ["issue", r.owner, r.repo, r.number],
+              queryFn: () => invoke<IssueSummary>("gh_get_issue", { ...r }),
+              staleTime: ISSUE_STALE_MS,
+            })
+            .catch(() => null),
+        })),
+      ),
+    [qc, owner, repo, number],
+  );
+
   /** Check one thread. Throws on an AI failure; the caller decides how loud. */
   const check = useCallback(
     async (f: FollowUp): Promise<void> => {
@@ -78,7 +109,7 @@ export function useFollowUpRunner({
       runs.start(rk);
       try {
         const provider = useAiProvider.getState().provider;
-        const { changes, basis } = await changesSince(f);
+        const [{ changes, basis }, issues] = await Promise.all([changesSince(f), linkedIssues(f)]);
         const file = changes.find((c) => c.filename === f.path);
         const instructions = useReviewPrefs.getState().aiInstructions.trim();
         const prompt = buildFollowUpCheckPrompt({
@@ -89,6 +120,7 @@ export function useFollowUpRunner({
           comment: f.root.body,
           diffHunk: f.diffHunk,
           replies: f.replies.map((r) => ({ author: r.user.login, body: r.body })),
+          linkedIssues: issues,
           prAuthor,
           resolved: f.resolved,
           resolvedBy: f.resolvedBy,
@@ -105,7 +137,7 @@ export function useFollowUpRunner({
         const out = await invoke<string>("ai_review", { ...aiInvokeArgs(), cwd, prompt });
         const record: FollowUpRecord = {
           type: "followup",
-          ...parseFollowUpCheck(out, changes),
+          ...parseFollowUpCheck(out, changes, issues),
           lastCommentId: f.lastCommentId,
           basis,
           clone: !!cwd,
@@ -117,7 +149,7 @@ export function useFollowUpRunner({
         useStepCheckRuns.getState().finish(rk);
       }
     },
-    [key, changesSince, prAuthor, cwd],
+    [key, changesSince, linkedIssues, prAuthor, cwd],
   );
 
   /** Check every given thread, `CHECK_CONCURRENCY` at a time. Results land as

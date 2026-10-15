@@ -1,6 +1,6 @@
 use tauri::State;
 
-use crate::clients::github::{self, ReviewThread};
+use crate::clients::github::{self, IssueSummary, ReviewThread};
 use crate::creds;
 use crate::error::AppResult;
 use crate::state::AppState;
@@ -25,6 +25,18 @@ pub async fn gh_list_issue_comments(
 ) -> AppResult<serde_json::Value> {
     let token = creds::require_token()?;
     github::list_issue_comments(&state, &token, &owner, &repo, number).await
+}
+
+/// One issue or PR, e.g. the one a reply says tracks a review comment.
+#[tauri::command]
+pub async fn gh_get_issue(
+    state: State<'_, AppState>,
+    owner: String,
+    repo: String,
+    number: u64,
+) -> AppResult<IssueSummary> {
+    let token = creds::require_token()?;
+    github::get_issue(&state, &token, &owner, &repo, number).await
 }
 
 #[tauri::command]

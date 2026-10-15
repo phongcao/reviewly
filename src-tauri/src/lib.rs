@@ -326,6 +326,7 @@ pub fn run() {
             // comments
             commands::comments::gh_list_review_comments,
             commands::comments::gh_list_issue_comments,
+            commands::comments::gh_get_issue,
             commands::comments::gh_create_issue_comment,
             commands::comments::gh_reply_review_comment,
             commands::comments::gh_create_review_comment,

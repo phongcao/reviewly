@@ -377,6 +377,19 @@ export interface DraftComment {
   start_side?: string | null;
 }
 
+/** One issue or PR from `gh_get_issue`. */
+export interface IssueSummary {
+  number: number;
+  title: string;
+  state: string;
+  /** `completed`, `not_planned`, `reopened`, or null. */
+  state_reason: string | null;
+  html_url: string;
+  body: string | null;
+  /** Non-null when the number is a pull request. */
+  pull_request?: unknown;
+}
+
 /** Parse a PR repository_url (api endpoint) into owner/repo. */
 export function parseRepoUrl(
   url: string | null | undefined,

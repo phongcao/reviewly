@@ -581,6 +581,37 @@ pub async fn list_review_comments(
     Ok(out)
 }
 
+/// An issue (or PR — GitHub serves both from `/issues`), trimmed to what a
+/// follow-up check reads: does it exist, is it open, and what does it say.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IssueSummary {
+    pub number: u64,
+    pub title: String,
+    pub state: String,
+    /// `completed`, `not_planned`, `reopened`, or null.
+    pub state_reason: Option<String>,
+    pub html_url: String,
+    pub body: Option<String>,
+    /// Set when the number is a pull request, not an issue.
+    #[serde(default)]
+    pub pull_request: Option<Value>,
+}
+
+pub async fn get_issue(
+    state: &AppState,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    number: u64,
+) -> AppResult<IssueSummary> {
+    let url = format!("{API}/repos/{owner}/{repo}/issues/{number}");
+    let res = auth_request(state, token, reqwest::Method::GET, &url)
+        .send()
+        .await?;
+    let res = check(res).await?;
+    Ok(res.json().await?)
+}
+
 pub async fn list_issue_comments(
     state: &AppState,
     token: &str,

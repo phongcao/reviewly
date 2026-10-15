@@ -14,6 +14,7 @@ import {
   DONE_RANK,
   type FollowUp,
   type FollowUpVerdict,
+  type Tracking,
   followUpFlags,
   hasNewReply,
   latestOtherReply,
@@ -23,11 +24,18 @@ import {
 } from "@/lib/followups";
 import { invoke } from "@/lib/tauri";
 import type { PullFile, ReviewThread, ReviewThreadGraphQL } from "@/lib/tauri";
-import { toastError } from "@/lib/ui";
+import { safeOpenUrl, toastError } from "@/lib/ui";
 import { cn } from "@/lib/utils";
 import { runKey, useStepCheckRuns, useStepChecks } from "@/stores/step-checks";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, ChevronRight, MessageSquareText, X } from "lucide-react";
+import {
+  AlertTriangle,
+  ChevronRight,
+  CircleDot,
+  GitPullRequest,
+  MessageSquareText,
+  X,
+} from "lucide-react";
 import { Fragment, useMemo, useState } from "react";
 import { toast } from "sonner";
 
@@ -39,6 +47,7 @@ const VERDICT: Record<
   partial: { label: "Partly addressed", variant: "warning" },
   not_addressed: { label: "Not addressed", variant: "error" },
   declined: { label: "Declined", variant: "secondary" },
+  deferred: { label: "Tracked", variant: "secondary" },
   unclear: { label: "Unclear", variant: "info" },
 };
 
@@ -85,7 +94,16 @@ export function FollowUpsPanel({
   onClose: () => void;
 }) {
   const { available } = useAiAvailable();
-  const runner = useFollowUpRunner({ owner, repo, prKey, headSha, prFiles, prAuthor, cwd });
+  const runner = useFollowUpRunner({
+    owner,
+    repo,
+    number,
+    prKey,
+    headSha,
+    prFiles,
+    prAuthor,
+    cwd,
+  });
   const checks = useStepChecks((s) => s.byKey[runner.key]);
   const inFlight = useStepCheckRuns((s) => s.inFlight);
   const batch = useStepCheckRuns((s) => s.batch[runner.key]);
@@ -190,7 +208,7 @@ export function FollowUpsPanel({
                 <ChevronRight
                   className={cn("size-3 shrink-0 transition-transform", showDone && "rotate-90")}
                 />
-                <span className="shrink-0">Addressed or resolved · {doneCount}</span>
+                <span className="shrink-0">Addressed, tracked or resolved · {doneCount}</span>
                 <span className="h-px flex-1 bg-hairline" />
               </button>
             )}
@@ -354,6 +372,7 @@ function FollowUpRow({
               <CodeSpans text={record.summary} />
             </p>
           )}
+          {record.tracking && <TrackingLink tracking={record.tracking} />}
           {record.downgraded && <p className="text-2xs text-warning">{record.downgraded}</p>}
           {record.basis === "whole-pr" && (
             <p className="text-2xs text-muted-foreground">
@@ -472,6 +491,43 @@ function FollowUpRow({
           hideLocation
           className="mt-2"
         />
+      )}
+    </div>
+  );
+}
+
+/** The issue a deferred comment is tracked in, and whether it still holds up. */
+function TrackingLink({ tracking: t }: { tracking: Tracking }) {
+  const Icon = t.isPull ? GitPullRequest : CircleDot;
+  const state =
+    t.state === "closed" && t.stateReason === "not_planned" ? "closed, not planned" : t.state;
+  return (
+    <div className="space-y-0.5">
+      <button
+        type="button"
+        onClick={() => safeOpenUrl(t.url)}
+        className="flex w-full items-center gap-1.5 text-left text-2xs hover:text-foreground"
+        title={t.url}
+      >
+        <Icon
+          className={cn(
+            "size-3 shrink-0",
+            t.state === "open" ? "text-success" : "text-muted-foreground",
+          )}
+        />
+        <span className="shrink-0 font-mono text-muted-foreground">{t.ref}</span>
+        <span className="min-w-0 truncate hover:underline">{t.title}</span>
+        <span className="ml-auto shrink-0 text-muted-foreground">{state}</span>
+      </button>
+      {t.state !== "open" && (
+        <p className="text-2xs text-warning">
+          The tracking {t.isPull ? "PR" : "issue"} is {state}: check that the work still lands.
+        </p>
+      )}
+      {t.covers === "part" && (
+        <p className="text-2xs text-warning">
+          The {t.isPull ? "PR" : "issue"} covers only part of your comment.
+        </p>
       )}
     </div>
   );
