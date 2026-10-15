@@ -30,6 +30,29 @@ interface State {
    */
   expandedGaps: Record<string, Record<string, Record<string, true>>>;
   setGapExpanded: (key: string, path: string, gapIdx: number) => void;
+  /**
+   * Where the reviewer had scrolled to in each file's diff, so leaving a file
+   * and coming back resumes mid-file instead of snapping to the top. Keyed by
+   * viewedKey → filePath → scrollTop.
+   *
+   * Head-sha-keyed like everything else here: once the PR moves, the old
+   * offsets are meaningless because the diff itself changed.
+   */
+  scrollOffsets: Record<string, Record<string, number>>;
+  setScrollOffset: (key: string, path: string, top: number) => void;
+  /**
+   * Merge viewed marks from an exported bundle. Union per key rather than
+   * newest-wins: these rows are already head-sha-keyed, so two machines writing
+   * the same key were looking at the same diff and both sets of marks are true.
+   * Returns how many keys were touched.
+   */
+  importViewed: (viewed: Record<string, Record<string, true>>) => number;
+  /**
+   * Copy viewed marks from one head to another for the paths `keep` accepts:
+   * files the new commits didn't touch were already read. A union, so running
+   * it again changes nothing. Returns how many marks were added.
+   */
+  carryForward: (fromKey: string, toKey: string, keep: (path: string) => boolean) => number;
 }
 
 export function viewedKey(owner: string, repo: string, number: number, sha: string): string {
@@ -54,6 +77,35 @@ export const useViewedFiles = create<State>()(
         delete rest[key];
         set({ viewed: rest });
       },
+      importViewed: (incoming) => {
+        const cur = get().viewed;
+        const next = { ...cur };
+        let touched = 0;
+        for (const [key, paths] of Object.entries(incoming)) {
+          const merged = { ...(cur[key] ?? {}), ...paths };
+          if (Object.keys(merged).length === Object.keys(cur[key] ?? {}).length) continue;
+          next[key] = merged;
+          touched++;
+        }
+        if (touched > 0) set({ viewed: next });
+        return touched;
+      },
+      carryForward: (fromKey, toKey, keep) => {
+        if (fromKey === toKey) return 0;
+        const from = get().viewed[fromKey];
+        if (!from) return 0;
+        const to = get().viewed[toKey] ?? {};
+        const next = { ...to };
+        let added = 0;
+        for (const path of Object.keys(from)) {
+          if (next[path] || !keep(path)) continue;
+          next[path] = true;
+          added++;
+        }
+        if (added > 0) set({ viewed: { ...get().viewed, [toKey]: next } });
+        return added;
+      },
+
       collapsed: {},
       setCollapsed: (key, path, c) => {
         const current = get().collapsed[key] ?? {};
@@ -70,6 +122,18 @@ export const useViewedFiles = create<State>()(
           else delete next[path];
         }
         set({ collapsed: { ...get().collapsed, [key]: next } });
+      },
+      scrollOffsets: {},
+      setScrollOffset: (key, path, top) => {
+        // `?? {}` guards rows persisted before this field existed.
+        const byKey = get().scrollOffsets?.[key] ?? {};
+        if (byKey[path] === top) return;
+        set({
+          scrollOffsets: {
+            ...(get().scrollOffsets ?? {}),
+            [key]: { ...byKey, [path]: top },
+          },
+        });
       },
       expandedGaps: {},
       setGapExpanded: (key, path, gapIdx) => {

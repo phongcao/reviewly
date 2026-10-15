@@ -49,6 +49,17 @@ fn pr_key(p: &github::PullSummary) -> Option<String> {
     Some(format!("{}#{}", repo_full_name(p)?, p.number))
 }
 
+/// Gap between the poller's search steps, so a cycle doesn't land on the
+/// Search API as one burst (which is what trips GitHub's secondary limit).
+const SEARCH_SPACING: Duration = Duration::from_secs(2);
+
+/// Wait out `SEARCH_SPACING`, then report whether searching is still allowed —
+/// a rate limit hit earlier in the cycle pauses every later search step.
+async fn search_ok() -> bool {
+    tokio::time::sleep(SEARCH_SPACING).await;
+    github::search_paused_for().is_none()
+}
+
 /// Poll GitHub for PRs that need the user's attention — incrementally. Each
 /// cycle does a cheap count (ETag-revalidated) plus a *delta* search for only
 /// PRs updated since the last cycle, instead of re-listing everything. Emits:
@@ -81,9 +92,20 @@ pub async fn run(app: AppHandle) {
         };
         let state = app.state::<AppState>();
 
+        // Searches are paused after a rate limit; sit this cycle out rather
+        // than failing (and logging) each step until the window passes.
+        if let Some(secs) = github::search_paused_for() {
+            tracing::debug!("github poll skipped; searches paused for {secs}s");
+            continue;
+        }
+
         // Accurate total for the tray — per_page=1 + ETag, so this is ~free.
         if let Ok(count) = github::search_count(&state, &token, BASE).await {
             let _ = app.emit("pr:tick", count);
+        }
+
+        if !search_ok().await {
+            continue;
         }
 
         // Delta: only PRs updated since the last cycle (full list on first pass).
@@ -150,6 +172,7 @@ pub async fn run(app: AppHandle) {
                     let pending: Option<HashSet<String>> = if notes
                         .iter()
                         .any(|n| n.unread && n.reason == "review_requested" && reasons.contains(&n.reason))
+                        && search_ok().await
                     {
                         github::search_prs(&state, &token, BASE)
                             .await
@@ -211,6 +234,9 @@ pub async fn run(app: AppHandle) {
             .map(|w| w.clone())
             .unwrap_or_default();
         if !watched.is_empty() {
+            if !search_ok().await {
+                continue;
+            }
             let repo_q = watched
                 .iter()
                 .map(|r| format!("repo:{r}"))

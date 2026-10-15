@@ -316,7 +316,7 @@ function AlertRow({ alert, repo }: { alert: DependabotAlert; repo: string }) {
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <span
               className={cn(
-                "rounded-md px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide",
+                "rounded-md px-1.5 py-0.5 text-3xs font-medium uppercase tracking-wide",
                 severityTone(sev),
               )}
             >
@@ -330,7 +330,7 @@ function AlertRow({ alert, repo }: { alert: DependabotAlert; repo: string }) {
             )}
           </div>
 
-          <p className="mt-1.5 text-[13px] leading-relaxed text-foreground/85">
+          <p className="mt-1.5 text-sm leading-relaxed text-foreground/85">
             {alert.security_advisory.summary}
           </p>
 
@@ -360,7 +360,7 @@ function AlertRow({ alert, repo }: { alert: DependabotAlert; repo: string }) {
         {/* right: persistent status + hover actions */}
         <div className="flex shrink-0 items-center gap-2.5">
           {fixing && (
-            <span className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground">
+            <span className="inline-flex items-center gap-1.5 text-2xs text-muted-foreground">
               <Loader2 className="size-3 animate-spin" />
               Fixing…
             </span>
@@ -370,7 +370,7 @@ function AlertRow({ alert, repo }: { alert: DependabotAlert; repo: string }) {
               <button
                 type="button"
                 onClick={() => openPr(prUrl)}
-                className="inline-flex cursor-pointer items-center gap-1.5 text-[11px] font-medium text-success transition-opacity hover:underline hover:opacity-90"
+                className="inline-flex cursor-pointer items-center gap-1.5 text-2xs font-medium text-success transition-opacity hover:underline hover:opacity-90"
               >
                 <Check className="size-3.5" />
                 Draft PR opened
@@ -387,7 +387,7 @@ function AlertRow({ alert, repo }: { alert: DependabotAlert; repo: string }) {
                     duration: 12_000,
                   })
                 }
-                className="inline-flex items-center gap-1.5 text-[11px] font-medium text-destructive transition-opacity hover:opacity-80"
+                className="inline-flex items-center gap-1.5 text-2xs font-medium text-destructive transition-opacity hover:opacity-80"
               >
                 <ShieldAlert className="size-3.5" />
                 Fix failed
@@ -417,7 +417,7 @@ function AlertRow({ alert, repo }: { alert: DependabotAlert; repo: string }) {
                 <button
                   type="button"
                   onClick={runAiFix}
-                  className="inline-flex items-center gap-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+                  className="inline-flex items-center gap-1 text-2xs text-muted-foreground transition-colors hover:text-foreground"
                 >
                   <RefreshCw className="size-3" />
                   Run again
@@ -428,7 +428,7 @@ function AlertRow({ alert, repo }: { alert: DependabotAlert; repo: string }) {
               <button
                 type="button"
                 onClick={() => safeOpenUrl(alert.html_url)}
-                className="inline-flex items-center gap-1 text-[11px] text-muted-foreground transition-colors hover:text-foreground"
+                className="inline-flex items-center gap-1 text-2xs text-muted-foreground transition-colors hover:text-foreground"
               >
                 <ExternalLink className="size-3" />
                 Open
@@ -448,7 +448,7 @@ function AlertRow({ alert, repo }: { alert: DependabotAlert; repo: string }) {
               push a fresh branch off the base you pick, and open a DRAFT PR for you to review.
             </AlertDialogDescription>
             {local && (
-              <code className="mt-1 block truncate rounded-md bg-foreground/[0.04] px-2 py-1.5 font-mono text-[11px] text-muted-foreground">
+              <code className="mt-1 block truncate rounded-md bg-foreground/[0.04] px-2 py-1.5 font-mono text-2xs text-muted-foreground">
                 {local.path}
               </code>
             )}

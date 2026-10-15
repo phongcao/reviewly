@@ -3,15 +3,29 @@ import { MarkdownBody } from "@/components/markdown-body";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { type AiAction, actionTitle, parseActions } from "@/lib/ai-actions";
-import { CHAT_SYSTEM } from "@/lib/ai/prompts";
-import { invoke } from "@/lib/tauri";
+import { buildFocusedContext, echoRefs, refForFile, refLabel, searchPaths } from "@/lib/ai/attach";
+import type { PrContextRef } from "@/lib/ai/attach";
+import { attachContext, clearContext, removeContext } from "@/lib/ai/attach-bridge";
+import { CHAT_SYSTEM, chatCheckoutClause, chatWebClause } from "@/lib/ai/prompts";
+import { type PullFile, invoke } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
-import { PROVIDER_LABEL, aiInvokeArgs, useAiProvider } from "@/stores/ai";
-import { type ChatMessage, useAiChat } from "@/stores/ai-chat";
+import { PROVIDER_LABEL, aiInvokeArgs, chatWebSearchOn, useAiProvider } from "@/stores/ai";
+import { type ChatMessage, useAiChat, whenChatHydrated } from "@/stores/ai-chat";
 import { useLocalRepos } from "@/stores/local-repos";
 import { useReviewPrefs } from "@/stores/review-prefs";
 import { listen } from "@tauri-apps/api/event";
-import { Check, Copy, MessageSquare, RotateCcw, SendHorizonal, Tag, Trash2, X } from "lucide-react";
+import {
+  Check,
+  Copy,
+  FileCode,
+  MessageSquare,
+  RotateCcw,
+  SendHorizonal,
+  Tag,
+  TextQuote,
+  Trash2,
+  X,
+} from "lucide-react";
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
@@ -22,14 +36,31 @@ interface Props {
   context: string;
   /** Posts an AI-proposed action via the app's authenticated GitHub commands. */
   executeAction: (a: AiAction) => Promise<void>;
+  /** The PR's changed files — powers the `@` path picker and lets an attached
+   * snippet be re-derived from its patch at send time. */
+  files?: PullFile[];
+  // NOTE: the host route must mount `useAttachBridge(prKey)`. It lives there,
+  // not here, because this panel unmounts when the chat is collapsed — and the
+  // bridge has to keep listening so edits made in a detached chat window still
+  // reach this window's store.
+}
+
+/** `ai:complete` payload — also what `ai_stream_claim` hands back. */
+interface StreamComplete {
+  key: string;
+  ok: boolean;
+  output?: string;
+  error?: string;
 }
 
 const EMPTY: ChatMessage[] = [];
+const NO_REFS: PrContextRef[] = [];
 
-export function AiReview({ prKey, context, executeAction }: Props) {
+export function AiReview({ prKey, context, executeAction, files }: Props) {
   const provider = useAiProvider((s) => s.provider);
   const messages = useAiChat((s) => s.byPr[prKey]) ?? EMPTY;
   const draft = useAiChat((s) => s.drafts[prKey]) ?? "";
+  const attachments = useAiChat((s) => s.attachments[prKey]) ?? NO_REFS;
   const append = useAiChat((s) => s.append);
   const reset = useAiChat((s) => s.reset);
   const setMessages = useAiChat((s) => s.setMessages);
@@ -45,6 +76,10 @@ export function AiReview({ prKey, context, executeAction }: Props) {
   }, [prKey]);
 
   const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  // The focused-context block of the turn in flight, so Regenerate re-sends the
+  // same one after the chips have been cleared.
+  const focusedRef = useRef("");
   // Live streaming state — the in-flight assistant text accumulates here (not in
   // the persisted store, to avoid a sqlite write per token); on completion the
   // backend's authoritative full text is committed as one message.
@@ -61,36 +96,72 @@ export function AiReview({ prKey, context, executeAction }: Props) {
 
   // Stream tokens (ai:chunk) + completion (ai:complete) for THIS PR. Chunks
   // accumulate live; on complete we commit the full text to the store.
+  //
+  // The turn lives in the backend, not in this component: the panel unmounts
+  // when collapsed or popped out mid-answer, and the pop-out window's panel
+  // didn't start the turn. So on mount we adopt whatever is in flight, and the
+  // answer is committed by whichever surface claims it first (exactly once).
   useEffect(() => {
-    const unlistens: Array<() => void> = [];
     let alive = true;
-    const track = (p: Promise<() => void>) => {
-      p.then((u) => (alive ? unlistens.push(u) : u()));
+    const commit = async () => {
+      const p = await invoke<StreamComplete | null>("ai_stream_claim", { key: prKey }).catch(
+        () => null,
+      );
+      if (!p) return; // another window (or a Stop) already took it
+      append(prKey, {
+        role: "assistant",
+        content: p.ok ? (p.output ?? "") : `⚠️ ${p.error ?? "AI failed"}`,
+      });
     };
-    track(
+    // Set when a turn ends while we're still looking up what to adopt, so a
+    // stale "still running" snapshot can't leave the panel stuck on "thinking".
+    let completed = false;
+    const listening = Promise.all([
       listen<{ key: string; delta: string }>("ai:chunk", (e) => {
         if (e.payload.key !== prKey || !streamingRef.current) return;
         setStreamText((t) => t + e.payload.delta);
       }),
-    );
-    track(
-      listen<{ key: string; ok: boolean; output?: string; error?: string }>("ai:complete", (e) => {
-        if (e.payload.key !== prKey || !streamingRef.current) return;
-        const p = e.payload;
-        append(prKey, {
-          role: "assistant",
-          content: p.ok ? (p.output ?? "") : `⚠️ ${p.error ?? "AI failed"}`,
-        });
+      listen<StreamComplete>("ai:complete", (e) => {
+        if (e.payload.key !== prKey) return;
+        completed = true;
         streamingRef.current = false;
         setStreaming(false);
         setStreamText("");
+        void commit();
       }),
-    );
+    ]);
+    listening.then(async () => {
+      // Appending before hydration would be overwritten when it lands.
+      await whenChatHydrated();
+      const s = await invoke<{ text: string; done: StreamComplete | null } | null>(
+        "ai_stream_state",
+        { key: prKey },
+      ).catch(() => null);
+      if (!alive || !s || completed || streamingRef.current) return;
+      if (s.done) {
+        void commit();
+      } else {
+        streamingRef.current = true;
+        setStreaming(true);
+        setStreamText(s.text);
+      }
+    });
     return () => {
       alive = false;
-      for (const u of unlistens) u();
+      listening.then((us) => {
+        for (const u of us) u();
+      });
     };
   }, [prKey, append]);
+
+  // Clicking "Ask AI" in the diff should leave the reviewer typing, not hunting
+  // for the composer.
+  const attachCount = attachments.length;
+  const prevAttachCount = useRef(attachCount);
+  useEffect(() => {
+    if (attachCount > prevAttachCount.current) inputRef.current?.focus();
+    prevAttachCount.current = attachCount;
+  }, [attachCount]);
 
   // 67: keep the latest message (and the live stream) in view.
   // biome-ignore lint/correctness/useExhaustiveDependencies: re-run on transcript/stream change
@@ -99,13 +170,14 @@ export function AiReview({ prKey, context, executeAction }: Props) {
     if (el) el.scrollTop = el.scrollHeight;
   }, [messages, streaming, streamText]);
 
-  function runTurn(history: ChatMessage[]) {
+  function runTurn(history: ChatMessage[], focused: string) {
     const transcript = history
       .map((m) => `${m.role === "user" ? "User" : "Assistant"}: ${m.content}`)
       .join("\n\n");
     const custom = aiInstructions.trim()
       ? `\n\n# Reviewer's instructions (follow these)\n${aiInstructions.trim()}`
       : "";
+    const webSearch = chatWebSearchOn();
     setStreamText("");
     setStreaming(true);
     streamingRef.current = true;
@@ -113,7 +185,8 @@ export function AiReview({ prKey, context, executeAction }: Props) {
       key: prKey,
       ...aiInvokeArgs(),
       cwd,
-      prompt: `${CHAT_SYSTEM}${custom}\n\n# Pull request\n${context}\n\n# Conversation\n${transcript}\n\nAssistant:`,
+      webSearch,
+      prompt: `${CHAT_SYSTEM}${chatCheckoutClause(!!cwd)}${chatWebClause(webSearch)}${custom}${focused}\n\n# Pull request\n${context}\n\n# Conversation\n${transcript}\n\nAssistant:`,
     }).catch((e) => {
       if (!streamingRef.current) return;
       streamingRef.current = false;
@@ -126,11 +199,21 @@ export function AiReview({ prKey, context, executeAction }: Props) {
   function send(text: string) {
     const body = text.trim();
     if (!body || streaming) return;
-    const history = [...messages, { role: "user" as const, content: body }];
-    append(prKey, { role: "user", content: body });
+    const refs = useAiChat.getState().attachments[prKey] ?? NO_REFS;
+    const focused = refs.length ? `\n\n${buildFocusedContext(refs, files ?? [])}` : "";
+    focusedRef.current = focused;
+    // The message keeps a compact echo of what was pinned (never the code): the
+    // store holds no snippet text, so a reloaded transcript would otherwise
+    // read as a context-free question — and this is what later turns see.
+    const content = refs.length ? `${echoRefs(refs)}\n\n${body}` : body;
+    const history = [...messages, { role: "user" as const, content }];
+    append(prKey, { role: "user", content });
     setInput("");
     setDraft(prKey, "");
-    runTurn(history);
+    // Chips belong to this question only. Carrying them forward would prepend a
+    // stale focused block to every later turn and misdirect the model.
+    if (refs.length) clearContext(prKey);
+    runTurn(history, focused);
   }
 
   // 66: stop the in-flight turn — abort the backend task (kills the child) and
@@ -156,7 +239,7 @@ export function AiReview({ prKey, context, executeAction }: Props) {
         ? messages.slice(0, -1)
         : messages.slice();
     setMessages(prKey, trimmed);
-    runTurn(trimmed);
+    runTurn(trimmed, focusedRef.current);
   }
 
   // 70: clearing wipes a real conversation — confirm via an undoable toast that
@@ -224,7 +307,7 @@ export function AiReview({ prKey, context, executeAction }: Props) {
               <button
                 type="button"
                 onClick={stop}
-                className="pl-1 text-[11px] font-medium text-muted-foreground/55 transition-colors hover:text-destructive"
+                className="pl-1 text-2xs font-medium text-muted-foreground/55 transition-colors hover:text-destructive"
               >
                 Stop generating
               </button>
@@ -238,7 +321,7 @@ export function AiReview({ prKey, context, executeAction }: Props) {
               <button
                 type="button"
                 onClick={stop}
-                className="ml-auto text-[11px] font-medium text-muted-foreground/55 transition-colors hover:text-destructive"
+                className="ml-auto text-2xs font-medium text-muted-foreground/55 transition-colors hover:text-destructive"
               >
                 Stop
               </button>
@@ -262,10 +345,29 @@ export function AiReview({ prKey, context, executeAction }: Props) {
             </Button>
           </div>
         )}
+        {attachments.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1">
+            {attachments.map((a) => (
+              <ContextChip key={a.id} refItem={a} onRemove={() => removeContext(prKey, a.id)} />
+            ))}
+            {attachments.length > 1 && (
+              <Button size="xs" variant="ghost" onClick={() => clearContext(prKey)}>
+                Clear all
+              </Button>
+            )}
+          </div>
+        )}
         <form onSubmit={onSubmit} className="flex items-end gap-2">
           <Textarea
+            ref={inputRef}
             value={input}
             onChange={(e) => onChangeInput(e.target.value)}
+            mentions={{
+              search: (q) => searchPaths(files ?? [], q),
+              onPick: (item) => {
+                attachContext(prKey, refForFile(item.id));
+              },
+            }}
             onKeyDown={(e) => {
               // 71: Enter or ⌘/Ctrl↵ sends; ⇧↵ inserts a newline.
               if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
@@ -278,6 +380,13 @@ export function AiReview({ prKey, context, executeAction }: Props) {
                 send(input);
                 return;
               }
+              // Backspace on an empty field peels off the last attachment —
+              // the usual "chips in a composer" gesture.
+              if (e.key === "Backspace" && input.length === 0 && attachments.length > 0) {
+                e.preventDefault();
+                removeContext(prKey, attachments[attachments.length - 1].id);
+                return;
+              }
               // 72: ↑ on an empty field recalls the previous user message to edit.
               if (e.key === "ArrowUp" && input.length === 0) {
                 const lastUser = [...messages].reverse().find((m) => m.role === "user");
@@ -287,16 +396,16 @@ export function AiReview({ prKey, context, executeAction }: Props) {
                 }
               }
             }}
-            placeholder="Talk about this PR…"
+            placeholder="Talk about this PR… (@ to attach a file)"
             rows={2}
-            className="min-h-0 flex-1 resize-none font-sans text-xs"
+            className="min-h-0 flex-1 resize-none font-sans text-sm"
           />
           <Button type="submit" size="icon-sm" disabled={streaming || !input.trim()}>
             <SendHorizonal className="size-4" />
           </Button>
         </form>
         {/* 71: keyboard hint */}
-        <p className="flex items-center gap-1.5 pl-0.5 text-[11px] text-muted-foreground/45">
+        <p className="flex items-center gap-1.5 pl-0.5 text-2xs text-muted-foreground/45">
           <span className="inline-flex items-center gap-1">
             <KbdEnter /> send
           </span>
@@ -308,9 +417,40 @@ export function AiReview({ prKey, context, executeAction }: Props) {
             </span>
             newline
           </span>
+          <span className="text-muted-foreground/30">·</span>
+          <span className="inline-flex items-center gap-1">
+            <span className="font-mono">@</span> attach a file
+          </span>
         </p>
       </div>
     </div>
+  );
+}
+
+/** One attached snippet/file on the composer, with a remove affordance. */
+function ContextChip({ refItem, onRemove }: { refItem: PrContextRef; onRemove: () => void }) {
+  const Icon = refItem.kind === "snippet" || refItem.quote ? TextQuote : FileCode;
+  const label = refLabel(refItem);
+  return (
+    <span
+      title={
+        refItem.quote
+          ? `${refItem.path}${refItem.stop ? ` — tour stop “${refItem.stop}”` : ""}\n\n“${refItem.quote}”`
+          : refItem.path
+      }
+      className="inline-flex items-center gap-1 rounded-md bg-primary/15 px-1.5 py-0.5 font-mono text-2xs font-medium text-primary"
+    >
+      <Icon className="size-3 shrink-0" />
+      <span className="max-w-[14rem] truncate">{label}</span>
+      <button
+        type="button"
+        onClick={onRemove}
+        aria-label={`Remove ${label}`}
+        className="text-primary/60 transition-colors hover:text-primary"
+      >
+        <X className="size-2.5" />
+      </button>
+    </span>
   );
 }
 
@@ -450,6 +590,8 @@ function ActionCard({
   const Icon = tone.icon;
   const body = actionBody(action);
   const done = status === "done";
+  // Inline comments join the pending review rather than posting on their own.
+  const pending = action.type === "inline_comment";
 
   async function run() {
     setStatus("running");
@@ -490,7 +632,7 @@ function ActionCard({
         {done ? (
           <span className="inline-flex items-center gap-1 text-xs text-success">
             <Check className="size-3.5" strokeWidth={2.5} />
-            Posted
+            {pending ? "Added to review" : "Posted"}
           </span>
         ) : (
           <Button
@@ -499,7 +641,7 @@ function ActionCard({
             loading={status === "running"}
             onClick={run}
           >
-            Confirm & post
+            {pending ? "Add to review" : "Confirm & post"}
           </Button>
         )}
       </div>

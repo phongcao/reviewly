@@ -15,6 +15,17 @@
 @theme {
   --font-weight-semibold: 550;
   --font-weight-bold: 600;
+
+  /* Steps below `text-xs`, for chips, badges and eyebrow labels. These exist so
+     that small text is written in REM like everything else: zoom works by
+     scaling the root font-size (see `use-global-shortcuts`), so a literal px
+     font-size silently opts out of it and gets relatively smaller the more the
+     reviewer zooms in. No line-height is paired with them on purpose —
+     these sizes are used inside rows that set their own leading, and inheriting
+     it is what the px literals they replaced already did. */
+  --text-2xs: 0.6875rem; /* 11px at the default root */
+  --text-3xs: 0.625rem; /* 10px */
+  --text-4xs: 0.5625rem; /* 9px — count bubbles inside a size-3.5 dot */
 }
 
 :root {
@@ -55,6 +66,12 @@
   --warning-foreground: oklch(0.92 0.1 75);
   --info: oklch(0.7 0.16 240);
   --info-foreground: oklch(0.92 0.1 240);
+  /* Text on a soft tint of the tone (e.g. bg-destructive/10) — the
+   * -foreground tokens are for solid fills and wash out on a tint. */
+  --destructive-soft: oklch(0.8 0.13 25);
+  --success-soft: oklch(0.85 0.13 145);
+  --warning-soft: oklch(0.88 0.12 75);
+  --info-soft: oklch(0.82 0.11 240);
 
   /* ── Edges: there are exactly three levels, and no others. ──────────────
    * 1. NONE — the default for anything inline: chips, kbds, counters, pills,
@@ -137,6 +154,10 @@
   --warning-foreground: oklch(0.99 0.02 70);
   --info: oklch(0.54 0.16 245);
   --info-foreground: oklch(0.98 0.02 245);
+  --destructive-soft: oklch(0.48 0.19 25);
+  --success-soft: oklch(0.44 0.12 150);
+  --warning-soft: oklch(0.5 0.12 65);
+  --info-soft: oklch(0.46 0.15 245);
 
   /* Light needs slightly more present structure than dark. */
   --border: oklch(0.5 0.012 70 / 0.45);
@@ -177,6 +198,10 @@
   --color-warning-foreground: var(--warning-foreground);
   --color-info: var(--info);
   --color-info-foreground: var(--info-foreground);
+  --color-destructive-soft: var(--destructive-soft);
+  --color-success-soft: var(--success-soft);
+  --color-warning-soft: var(--warning-soft);
+  --color-info-soft: var(--info-soft);
   --color-border: var(--border);
   --color-hairline: var(--hairline);
   --color-input: var(--input);
@@ -260,6 +285,32 @@
   background-size: 22px 22px;
   -webkit-mask-image: radial-gradient(closest-side at 50% 40%, #000 0%, transparent 76%);
   mask-image: radial-gradient(closest-side at 50% 40%, #000 0%, transparent 76%);
+}
+
+/* Base UI's ScrollArea rewrites these four on its viewport on EVERY scroll
+   event (for the optional edge fade). Unregistered custom properties inherit,
+   so each write restyled every element inside the scroller — the whole diff,
+   down to each Prism token — while scrolling. Registered as non-inheriting,
+   they only change the viewport itself, the one element that reads them. */
+@property --scroll-area-overflow-x-start {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@property --scroll-area-overflow-x-end {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@property --scroll-area-overflow-y-start {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
+}
+@property --scroll-area-overflow-y-end {
+  syntax: "<length>";
+  inherits: false;
+  initial-value: 0px;
 }
 
 @layer base {
@@ -469,7 +520,7 @@
 
 /* Markdown rendering styles for AI responses (react-markdown). */
 .prose-reviewly {
-  font-size: 13.5px;
+  font-size: 0.875rem;
   line-height: 1.65;
   color: var(--color-foreground);
   letter-spacing: -0.003em;
@@ -584,7 +635,7 @@
 }
 .prose-code-block-lang {
   font-family: var(--font-mono);
-  font-size: 11px;
+  font-size: 0.6875rem;
   color: var(--color-muted-foreground);
   text-transform: lowercase;
 }
@@ -593,7 +644,7 @@
   display: inline-flex;
   align-items: center;
   gap: 0.25rem;
-  font-size: 11px;
+  font-size: 0.6875rem;
   color: var(--color-muted-foreground);
   background: transparent;
   border: 0;
@@ -614,7 +665,7 @@
   padding: 0.85rem 0.95rem;
   overflow-x: auto;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 0.75rem;
   line-height: 1.55;
 }
 .prose-code-block pre code {
@@ -634,7 +685,7 @@
   padding: 0.85rem 0.95rem;
   overflow-x: auto;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 0.75rem;
   line-height: 1.55;
 }
 .prose-reviewly pre:not(.prose-code-block pre) code {
@@ -643,6 +694,82 @@
   border: 0;
   border-radius: 0;
   font-size: inherit;
+}
+
+/* Image previews (ImagePreview): a faint checkerboard so transparent pixels
+ * read as transparent in either theme. */
+.image-checker {
+  --checker: color-mix(in oklch, var(--color-foreground) 6%, transparent);
+  background-color: color-mix(in oklch, var(--color-foreground) 2%, transparent);
+  background-image: conic-gradient(
+    var(--checker) 25%,
+    transparent 0 50%,
+    var(--checker) 0 75%,
+    transparent 0
+  );
+  background-size: 16px 16px;
+}
+
+/* ```mermaid fences (MermaidDiagram). Mermaid sizes the SVG with an inline
+ * max-width; keep it centered and let very wide diagrams scroll. */
+.prose-mermaid {
+  margin: 0.5rem 0;
+  padding: 0.85rem;
+  border: 1px solid var(--color-border);
+  border-radius: 10px;
+  background: color-mix(in oklch, var(--color-card) 60%, transparent);
+  overflow-x: auto;
+  text-align: center;
+  /* Mermaid measures labels outside the page, so undo the text tweaks
+     `.prose-reviewly` would otherwise inherit — they reflow labels past the
+     boxes mermaid sized for them. */
+  line-height: normal;
+  letter-spacing: normal;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+.prose-mermaid svg {
+  display: inline-block;
+  height: auto;
+}
+/* Labels are measured before they're in the page, so real text (emoji
+   especially) can come out a few px wider than its box — let it spill
+   rather than clip the last word of a subgraph title. */
+.prose-mermaid foreignObject {
+  overflow: visible;
+}
+/* Label text takes the label's color, not `.prose-reviewly`'s p/b colors —
+   mermaid wraps every label in a <p>. */
+.prose-mermaid p,
+.prose-mermaid b,
+.prose-mermaid strong {
+  color: inherit;
+}
+.prose-mermaid b,
+.prose-mermaid strong {
+  font-weight: bold;
+}
+.prose-mermaid.is-loading {
+  font-size: 0.75rem;
+  color: var(--color-muted-foreground);
+}
+.prose-mermaid-error {
+  margin: 0.5rem 0;
+}
+.prose-mermaid-error-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+  font-size: 0.75rem;
+  color: var(--color-warning);
+}
+.prose-mermaid-error-detail {
+  margin-top: 0.35rem;
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: var(--color-muted-foreground);
+  white-space: pre-wrap;
 }
 
 .prose-reviewly ul,
@@ -688,14 +815,28 @@
   border-radius: 0 6px 6px 0;
 }
 
+/* The frame owns the border so a table wider than the pane scrolls inside it
+   rather than being clipped by the rounded corners. */
+.prose-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--color-border);
+  border-radius: 8px;
+}
 .prose-reviewly table {
   width: 100%;
   border-collapse: separate;
   border-spacing: 0;
-  font-size: 12px;
-  border: 1px solid var(--color-border);
-  border-radius: 8px;
-  overflow: hidden;
+  font-size: 0.75rem;
+}
+/* `anywhere`/`break-word` (inherited from `.prose-reviewly` and inline code)
+   shrink a cell's min-content width to one character, so auto table layout
+   crushes short columns into a letter per line ("M/et/ho/d"). In cells, only
+   break at word boundaries; the frame scrolls if the words don't fit. */
+.prose-reviewly th,
+.prose-reviewly td,
+.prose-reviewly :is(th, td) code {
+  overflow-wrap: break-word;
+  word-break: normal;
 }
 .prose-reviewly thead {
   background: color-mix(in oklch, var(--color-card) 70%, transparent);
@@ -705,7 +846,7 @@
   padding: 0.5rem 0.7rem;
   text-align: left;
   font-weight: 500;
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--color-muted-foreground);
 }
 .prose-reviewly td {
@@ -735,7 +876,7 @@
   cursor: pointer;
   list-style: none;
   font-weight: 500;
-  font-size: 12px;
+  font-size: 0.75rem;
   color: var(--color-muted-foreground);
   padding-left: 1.1rem;
   position: relative;

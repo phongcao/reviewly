@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use reqwest::Response;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
@@ -203,10 +204,52 @@ pub async fn viewer(state: &AppState, token: &str) -> AppResult<Viewer> {
     Ok(res.json().await?)
 }
 
-/// GitHub's Search API is capped at ~30 req/min and punishes bursts with a
-/// secondary (abuse) limit. We funnel every search through a small concurrency
-/// gate (kills the burst) and retry on 403/429, waiting for the reset window.
-static SEARCH_GATE: Semaphore = Semaphore::const_new(5);
+/// GitHub's Search API is capped at ~30 req/min and punishes bursts — and
+/// concurrency in particular — with a secondary (abuse) limit. We funnel every
+/// search through a narrow gate, and on a rate-limit response pause *all*
+/// searches for the reset window rather than retrying into the throttle.
+static SEARCH_GATE: Semaphore = Semaphore::const_new(2);
+
+/// Unix seconds until which searches are paused after a rate-limit hit (0 =
+/// not paused), and consecutive header-less hits, for exponential backoff.
+static SEARCH_PAUSED_UNTIL: AtomicU64 = AtomicU64::new(0);
+static SEARCH_STRIKES: AtomicU32 = AtomicU32::new(0);
+
+/// A secondary limit without `Retry-After` means "wait at least a minute, then
+/// back off exponentially" per GitHub's docs; cap the pause at 15 minutes.
+const SECONDARY_MIN_WAIT: u64 = 60;
+const SECONDARY_MAX_WAIT: u64 = 15 * 60;
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Pause length for the `strikes`-th consecutive header-less secondary limit.
+fn secondary_backoff(strikes: u32) -> u64 {
+    SECONDARY_MIN_WAIT
+        .saturating_mul(1u64 << strikes.min(8))
+        .min(SECONDARY_MAX_WAIT)
+}
+
+/// Seconds left in the current search pause, if any. The poller checks this to
+/// skip its search steps instead of piling requests onto an active throttle.
+pub fn search_paused_for() -> Option<u64> {
+    let left = SEARCH_PAUSED_UNTIL.load(Ordering::Relaxed).saturating_sub(unix_now());
+    (left > 0).then_some(left)
+}
+
+fn pause_searches(secs: u64) {
+    SEARCH_PAUSED_UNTIL.fetch_max(unix_now() + secs, Ordering::Relaxed);
+}
+
+/// Whether a 403/429 is a rate limit (primary or secondary) rather than a
+/// plain permission error, which must not trigger a pause.
+fn is_rate_limited(code: u16, header_wait: Option<u64>, body: &str) -> bool {
+    code == 429 || header_wait.is_some() || body.to_ascii_lowercase().contains("rate limit")
+}
 
 /// Seconds to wait before retrying a rate-limited response: prefer `Retry-After`,
 /// fall back to `X-RateLimit-Reset` when the remaining quota is 0.
@@ -225,11 +268,7 @@ fn rate_limit_wait(res: &Response) -> Option<u64> {
             .and_then(|v| v.to_str().ok())
             .and_then(|s| s.trim().parse::<u64>().ok())
         {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            return Some(reset.saturating_sub(now).saturating_add(1));
+            return Some(reset.saturating_sub(unix_now()).saturating_add(1));
         }
     }
     None
@@ -239,15 +278,17 @@ fn rate_limit_wait(res: &Response) -> Option<u64> {
 /// without overriding the frontend's own (longer) staleness cadence.
 const SEARCH_TTL: Duration = Duration::from_secs(60);
 
-/// One throttled, cached, auto-retrying GET against `/search/issues`, returning
-/// the parsed JSON body. Identical concurrent queries coalesce on the cache.
+/// One throttled, cached, auto-retrying GET against a `/search/*` endpoint,
+/// returning the parsed JSON body. Identical concurrent queries coalesce on the
+/// cache. `path` is the endpoint (e.g. `/search/issues`, `/search/repositories`).
 async fn search_get(
     state: &AppState,
     token: &str,
+    path: &str,
     params: &[(&str, &str)],
 ) -> AppResult<serde_json::Value> {
     let key = format!(
-        "search?{}",
+        "{path}?{}",
         params.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("&")
     );
     if let Some(v) = state.cache_get(&key, SEARCH_TTL) {
@@ -259,8 +300,13 @@ async fn search_get(
     if let Some(v) = state.cache_get(&key, SEARCH_TTL) {
         return Ok(v);
     }
+    // While throttled, serve the last known result (however stale) rather than
+    // sending another request that would only extend the penalty.
+    if let Some(secs) = search_paused_for() {
+        return state.cache_value(&key).ok_or(AppError::RateLimited(secs));
+    }
 
-    let url = format!("{API}/search/issues");
+    let url = format!("{API}{path}");
     // Conditional request: a 304 returns our cached body and does NOT count
     // against the rate limit, so revalidating an expired entry is ~free.
     let etag = state.cache_etag(&key);
@@ -286,16 +332,29 @@ async fn search_get(
                 .map(String::from);
             let v: serde_json::Value = res.json().await?;
             state.cache_put_etag(key, v.clone(), new_etag);
+            SEARCH_STRIKES.store(0, Ordering::Relaxed);
             return Ok(v);
         }
         let code = res.status().as_u16();
-        if (code == 403 || code == 429) && attempt < 3 {
-            let wait = rate_limit_wait(&res).unwrap_or(1u64 << attempt).clamp(1, 60);
-            tokio::time::sleep(Duration::from_secs(wait)).await;
-            attempt += 1;
-            continue;
-        }
+        let header_wait = rate_limit_wait(&res);
         let body = res.text().await.unwrap_or_default();
+        if (code == 403 || code == 429) && is_rate_limited(code, header_wait, &body) {
+            let wait = match header_wait {
+                Some(w) => w.max(1),
+                None => secondary_backoff(SEARCH_STRIKES.fetch_add(1, Ordering::Relaxed)),
+            };
+            pause_searches(wait);
+            // A short, server-stated wait (the primary limit's reset window) is
+            // worth sitting out once; a header-less secondary limit is not.
+            if header_wait.is_some() && wait <= 60 && attempt < 1 {
+                tracing::debug!("github search rate-limited; retrying in {wait}s");
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                attempt += 1;
+                continue;
+            }
+            tracing::warn!("github search rate-limited ({code}); pausing searches for {wait}s");
+            return Err(AppError::RateLimited(wait));
+        }
         return Err(AppError::Upstream { status: code, body });
     }
 }
@@ -311,6 +370,7 @@ pub async fn search_prs(state: &AppState, token: &str, query: &str) -> AppResult
         let v = search_get(
             state,
             token,
+            "/search/issues",
             &[
                 ("q", query),
                 ("per_page", "100"),
@@ -335,7 +395,7 @@ pub async fn search_prs(state: &AppState, token: &str, query: &str) -> AppResult
 /// Total number of issues/PRs matching a search query (uses `total_count`,
 /// so it's accurate beyond the 50-item page cap and cheap with `per_page=1`).
 pub async fn search_count(state: &AppState, token: &str, query: &str) -> AppResult<u64> {
-    let v = search_get(state, token, &[("q", query), ("per_page", "1")]).await?;
+    let v = search_get(state, token, "/search/issues", &[("q", query), ("per_page", "1")]).await?;
     Ok(v.get("total_count").and_then(|c| c.as_u64()).unwrap_or(0))
 }
 
@@ -406,6 +466,28 @@ pub async fn list_repo_pulls(
     Ok(out)
 }
 
+/// Repository typeahead. `query` must already carry its scope qualifiers
+/// (`org:` / `user:`) — GitHub's search returns nothing for private or internal
+/// repos otherwise. Shares the search gate, cache and retry with the PR search.
+pub async fn search_repos(state: &AppState, token: &str, query: &str) -> AppResult<Vec<String>> {
+    let v = search_get(
+        state,
+        token,
+        "/search/repositories",
+        &[("q", query), ("per_page", "50"), ("sort", "updated")],
+    )
+    .await?;
+    Ok(v.get("items")
+        .and_then(|i| i.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|r| r.get("full_name").and_then(|f| f.as_str()).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default())
+}
+
 pub async fn get_pull(
     state: &AppState,
     token: &str,
@@ -474,13 +556,29 @@ pub async fn list_review_comments(
     repo: &str,
     number: u64,
 ) -> AppResult<Vec<ReviewThread>> {
-    let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/comments");
-    let res = auth_request(state, token, reqwest::Method::GET, &url)
-        .query(&[("per_page", "100")])
-        .send()
-        .await?;
-    let res = check(res).await?;
-    Ok(res.json().await?)
+    // Paged like `list_pull_files`: a busy PR passes 100 comments, and the
+    // follow-up check needs every thread the viewer started.
+    let mut out: Vec<ReviewThread> = Vec::new();
+    let mut page = 1u32;
+    loop {
+        let url = format!("{API}/repos/{owner}/{repo}/pulls/{number}/comments");
+        let res = auth_request(state, token, reqwest::Method::GET, &url)
+            .query(&[
+                ("per_page", "100".to_string()),
+                ("page", page.to_string()),
+            ])
+            .send()
+            .await?;
+        let res = check(res).await?;
+        let batch: Vec<ReviewThread> = res.json().await?;
+        let done = batch.len() < 100;
+        out.extend(batch);
+        if done || page >= 30 {
+            break;
+        }
+        page += 1;
+    }
+    Ok(out)
 }
 
 pub async fn list_issue_comments(
@@ -650,6 +748,130 @@ pub async fn list_commits(
         .await?;
     let res = check(res).await?;
     Ok(res.json().await?)
+}
+
+/// GitHub returns at most this many files for a comparison, on the first page
+/// only. A result with this many may be missing files.
+const COMPARE_FILE_CAP: usize = 300;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CompareCommit {
+    pub sha: String,
+    /// First line of the commit message.
+    pub subject: String,
+    pub author: Option<String>,
+    pub date: Option<DateTime<Utc>>,
+}
+
+/// Two commits compared with `base...head`. `status` is GitHub's: "ahead"
+/// (head builds on base), "identical", "behind" or "diverged" (history was
+/// rewritten, e.g. a force-push).
+#[derive(Debug, Clone, Serialize)]
+pub struct Compare {
+    pub status: String,
+    pub ahead_by: u64,
+    pub behind_by: u64,
+    pub total_commits: u64,
+    pub commits: Vec<CompareCommit>,
+    pub files: Vec<PullFile>,
+    pub files_truncated: bool,
+}
+
+#[derive(Deserialize)]
+struct CompareRaw {
+    status: String,
+    ahead_by: u64,
+    behind_by: u64,
+    total_commits: u64,
+    #[serde(default)]
+    commits: Vec<CompareCommitRaw>,
+    #[serde(default)]
+    files: Option<Vec<PullFile>>,
+}
+
+#[derive(Deserialize)]
+struct CompareCommitRaw {
+    sha: String,
+    commit: CompareCommitInner,
+    author: Option<CompareLogin>,
+}
+
+#[derive(Deserialize)]
+struct CompareCommitInner {
+    message: String,
+    author: Option<CompareGitAuthor>,
+}
+
+#[derive(Deserialize)]
+struct CompareGitAuthor {
+    name: Option<String>,
+    date: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize)]
+struct CompareLogin {
+    login: String,
+}
+
+impl From<CompareRaw> for Compare {
+    fn from(r: CompareRaw) -> Self {
+        let files = r.files.unwrap_or_default();
+        Compare {
+            status: r.status,
+            ahead_by: r.ahead_by,
+            behind_by: r.behind_by,
+            total_commits: r.total_commits,
+            files_truncated: files.len() >= COMPARE_FILE_CAP,
+            commits: r
+                .commits
+                .into_iter()
+                .map(|c| CompareCommit {
+                    subject: c.commit.message.lines().next().unwrap_or("").to_string(),
+                    author: c
+                        .author
+                        .map(|a| a.login)
+                        .or_else(|| c.commit.author.as_ref().and_then(|a| a.name.clone())),
+                    date: c.commit.author.and_then(|a| a.date),
+                    sha: c.sha,
+                })
+                .collect(),
+            files,
+        }
+    }
+}
+
+fn is_sha(s: &str) -> bool {
+    (7..=64).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Compare two commits (`base...head`). Returns `None` when GitHub can't
+/// compare them: after a force-push the old commit can be garbage-collected
+/// (404), or the two have no common history (422).
+pub async fn compare_commits(
+    state: &AppState,
+    token: &str,
+    owner: &str,
+    repo: &str,
+    base: &str,
+    head: &str,
+) -> AppResult<Option<Compare>> {
+    if !is_sha(base) || !is_sha(head) {
+        return Err(AppError::Other(format!("not a commit sha: {base}...{head}")));
+    }
+    let url = format!("{API}/repos/{owner}/{repo}/compare/{base}...{head}");
+    // Files come only on the first page; 100 commits is plenty to list.
+    let res = auth_request(state, token, reqwest::Method::GET, &url)
+        .query(&[("per_page", "100")])
+        .send()
+        .await?;
+    match check(res).await {
+        Ok(res) => {
+            let raw: CompareRaw = res.json().await?;
+            Ok(Some(raw.into()))
+        }
+        Err(AppError::Upstream { status: 404 | 422, .. }) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 pub async fn list_checks(
@@ -840,4 +1062,64 @@ pub async fn rerun_check_run(
         status: status.as_u16(),
         body,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn secondary_backoff_doubles_from_a_minute_and_caps() {
+        assert_eq!(secondary_backoff(0), 60);
+        assert_eq!(secondary_backoff(1), 120);
+        assert_eq!(secondary_backoff(3), 480);
+        assert_eq!(secondary_backoff(4), SECONDARY_MAX_WAIT);
+        assert_eq!(secondary_backoff(u32::MAX), SECONDARY_MAX_WAIT);
+    }
+
+    #[test]
+    fn compare_keeps_first_message_line_and_flags_truncation() {
+        let json = r#"{
+            "status": "ahead", "ahead_by": 2, "behind_by": 0, "total_commits": 2,
+            "commits": [
+                {"sha": "aaa1111", "commit": {"message": "Fix null check\n\nbody", "author": {"name": "Ann", "date": "2026-10-01T10:00:00Z"}}, "author": {"login": "ann"}},
+                {"sha": "bbb2222", "commit": {"message": "Tidy", "author": {"name": "Bob", "date": null}}, "author": null}
+            ],
+            "files": [{"sha": "f1", "filename": "a.ts", "status": "modified", "additions": 1, "deletions": 0, "changes": 1, "patch": "@@ -1 +1,2 @@\n a\n+b"}]
+        }"#;
+        let c: Compare = serde_json::from_str::<CompareRaw>(json).unwrap().into();
+        assert_eq!(c.status, "ahead");
+        assert_eq!(c.commits[0].subject, "Fix null check");
+        assert_eq!(c.commits[0].author.as_deref(), Some("ann"));
+        assert_eq!(c.commits[1].author.as_deref(), Some("Bob"));
+        assert_eq!(c.files.len(), 1);
+        assert!(!c.files_truncated);
+    }
+
+    #[test]
+    fn compare_without_files_is_empty_not_an_error() {
+        let json = r#"{"status": "diverged", "ahead_by": 3, "behind_by": 1, "total_commits": 3}"#;
+        let c: Compare = serde_json::from_str::<CompareRaw>(json).unwrap().into();
+        assert_eq!(c.status, "diverged");
+        assert!(c.files.is_empty());
+        assert!(c.commits.is_empty());
+    }
+
+    #[test]
+    fn compare_rejects_non_sha_refs() {
+        assert!(is_sha("abc1234"));
+        assert!(is_sha(&"a".repeat(40)));
+        assert!(!is_sha("main"));
+        assert!(!is_sha("abc12../x"));
+        assert!(!is_sha("abc"));
+    }
+
+    #[test]
+    fn only_rate_limit_403s_count_as_throttling() {
+        let secondary = r#"{"message":"You have exceeded a secondary rate limit."}"#;
+        assert!(is_rate_limited(403, None, secondary));
+        assert!(is_rate_limited(403, Some(30), ""));
+        assert!(is_rate_limited(429, None, ""));
+        assert!(!is_rate_limited(403, None, r#"{"message":"Resource not accessible"}"#));
+    }
 }

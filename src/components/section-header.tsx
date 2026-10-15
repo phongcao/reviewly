@@ -20,7 +20,7 @@ export function SectionHeader({
   return (
     <div
       className={cn(
-        "mb-2 flex items-center gap-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground",
+        "mb-2 flex items-center gap-1.5 text-2xs font-medium uppercase tracking-wide text-muted-foreground",
         className,
       )}
     >

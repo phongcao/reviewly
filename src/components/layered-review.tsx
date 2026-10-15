@@ -1,13 +1,21 @@
+import { MermaidDiagram } from "@/components/mermaid-diagram";
 import { TooltipFor } from "@/components/tooltip-for";
+import { CodeSpans } from "@/components/tour/code-spans";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
-import { buildLayerContext } from "@/lib/ai/context";
-import { LAYERED_SYSTEM } from "@/lib/ai/prompts";
+import { layerBudget } from "@/lib/ai/budget";
+import { type ContextOptions, type ReviewContext, buildLayerContext } from "@/lib/ai/context";
+import { buildLayeredSystem } from "@/lib/ai/prompts";
 import { useAiAvailable } from "@/lib/ai/use-ai-available";
+import { useDeepTourRunner } from "@/lib/ai/use-deep-tour";
+import { type EdgeSource, loadEdgeTexts } from "@/lib/edge-sources";
+import { relativeTime } from "@/lib/format";
+import { type LayerEdge, layerEdges, layerMermaid, orderViolations } from "@/lib/layer-edges";
 import {
   type LayerPlan,
-  type LayerRisk,
   type LayerStats,
+  RISK_CHIP,
+  RISK_DOT,
   RISK_LABEL,
   type ReviewLayer,
   heuristicLayers,
@@ -19,13 +27,34 @@ import {
 import type { PullFile } from "@/lib/tauri";
 import { invoke } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
-import { PROVIDER_LABEL, aiInvokeArgs, useAiProvider } from "@/stores/ai";
-import { useLayers } from "@/stores/layers";
+import {
+  type AiProvider,
+  EFFORT_SHORT,
+  PROVIDER_LABEL,
+  aiInvokeArgs,
+  useAiProvider,
+} from "@/stores/ai";
+import { useDeepTour } from "@/stores/deep-tour";
+import { useDeepTourGen } from "@/stores/deep-tour-gen";
+import { type LayersEntry, useLayers } from "@/stores/layers";
 import { useLayersGen } from "@/stores/layers-gen";
+import { useLocalRepos } from "@/stores/local-repos";
 import { useReviewPrefs } from "@/stores/review-prefs";
+import { useUi } from "@/stores/ui";
 import { useViewedFiles } from "@/stores/viewed-files";
-import { AlertTriangle, Check, Layers, RefreshCw, SplitSquareVertical, X } from "lucide-react";
-import { type ReactNode, useCallback, useEffect, useMemo } from "react";
+import {
+  AlertTriangle,
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Compass,
+  Layers,
+  Network,
+  RefreshCw,
+  SplitSquareVertical,
+  X,
+} from "lucide-react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 /** Everything the review screen needs to scope itself to one layer. */
@@ -146,22 +175,68 @@ export function useLayerScope({
   }, [plan, stats, files, headSha, entry?.active, entry?.headSha, select, advance]);
 }
 
-const RISK_CHIP: Record<LayerRisk, string> = {
-  low: "text-muted-foreground bg-foreground/[0.06]",
-  medium: "text-info bg-info/12",
-  high: "text-warning bg-warning/12",
-};
+/** Import links between a plan's layers, and the ones that run against the
+ * reading order. */
+export interface LayerLinks {
+  edges: LayerEdge[];
+  violations: LayerEdge[];
+  source: EdgeSource;
+}
+
+/**
+ * Compute the plan's layer links after first paint. Reads each changed file
+ * from the clone when there is one, else from the diff. Re-runs only when the
+ * plan or the file list changes — both are memoized upstream.
+ */
+export function useLayerLinks(
+  plan: LayerPlan | null,
+  files: PullFile[],
+  cwd: string | null,
+): LayerLinks | null {
+  const [links, setLinks] = useState<LayerLinks | null>(null);
+  useEffect(() => {
+    if (!plan) {
+      setLinks(null);
+      return;
+    }
+    let cancelled = false;
+    // A macrotask, so the bar paints before any file is read.
+    const t = setTimeout(() => {
+      loadEdgeTexts(files, cwd)
+        .then(({ texts, source, aliases }) => {
+          if (cancelled) return;
+          const edges = layerEdges(plan, texts, aliases);
+          setLinks({ edges, violations: orderViolations(plan, edges), source });
+        })
+        .catch(() => {});
+    }, 0);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [plan, files, cwd]);
+  return links;
+}
 
 interface BarProps {
   scope: LayerScope;
   prKey: string;
-  /** Self-contained PR context (metadata + diff) for the planner. */
-  context: string;
+  /** Self-contained PR context (metadata + diff) for the planner, plus the PR's
+   * size — which sets how many layers the plan asks for. */
+  context: ReviewContext;
   files: PullFile[];
   headSha?: string;
   viewedKey: string | null;
+  /** The file open in the diff pane — a compact briefing stays unfolded until
+   * the reviewer moves past the file a layer opened on. */
+  activeFile: string | null;
   /** Open a file in the diff pane (used when moving between layers). */
   onSelectFile: (path: string) => void;
+  /** Rebuild the review context for a subset of the PR's files — a per-layer
+   * tour needs one context per layer. */
+  buildContext: (subset: PullFile[], opts?: ContextOptions) => ReviewContext;
+  /** Switch the review to the guided pane, where the tour renders. */
+  onOpenGuided?: () => void;
 }
 
 /**
@@ -178,6 +253,40 @@ export function LayerBar(props: BarProps) {
   const error = useLayersGen((s) => s.error[prKey]);
   const setViewed = useViewedFiles((s) => s.setViewed);
   const aiName = PROVIDER_LABEL[provider];
+  const runDeepTour = useDeepTourRunner({
+    prKey,
+    files,
+    headSha,
+    buildContext: props.buildContext,
+  });
+  // A layer already toured, or one being toured right now.
+  const touredLayers = useDeepTour((s) => s.byPr[prKey]?.byLayer);
+  const tourGen = useDeepTourGen((s) => s.byPr[prKey]);
+  const compact = useUi((s) => s.compactChrome);
+  const toggleCompact = useUi((s) => s.toggleCompactChrome);
+  const localRepos = useLocalRepos((s) => s.repos);
+  const cwd = useMemo(() => {
+    const [owner, repo] = prKey.split("#")[0].split("/");
+    return localRepos.find((r) => r.owner === owner && r.repo === repo)?.path ?? null;
+  }, [prKey, localRepos]);
+  const links = useLayerLinks(scope.plan, files, cwd);
+  const [mapOpen, setMapOpen] = useState(false);
+
+  // In compact mode, entering a layer still unfolds its briefing — that's the
+  // moment it's worth reading — until the reviewer moves on to another file.
+  const activeId = scope.active?.id;
+  const prevLayerId = useRef(activeId);
+  const [peek, setPeek] = useState<{ layerId: string; file: string | null } | null>(null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: only a layer change starts a peek, with the file it opened on
+  useEffect(() => {
+    if (activeId && prevLayerId.current && activeId !== prevLayerId.current) {
+      setPeek({ layerId: activeId, file: props.activeFile });
+    }
+    prevLayerId.current = activeId;
+  }, [activeId]);
+  // Toggling compact mode is an explicit choice; drop any peek in flight.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: reset on toggle only
+  useEffect(() => setPeek(null), [compact]);
 
   // Recover the "planning" state when a background run for this PR is still
   // going after navigating away or refreshing (the Rust task outlives both).
@@ -202,7 +311,10 @@ export function LayerBar(props: BarProps) {
       // and handing the agent a checkout turns a ~20s call into a multi-minute
       // agentic run for a plan that wouldn't get better.
       cwd: null,
-      prompt: `${LAYERED_SYSTEM}${custom}\n\n# Pull request\n${buildLayerContext(props.context, files)}`,
+      prompt: `${buildLayeredSystem({
+        layers: layerBudget(props.context.size),
+        size: props.context.size,
+      })}${custom}\n\n# Pull request\n${buildLayerContext(props.context.text, files)}`,
     }).catch((e) => useLayersGen.getState().fail(prKey, String(e)));
   }, [prKey, headSha, aiInstructions, props.context, files]);
 
@@ -267,6 +379,24 @@ export function LayerBar(props: BarProps) {
     );
   }
 
+  // One file can only ever be one layer, and a one-layer plan isn't a split —
+  // don't offer a run that is guaranteed to come back "failed".
+  if (!scope.plan && files.length < 2) {
+    return (
+      <Shell>
+        <div className="flex items-center gap-3">
+          <Layers className="size-3.5 shrink-0 text-muted-foreground" />
+          <div className="min-w-0">
+            <p className="text-xs font-medium text-foreground">Nothing to split</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              This PR changes a single file — read it as-is; layers need at least two files.
+            </p>
+          </div>
+        </div>
+      </Shell>
+    );
+  }
+
   if (!scope.plan) {
     return (
       <Shell>
@@ -305,22 +435,155 @@ export function LayerBar(props: BarProps) {
   }
 
   const { plan, active, index, stats } = scope;
+  // Foundations the active layer imports from a layer read later.
+  const lateFoundations = (links?.violations ?? [])
+    .filter((e) => e.to === active?.id)
+    .map((e) => plan.layers.findIndex((l) => l.id === e.from) + 1)
+    .filter((n) => n > 0)
+    .sort((a, b) => a - b);
+  const violated = new Set((links?.violations ?? []).map((e) => e.to));
   const activeStats = stats[index];
   const remaining = stats.filter((s) => !s.done).length;
   // The plan stopped describing this PR: everything ended up in the catch-all.
   const unusable = isPlanStale(plan);
 
+  const expanded = !compact || (peek?.layerId === active?.id && peek?.file === props.activeFile);
+
+  const tourButton = (size: "xs" | "sm") =>
+    active &&
+    available === true &&
+    props.onOpenGuided && (
+      <Button
+        size={size}
+        variant="outline"
+        disabled={
+          !!tourGen?.running.includes(active.id) ||
+          !!tourGen?.queued.some((j) => j.layerId === active.id)
+        }
+        onClick={() => {
+          // Already toured: just go read it rather than paying for the
+          // same call twice.
+          if (!touredLayers?.[active.id]) runDeepTour([active.id]);
+          // Either way this is an explicit "take me to THIS layer" —
+          // the tour jumps to its first stop, now or once it lands.
+          // Set after `runDeepTour`, which may have restarted the entry
+          // (and with it, dropped any pending request).
+          useDeepTour.getState().focusLayer(prKey, active.id);
+          props.onOpenGuided?.();
+        }}
+      >
+        <Compass className="size-3.5" />
+        {touredLayers?.[active.id] ? "Read tour" : "Tour this layer"}
+      </Button>
+    );
+
+  const completeButton = (size: "xs" | "sm") => (
+    <Button size={size} variant={activeStats.done ? "outline" : "default"} onClick={completeLayer}>
+      {activeStats.done ? "Next layer" : "Mark layer reviewed"}
+    </Button>
+  );
+
+  const briefingToggle = (
+    <TooltipFor label={expanded ? "Compact header" : "Expand header"} shortcut="z">
+      <Button
+        size="icon-xs"
+        variant="ghost"
+        aria-label={expanded ? "Collapse layer briefing" : "Expand layer briefing"}
+        aria-expanded={expanded}
+        // Folding a peeked briefing just ends the peek; otherwise this is the
+        // same switch as `z`.
+        onClick={() => (compact && expanded ? setPeek(null) : toggleCompact())}
+      >
+        {expanded ? <ChevronUp className="size-3.5" /> : <ChevronDown className="size-3.5" />}
+      </Button>
+    </TooltipFor>
+  );
+
+  const layerChip = active && (
+    <>
+      <h3 className="max-w-[16rem] truncate text-xs font-medium text-foreground">{active.title}</h3>
+      <span
+        className={cn("shrink-0 rounded px-1.5 py-px text-3xs font-medium", RISK_CHIP[active.risk])}
+      >
+        {RISK_LABEL[active.risk]}
+      </span>
+      <span className="shrink-0 text-2xs tabular-nums text-muted-foreground">
+        {activeStats.files} file{activeStats.files === 1 ? "" : "s"}
+        {" · "}
+        <span className="text-success">+{activeStats.additions}</span>{" "}
+        <span className="text-destructive">−{activeStats.deletions}</span>
+      </span>
+    </>
+  );
+
   return (
     <Shell>
-      <div className="flex items-center gap-2.5">
-        <Layers className="size-3.5 shrink-0 text-muted-foreground" />
-        <span className="text-xs font-medium text-foreground">Layered review</span>
-        <span className="text-xs text-muted-foreground">
-          Layer {index + 1} of {plan.layers.length}
-          {remaining === 0 ? " · all read" : ` · ${remaining} left`}
-          {entry?.source === "structure" ? " · structural split" : ""}
-        </span>
-        <div className="ml-auto flex shrink-0 items-center gap-1.5">
+      {/* Stepper — the whole PR at a glance, and the way to move between slices. */}
+      <div className="flex items-center gap-2">
+        <TooltipFor
+          label={`Layered review · layer ${index + 1} of ${plan.layers.length}${
+            entry?.source === "structure" ? " · structural split" : ""
+          }`}
+        >
+          <span className="flex shrink-0 cursor-default items-center gap-1.5 text-xs text-muted-foreground">
+            <Layers className="size-3.5" />
+            <span className="tabular-nums">
+              {index + 1}/{plan.layers.length}
+              {remaining === 0 ? " · all read" : ` · ${remaining} left`}
+            </span>
+          </span>
+        </TooltipFor>
+        <div className="flex min-w-0 flex-1 items-center gap-0.5 overflow-x-auto py-0.5">
+          {plan.layers.map((layer, i) => {
+            const s = stats[i];
+            const isActive = i === index;
+            return (
+              <button
+                key={layer.id}
+                type="button"
+                onClick={() => enterLayer(layer)}
+                aria-current={isActive ? "step" : undefined}
+                title={`${layer.title} · ${RISK_LABEL[layer.risk]} · ${s.viewed}/${s.files} reviewed`}
+                className={cn(
+                  "flex shrink-0 items-center gap-1.5 rounded-md px-1.5 py-1 text-xs transition-colors",
+                  isActive
+                    ? "bg-foreground/[0.08] text-foreground"
+                    : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
+                )}
+              >
+                <span
+                  className={cn(
+                    "flex size-4 shrink-0 items-center justify-center rounded-full text-3xs tabular-nums",
+                    s.done
+                      ? "bg-success/15 text-success"
+                      : isActive
+                        ? "bg-primary text-primary-foreground"
+                        : "bg-foreground/[0.08] text-muted-foreground",
+                  )}
+                >
+                  {s.done ? <Check className="size-2.5" /> : i + 1}
+                </span>
+                <span className="max-w-[11rem] truncate">{layer.title}</span>
+                {violated.has(layer.id) && (
+                  <AlertTriangle
+                    className="size-3 shrink-0 text-warning"
+                    aria-label="Imports from a later layer"
+                  />
+                )}
+                {RISK_DOT[layer.risk] && (
+                  <span
+                    className={cn("size-1.5 shrink-0 rounded-full", RISK_DOT[layer.risk])}
+                    aria-hidden
+                  />
+                )}
+                <span className="shrink-0 tabular-nums text-muted-foreground/70">
+                  {s.viewed}/{s.files}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+        <div className="flex shrink-0 items-center gap-1.5">
           {entry?.source === "structure" && canUseAi && (
             <TooltipFor label="Replace the structural split with a semantic one">
               <Button size="xs" variant="ghost" onClick={planWithAi}>
@@ -328,6 +591,24 @@ export function LayerBar(props: BarProps) {
               </Button>
             </TooltipFor>
           )}
+          {entry && entry.source !== "structure" && (
+            <TooltipFor label={planByline(entry).full}>
+              <span className="max-w-40 shrink-0 cursor-default truncate text-2xs text-muted-foreground/70">
+                {planByline(entry).short}
+              </span>
+            </TooltipFor>
+          )}
+          <TooltipFor label={mapOpen ? "Hide dependency map" : "Dependency map"}>
+            <Button
+              size="icon-xs"
+              variant={mapOpen ? "secondary" : "ghost"}
+              aria-label="Dependency map"
+              aria-expanded={mapOpen}
+              onClick={() => setMapOpen((o) => !o)}
+            >
+              <Network className="size-3.5" />
+            </Button>
+          </TooltipFor>
           <TooltipFor label="Split this PR again">
             <Button
               size="icon-xs"
@@ -359,98 +640,115 @@ export function LayerBar(props: BarProps) {
         </div>
       )}
 
-      {/* Stepper — the whole PR at a glance, and the way to move between slices. */}
-      <div className="-mx-1 mt-2 flex items-center gap-0.5 overflow-x-auto px-1 pb-0.5">
-        {plan.layers.map((layer, i) => {
-          const s = stats[i];
-          const isActive = i === index;
-          return (
-            <button
-              key={layer.id}
-              type="button"
-              onClick={() => enterLayer(layer)}
-              aria-current={isActive ? "step" : undefined}
-              className={cn(
-                "flex shrink-0 items-center gap-1.5 rounded-md px-1.5 py-1 text-xs transition-colors",
-                isActive
-                  ? "bg-foreground/[0.08] text-foreground"
-                  : "text-muted-foreground hover:bg-foreground/[0.04] hover:text-foreground",
-              )}
-            >
-              <span
-                className={cn(
-                  "flex size-4 shrink-0 items-center justify-center rounded-full text-[10px] tabular-nums",
-                  s.done
-                    ? "bg-success/15 text-success"
-                    : isActive
-                      ? "bg-primary text-primary-foreground"
-                      : "bg-foreground/[0.08] text-muted-foreground",
-                )}
-              >
-                {s.done ? <Check className="size-2.5" /> : i + 1}
-              </span>
-              <span className="max-w-[11rem] truncate">{layer.title}</span>
-              <span className="shrink-0 tabular-nums text-muted-foreground/70">
-                {s.viewed}/{s.files}
-              </span>
-            </button>
-          );
-        })}
-      </div>
-
-      {/* Briefing for the layer in front of the reviewer. */}
-      {active && (
-        <div className="mt-2 flex items-start gap-3">
-          <div className="min-w-0 flex-1">
-            <div className="flex flex-wrap items-center gap-2">
-              <h3 className="truncate text-xs font-medium text-foreground">{active.title}</h3>
-              <span
-                className={cn(
-                  "rounded px-1.5 py-px text-[10px] font-medium",
-                  RISK_CHIP[active.risk],
-                )}
-              >
-                {RISK_LABEL[active.risk]}
-              </span>
-              <span className="text-[11px] tabular-nums text-muted-foreground">
-                {activeStats.files} file{activeStats.files === 1 ? "" : "s"}
-                {" · "}
-                <span className="text-success">+{activeStats.additions}</span>{" "}
-                <span className="text-destructive">−{activeStats.deletions}</span>
-              </span>
-            </div>
-            {active.intent && (
-              <p className="mt-1 line-clamp-2 text-xs leading-5 text-muted-foreground">
-                {active.intent}
+      {mapOpen && (
+        <div className="mt-2 rounded-md border border-hairline bg-foreground/[0.02] p-2.5">
+          <p className="text-2xs text-muted-foreground">
+            {!links
+              ? "Reading imports…"
+              : links.source === "clone"
+                ? "Edges read from your local clone, which may not be at the PR head."
+                : "Edges from the diff only; some links may be missing."}
+          </p>
+          {links &&
+            (links.edges.length === 0 ? (
+              <p className="mt-1.5 text-xs text-muted-foreground">
+                No import links found between layers.
               </p>
-            )}
-            {active.focus.length > 0 && (
-              <ul className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
-                {active.focus.map((f) => (
-                  <li
-                    key={f}
-                    className="flex items-center gap-1.5 text-[11px] leading-4 text-muted-foreground"
-                  >
-                    <span className="size-1 shrink-0 rounded-full bg-muted-foreground/50" />
-                    {f}
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
-          <Button
-            size="sm"
-            variant={activeStats.done ? "outline" : "default"}
-            onClick={completeLayer}
-          >
-            {activeStats.done ? "Next layer" : "Mark layer reviewed"}
-          </Button>
+            ) : (
+              // The bar sits above the diff and doesn't scroll — cap the map so
+              // a tall graph scrolls in place instead of pushing the diff away.
+              <MermaidDiagram
+                className="mt-1.5 max-h-[45vh] overflow-y-auto"
+                code={layerMermaid(plan, links.edges)}
+              />
+            ))}
         </div>
       )}
+
+      {/* Briefing for the layer in front of the reviewer — one line when compact. */}
+      {active &&
+        (expanded ? (
+          <div className="mt-2 flex items-start gap-3">
+            <div className="min-w-0 flex-1">
+              <div className="flex flex-wrap items-center gap-2">{layerChip}</div>
+              {active.intent && (
+                <p className="mt-1 line-clamp-2 text-sm leading-6 text-muted-foreground">
+                  <CodeSpans text={active.intent} />
+                </p>
+              )}
+              {lateFoundations.length > 0 && (
+                <p className="mt-1 flex items-center gap-1.5 text-xs text-warning">
+                  <AlertTriangle className="size-3 shrink-0" />
+                  {orderHint(lateFoundations)}
+                </p>
+              )}
+              {active.focus.length > 0 && (
+                <ul className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1">
+                  {active.focus.map((f) => (
+                    <li
+                      key={f}
+                      className="flex items-center gap-1.5 text-xs leading-5 text-muted-foreground"
+                    >
+                      <span className="size-1 shrink-0 rounded-full bg-muted-foreground/50" />
+                      <CodeSpans text={f} />
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            <div className="flex shrink-0 items-center gap-1.5">
+              {tourButton("sm")}
+              {completeButton("sm")}
+              {briefingToggle}
+            </div>
+          </div>
+        ) : (
+          <div className="mt-1.5 flex items-center gap-2">
+            {layerChip}
+            <span
+              className="min-w-0 flex-1 truncate text-xs text-muted-foreground"
+              title={active.intent || undefined}
+            >
+              <CodeSpans text={active.intent} />
+            </span>
+            <div className="flex shrink-0 items-center gap-1.5">
+              {tourButton("xs")}
+              {completeButton("xs")}
+              {briefingToggle}
+            </div>
+          </div>
+        ))}
     </Shell>
   );
 }
 
+/** "Imports from layer 4, which comes later. Consider reading layer 4 first."
+ * Advice only: the planner's order may be on purpose. */
+export function orderHint(layers: number[]): string {
+  if (layers.length === 1) {
+    return `Imports from layer ${layers[0]}, which comes later. Consider reading layer ${layers[0]} first.`;
+  }
+  const list = `${layers.slice(0, -1).join(", ")} and ${layers[layers.length - 1]}`;
+  return `Imports from layers ${list}, which come later. Consider reading them first.`;
+}
+
 function Shell({ children }: { children: ReactNode }) {
   return <div className="border-b border-hairline px-5 py-2.5">{children}</div>;
+}
+
+/** Who made an AI plan, for the layer bar: a terse "opus-5-5 · high" (the
+ *  `claude-` prefix and a `[1m]` context tag dropped to fit) and the full
+ *  story for its tooltip. Effort shows as "default" when none was sent — the
+ *  CLI's own setting applied. Plans from before this was recorded have no
+ *  model, so they show the provider instead. */
+function planByline(entry: LayersEntry): { short: string; full: string } {
+  const who = PROVIDER_LABEL[entry.source as AiProvider] ?? entry.source;
+  const effort = entry.effort ? (EFFORT_SHORT[entry.effort] ?? entry.effort) : "default";
+  const model = entry.model?.replace(/^claude-/, "").replace(/\[.*\]$/, "");
+  return {
+    short: `${model ?? who} · ${effort}`,
+    full: `Planned by ${who}${entry.model ? ` · ${entry.model}` : ""} · ${
+      entry.effort ? `${entry.effort} effort` : "default effort"
+    } · ${relativeTime(entry.generatedAt)}`,
+  };
 }

@@ -6,15 +6,22 @@ import { DiffFindBar } from "@/components/diff-find-bar";
 import { DiffViewer } from "@/components/diff-viewer";
 import { EmptyState } from "@/components/empty-state";
 import { FileTree } from "@/components/file-tree";
+import { FollowUpsPanel } from "@/components/followups-panel";
 import { GuidedReview } from "@/components/guided-review";
 import { LabelPicker } from "@/components/label-picker";
 import { LayerBar, useLayerScope } from "@/components/layered-review";
-import { MarkdownBody } from "@/components/markdown-body";
+import { MarkdownBody, MarkdownRepoContext } from "@/components/markdown-body";
 import { PrActions } from "@/components/pr-actions";
 import { ReactionsBar } from "@/components/reactions-bar";
+import { ReviewContextPane } from "@/components/review-context-pane";
 import { ReviewSubmitPopover, reviewStateToEvent } from "@/components/review-submit-dialog";
 import { ReviewThreadGroup } from "@/components/review-thread";
 import { Segmented } from "@/components/segmented";
+import {
+  type SinceDiff,
+  SinceReviewBanner,
+  type SinceView,
+} from "@/components/since-review-banner";
 import { StackRail } from "@/components/stack-rail";
 import { TooltipFor } from "@/components/tooltip-for";
 import {
@@ -39,17 +46,30 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { UserAvatar } from "@/components/user-avatar";
 import { UserHoverCard } from "@/components/user-hover-card";
 import type { AiAction } from "@/lib/ai-actions";
-import { buildReviewContext } from "@/lib/ai/context";
-import { parsePatch } from "@/lib/diff";
+import { useAttachBridge } from "@/lib/ai/attach-bridge";
+import { type ContextOptions, type ReviewContext, buildReviewContext } from "@/lib/ai/context";
 import { isTestFile } from "@/lib/focus";
+import { myThreads } from "@/lib/followups";
 import { relativeTime } from "@/lib/format";
+import { isImagePath } from "@/lib/images";
 import { celebrate } from "@/lib/kite-release";
+import { isMarkdownPath } from "@/lib/markdown";
+import { type NavEntry, useNavHistory } from "@/lib/nav-history";
+import type { ReviewLocation } from "@/lib/review-context";
+import {
+  addToPendingReview,
+  canAnchor,
+  isCommentableLine,
+  locatedNote,
+} from "@/lib/review-draft-bridge";
+import { commentableNewLines, lastReview } from "@/lib/since-review";
 import type {
   ActionsJob,
   ActionsStep,
   CheckAnnotation,
   CheckRun,
   CheckRunsResponse,
+  DraftComment,
   IssueComment,
   Label,
   PullDetail,
@@ -61,25 +81,30 @@ import type {
 } from "@/lib/tauri";
 import { invoke } from "@/lib/tauri";
 import { safeOpenUrl, toastError, toastRetry } from "@/lib/ui";
+import { useSinceReview } from "@/lib/use-since-review";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/stores/auth";
 import { useEditorPrefs } from "@/stores/editor-prefs";
 import { useLocalRepos } from "@/stores/local-repos";
 import { usePinboard } from "@/stores/pinboard";
 import { usePrView } from "@/stores/pr-view";
-import { useReviewDraft } from "@/stores/review-draft";
+import { useReviewContext } from "@/stores/review-context";
+import { toSubmittable, useReviewDraft } from "@/stores/review-draft";
 import { useReviewPrefs } from "@/stores/review-prefs";
 import { useUi } from "@/stores/ui";
 import { useViewedFiles, viewedKey } from "@/stores/viewed-files";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useBlocker, useNavigate, useParams } from "@tanstack/react-router";
 import {
+  ArrowLeft,
   ArrowRight,
   Check,
   CheckCheck,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  ChevronsDownUp,
+  ChevronsUpDown,
   Code2,
   Columns2,
   Copy,
@@ -91,7 +116,10 @@ import {
   GitPullRequest,
   Layers,
   MessageSquare,
+  MessageSquareText,
   OctagonX,
+  PanelLeft,
+  PanelRight,
   Pencil,
   Pin,
   PinOff,
@@ -112,6 +140,7 @@ import {
   useRef,
   useState,
 } from "react";
+import type { ImperativePanelHandle } from "react-resizable-panels";
 import { toast } from "sonner";
 
 type DetailTab = "files" | "conversation" | "commits" | "checks";
@@ -126,6 +155,17 @@ type DetailTab = "files" | "conversation" | "commits" | "checks";
  * back on replication lag. If GitHub never shows it, the next natural refetch
  * reconciles, so a failed/inconsistent submit can't keep showing a stale state.
  */
+/** Stand-in while the PR detail is still loading — every consumer of a
+ * `ReviewContext` renders behind a loading guard, so this is never sent to a
+ * model; it exists so `buildContext` can stay a plain non-null function. */
+const EMPTY_CONTEXT: ReviewContext = {
+  text: "",
+  size: { files: 0, churn: 0, shownFiles: 0, shownChurn: 0, coverage: 1 },
+};
+
+/** How often an open PR re-reads its comments and threads. */
+const CONVERSATION_POLL_MS = 60_000;
+
 function mergeReview(
   qc: ReturnType<typeof useQueryClient>,
   owner: string,
@@ -164,6 +204,17 @@ function mergeReview(
 }
 
 export function PRDetailPage() {
+  const { owner, repo } = useParams({ from: "/prs/$owner/$repo/$number" });
+  // `#123` in any markdown on this page links into this repo.
+  const repoRef = useMemo(() => ({ owner, repo }), [owner, repo]);
+  return (
+    <MarkdownRepoContext.Provider value={repoRef}>
+      <PRDetail />
+    </MarkdownRepoContext.Provider>
+  );
+}
+
+function PRDetail() {
   const { owner, repo, number: numberStr } = useParams({ from: "/prs/$owner/$repo/$number" });
   const number = Number(numberStr);
   const navigate = useNavigate();
@@ -173,6 +224,8 @@ export function PRDetailPage() {
   const diffLayout = useUi((s) => s.diffLayout);
   const focusMode = useUi((s) => s.focusMode);
   const toggleFocus = useUi((s) => s.toggleFocusMode);
+  const compactChrome = useUi((s) => s.compactChrome);
+  const toggleCompactChrome = useUi((s) => s.toggleCompactChrome);
   // The string key the per-PR view store (and review-draft store) is keyed by.
   const prViewKey = `${owner}/${repo}#${number}`;
   // Persist + restore the active tab per PR (item 16). Lazy init reads the
@@ -187,6 +240,13 @@ export function PRDetailPage() {
     setPersistedTab(prViewKey, next);
   };
   const [chatOpen, setChatOpen] = useState(false);
+  // Mounted here rather than inside AiReview: the chat panel unmounts when
+  // collapsed, and the bridge must keep listening so a detached chat window's
+  // edits still land in this window's store.
+  useAttachBridge(`${owner}/${repo}#${number}`);
+  // Once detached, that window owns the conversation — "Ask AI" raises it
+  // instead of re-opening the inline panel (two live views would both stream).
+  const chatDetachedRef = useRef(false);
   const [activeFile, setActiveFile] = useState<string | null>(null);
   // Review-screen search: Cmd+F find-in-diff, Cmd+P filter the file tree.
   const [findOpen, setFindOpen] = useState(false);
@@ -207,6 +267,11 @@ export function PRDetailPage() {
   const [editingTitle, setEditingTitle] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [guidedScrolled, setGuidedScrolled] = useState(false);
+  // The file-tree pane collapses to zero width; its size (collapsed or not) is
+  // persisted by the panel group's autoSaveId, so this only mirrors it for the
+  // toolbar button.
+  const treePanelRef = useRef<ImperativePanelHandle>(null);
+  const [treeCollapsed, setTreeCollapsed] = useState(false);
 
   // Jump from a pending review comment (in the submit dialog) to its file+line.
   const jumpToDraftComment = (c: { path: string; line?: number | null }) => {
@@ -278,10 +343,15 @@ export function PRDetailPage() {
     staleTime: 60_000,
   });
 
+  // Conversation queries poll while the PR is open, so a reply lands without a
+  // manual refresh. The background poller can't cover this: it only watches
+  // PRs requesting your review (which stops once you've reviewed) and watched
+  // repos. Paused while the window is hidden (TanStack's default).
   const threads = useQuery({
     queryKey: ["pull-review-comments", owner, repo, number],
     queryFn: () => invoke<ReviewThread[]>("gh_list_review_comments", { owner, repo, number }),
     staleTime: 30_000,
+    refetchInterval: CONVERSATION_POLL_MS,
   });
 
   // GraphQL thread data (resolve state + node ids) powers reply/resolve in both
@@ -290,6 +360,7 @@ export function PRDetailPage() {
     queryKey: ["pull-review-threads-gql", owner, repo, number],
     queryFn: () => invoke<ReviewThreadGraphQL[]>("gh_list_review_threads", { owner, repo, number }),
     staleTime: 30_000,
+    refetchInterval: CONVERSATION_POLL_MS,
   });
 
   const reviews = useQuery({
@@ -300,13 +371,10 @@ export function PRDetailPage() {
 
   // The viewer's own latest review verdict, so the header button reflects that
   // they've already reviewed (instead of always reading "Review" / undone).
-  const myReviewState = useMemo(() => {
-    const meaningful = new Set(["APPROVED", "CHANGES_REQUESTED", "COMMENTED"]);
-    const mine = (reviews.data ?? [])
-      .filter((r) => r.user.login === viewerLogin && meaningful.has(r.state))
-      .sort((a, b) => +new Date(b.submitted_at ?? 0) - +new Date(a.submitted_at ?? 0));
-    return mine[0]?.state ?? null;
-  }, [reviews.data, viewerLogin]);
+  const myReviewState = useMemo(
+    () => lastReview(reviews.data ?? [], viewerLogin, threads.data)?.state ?? null,
+    [reviews.data, viewerLogin, threads.data],
+  );
 
   // GraphQL node id is needed for draft↔ready and thread-resolve mutations.
   const nodeId = useQuery({
@@ -458,19 +526,184 @@ export function PRDetailPage() {
     headSha,
     viewedKey: vk,
   });
-  const scopedFiles = layers.active ? layers.scopedFiles : fileList;
-  // Inside a layer, a file from another layer must never stay open — otherwise
-  // the diff pane and the tree disagree about what's being reviewed.
-  const current = layers.active
-    ? activeFile && scopedFiles.some((f) => f.filename === activeFile)
-      ? activeFile
-      : (scopedFiles[0]?.filename ?? null)
-    : (activeFile ?? fileList[0]?.filename ?? null);
+
+  // Since your review: after new pushes, narrow the review loop to the files
+  // that changed since the viewer's last review. Combines with layers.
+  const since = useSinceReview({
+    owner,
+    repo,
+    number,
+    headSha,
+    prBaseSha: detail.data?.base.sha,
+    prFiles: fileList,
+    reviews: reviews.data,
+    comments: threads.data,
+    viewerLogin,
+  });
+  const sinceFilterPref = usePrView((s) => s.sinceReview?.[prViewKey]);
+  const setSinceFilter = usePrView((s) => s.setSinceReview);
+  const [sinceDiff, setSinceDiff] = useState<SinceDiff>("range");
+  const sinceChanged =
+    since.state.mode === "incremental" || since.state.mode === "rebased"
+      ? since.state.changed
+      : null;
+  const sinceActive = !!sinceChanged && (sinceFilterPref ?? true);
+  const sinceView: SinceView = (sinceFilterPref ?? true) ? sinceDiff : "all";
+  const setSinceView = (v: SinceView) => {
+    setSinceFilter(prViewKey, v !== "all");
+    if (v !== "all") setSinceDiff(v);
+  };
+  // Showing only the new commits' diff: the tree's status letters and +/− bars
+  // describe that same diff, not the PR's, so a file added by the PR but only
+  // touched since reads as the small modification it is.
+  const sinceRangeFiles = useMemo(
+    () =>
+      sinceActive && sinceDiff === "range" && since.state.mode === "incremental"
+        ? new Map(since.state.files.map((f) => [f.filename, f]))
+        : null,
+    [sinceActive, sinceDiff, since.state],
+  );
+
+  const layerFiles = layers.active ? layers.scopedFiles : fileList;
+  const scopedFiles = useMemo(
+    () =>
+      sinceActive && sinceChanged
+        ? layerFiles.filter((f) => sinceChanged.has(f.filename))
+        : layerFiles,
+    [sinceActive, sinceChanged, layerFiles],
+  );
+  // Inside a layer (or the since-review filter), a file outside it must never
+  // stay open — otherwise the diff pane and the tree disagree about what's
+  // being reviewed.
+  const sinceInLayer =
+    layers.active && sinceChanged
+      ? layerFiles.filter((f) => sinceChanged.has(f.filename)).length
+      : null;
+  const current =
+    layers.active || sinceActive
+      ? activeFile && scopedFiles.some((f) => f.filename === activeFile)
+        ? activeFile
+        : (scopedFiles[0]?.filename ?? null)
+      : (activeFile ?? fileList[0]?.filename ?? null);
   const currentFile = fileList.find((f) => f.filename === current) ?? null;
+  // Incremental since-review diff: the range patch replaces the PR patch, and
+  // only lines in the PR's own diff take new comments (GitHub rejects others).
+  const rangeFile = (currentFile && sinceRangeFiles?.get(currentFile.filename)) ?? null;
+  const currentPatch = currentFile?.patch;
+  const commentableRight = useMemo(
+    () => (rangeFile ? commentableNewLines(currentPatch) : null),
+    [rangeFile, currentPatch],
+  );
+
+  // Your comments: the threads the viewer started, and whether later pushes
+  // addressed them. The check itself runs only from the panel.
+  const [followUpsOpen, setFollowUpsOpen] = useState(false);
+  const followUps = useMemo(
+    () => myThreads(reviewThreadsGql.data ?? [], threads.data ?? [], viewerLogin),
+    [reviewThreadsGql.data, threads.data, viewerLogin],
+  );
+  // Jump from the panel to a line. A file the since-review filter hides turns
+  // the filter off — otherwise `current` would snap back into the filtered set.
+  const jumpToLine = (path: string, line: number | null) => {
+    if (sinceActive && sinceChanged && !sinceChanged.has(path)) setSinceFilter(prViewKey, false);
+    setActiveFile(path);
+    if (line != null) {
+      setFocusLine(line);
+      setFocusNonce((n) => n + 1);
+    }
+  };
+
+  // Back / forward between the tour and the files it links to (and any other
+  // file you open). Only once a file has been picked — the first-file fallback
+  // before the resume point loads isn't somewhere you went.
+  const nav = useNavHistory(
+    prViewKey,
+    tab !== "files"
+      ? null
+      : view === "guided"
+        ? { view, file: null }
+        : activeFile && current
+          ? { view, file: current }
+          : null,
+    useCallback(
+      (e: NavEntry) => {
+        if (e.file) setActiveFile(e.file);
+        // Between files, keep the layout you're in; only crossing into or out
+        // of the tour changes the view.
+        const now = useUi.getState().diffView;
+        if (e.view === "guided" || now === "guided") setView(e.view);
+      },
+      [setView],
+    ),
+  );
+  // Read by the mount-once ⌘-chord listener below.
+  const navRef = useRef(nav);
+  navRef.current = nav;
+  const tabRef = useRef(tab);
+  tabRef.current = tab;
+  // Review context pane — surrounding code beside the diff. Never feeds the
+  // viewed-files store: reading a dependency isn't reviewing a change.
+  const lastEditorTargetId = useEditorPrefs((s) => s.lastTargetId);
+  const setLastEditorTargetId = useEditorPrefs((s) => s.setLastTargetId);
+  const contextOpen = useReviewContext((s) => s.open);
+  const toggleContext = useReviewContext((s) => s.toggle);
+  const navigateContext = useReviewContext((s) => s.navigate);
+  const changedPaths = useMemo(() => fileList.map((f) => f.filename), [fileList]);
+
+  // Open a place in the context pane. `navigate` reveals the pane itself, so a
+  // peek from a closed pane is still one interaction. Deliberately does not
+  // touch `current`, the scroll position, or viewed state — the diff must stay
+  // exactly where the reviewer left it.
+  const peek = useCallback(
+    (loc: ReviewLocation) => navigateContext(prViewKey, loc),
+    [navigateContext, prViewKey],
+  );
+
+  // Hand a diff line off to the reviewer's editor, opened on that exact line.
+  // Only offered when a clone is mapped — there is nothing on disk to open
+  // otherwise. Reuses the target the reviewer last picked in the header menu.
+  const openInEditor = useCallback(
+    async (file: string, line: number) => {
+      if (!localRepo) return;
+      const targets = await invoke<LocalEditorTarget[]>("local_editor_targets").catch(() => []);
+      const target =
+        targets.find((t) => t.id === lastEditorTargetId) ??
+        targets.find((t) => t.isDefault) ??
+        targets[0];
+      if (!target) {
+        toast.info("No supported editor found", {
+          description: "Install Zed, VS Code, or Cursor, or set $EDITOR to an installed editor.",
+        });
+        return;
+      }
+      try {
+        await invoke("open_local_editor", {
+          path: localRepo.path,
+          targetId: target.id,
+          file,
+          line,
+        });
+        setLastEditorTargetId(target.id);
+      } catch {
+        toast.error(`Couldn't open ${target.label}`, {
+          description:
+            "The file may not be in your local clone, or the editor may have been removed or renamed.",
+        });
+      }
+    },
+    [localRepo, lastEditorTargetId, setLastEditorTargetId],
+  );
   // Cmd+P filter — narrows the file tree by filename (case-insensitive).
   const visibleFiles = fileFilter.trim()
     ? scopedFiles.filter((f) => f.filename.toLowerCase().includes(fileFilter.trim().toLowerCase()))
     : scopedFiles;
+  const treeFiles = useMemo(
+    () =>
+      sinceRangeFiles
+        ? visibleFiles.map((f) => sinceRangeFiles.get(f.filename) ?? f)
+        : visibleFiles,
+    [visibleFiles, sinceRangeFiles],
+  );
   const autoMarkViewed = useReviewPrefs((s) => s.autoMarkViewed);
   const autoReadyOnReview = useReviewPrefs((s) => s.autoReadyOnReview);
   const diffDensity = useReviewPrefs((s) => s.diffDensity);
@@ -587,6 +820,29 @@ export function PRDetailPage() {
         // Toggle "viewed" for the current file (item 37).
         e.preventDefault();
         if (vk && cur) setViewedFile(vk, cur, !viewedMap?.[cur]);
+      } else if (e.key === "m") {
+        // Rendered Markdown / raw diff. Only meaningful on a Markdown file, so
+        // the key stays free everywhere else.
+        if (!isMarkdownPath(cur)) return;
+        e.preventDefault();
+        const prefs = useReviewPrefs.getState();
+        prefs.setMarkdownPreview(!prefs.markdownPreview);
+      } else if (e.key === "\\") {
+        // Show/hide the review context pane. `\` is unclaimed, sits next to the
+        // bracket keys that already move between files, and needs no chord.
+        e.preventDefault();
+        useReviewContext.getState().toggle();
+      } else if (e.key === "z") {
+        // Compact header: title + tabs on one line, layer briefing on one line.
+        e.preventDefault();
+        useUi.getState().toggleCompactChrome();
+      } else if (e.key === "t") {
+        // Show/hide the file tree for a full-width diff. No tree in guided view.
+        const tree = treePanelRef.current;
+        if (!tree) return;
+        e.preventDefault();
+        if (tree.isCollapsed()) tree.expand();
+        else tree.collapse();
       }
     }
     window.addEventListener("keydown", onKey);
@@ -601,7 +857,14 @@ export function PRDetailPage() {
     function onKey(e: KeyboardEvent) {
       if (!(e.metaKey || e.ctrlKey) || e.altKey || e.shiftKey) return;
       const k = e.key.toLowerCase();
-      if (k === "f") {
+      if (k === "[" || k === "]") {
+        // Back / forward (⌘[ / ⌘]), like a browser. Files tab only — that's
+        // where the history lives.
+        if (tabRef.current !== "files") return;
+        e.preventDefault();
+        if (k === "[") navRef.current.back();
+        else navRef.current.forward();
+      } else if (k === "f") {
         e.preventDefault();
         setTab("files");
         setFindOpen(true);
@@ -610,6 +873,8 @@ export function PRDetailPage() {
         setTab("files");
         setFindOpen(false);
         requestAnimationFrame(() => {
+          // The filter lives in the tree pane — open it if it's collapsed.
+          if (treePanelRef.current?.isCollapsed()) treePanelRef.current.expand();
           fileFilterRef.current?.focus();
           fileFilterRef.current?.select();
         });
@@ -642,6 +907,56 @@ export function PRDetailPage() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // Guided Review's "Add": its steps are AI-anchored, so check the line is in
+  // the diff (same fallback as the chat's drafted comments).
+  function addGuidedComment(c: DraftComment) {
+    if (c.line == null) return addComment(prKey, c);
+    void addToPendingReview(prKey, fileList, { ...c, line: c.line, side: "RIGHT" }).then(
+      (where) => {
+        if (where === "body") {
+          toast.warning(
+            `Line ${c.line} isn't in ${c.path.split("/").pop()}'s diff — added to the review summary instead.`,
+          );
+        }
+      },
+    );
+  }
+
+  // Post an inline comment straight to GitHub (Guided Review's "Post").
+  async function postInlineComment(c: { path: string; line: number; body: string }) {
+    if (!headSha) throw new Error("PR head commit unavailable — reload and try again.");
+    // An inline comment only sticks on a line that's actually in the diff;
+    // an off / hallucinated anchor 422s. If the line isn't commentable, fall
+    // back to a file-level comment (with the path:line in the body) so the
+    // note still lands instead of erroring out.
+    if (!isCommentableLine(fileList, c.path, c.line)) {
+      toast.warning(
+        `Line ${c.line} isn't in ${c.path.split("/").pop()}'s diff — posting as a file comment.`,
+      );
+      await invoke("gh_create_issue_comment", {
+        owner,
+        repo,
+        number,
+        body: `**${c.path}:${c.line}**\n\n${c.body}`,
+      });
+      qc.invalidateQueries({ queryKey: ["pull-issue-comments", owner, repo, number] });
+    } else {
+      await invoke("gh_create_review_comment", {
+        owner,
+        repo,
+        number,
+        commitId: headSha,
+        path: c.path,
+        line: c.line,
+        side: "RIGHT",
+        body: c.body,
+      });
+      qc.invalidateQueries({ queryKey: ["pull-review-comments", owner, repo, number] });
+      qc.invalidateQueries({ queryKey: ["pull-review-threads-gql", owner, repo, number] });
+    }
+    toast.success("Posted to GitHub");
+  }
+
   // Execute an AI-proposed action with the app's authenticated commands.
   async function executeAiAction(a: AiAction): Promise<void> {
     switch (a.type) {
@@ -664,43 +979,17 @@ export function PRDetailPage() {
         break;
       }
       case "inline_comment": {
-        if (!headSha) throw new Error("PR head commit unavailable — reload and try again.");
-        // An inline comment only sticks on a line that's actually in the diff;
-        // an off / hallucinated anchor 422s. If the line isn't commentable, fall
-        // back to a file-level comment (with the path:line in the body) so the
-        // note still lands instead of erroring out.
-        const target = fileList.find((f) => f.filename === a.path);
-        const commentable =
-          !!target?.patch &&
-          parsePatch(target.patch).some((h) =>
-            h.lines.some((l) => l.kind !== "hunk" && l.newLine === a.line),
-          );
-        if (!commentable) {
+        // Lands in the pending review (like a comment typed in the diff) so the
+        // reviewer can edit or drop it before submitting — not posted directly.
+        const where = await addToPendingReview(prKey, fileList, a);
+        if (where === "body") {
           toast.warning(
-            `Line ${a.line} isn't in ${a.path.split("/").pop()}'s diff — posting as a file comment.`,
+            `Line ${a.line} isn't in ${a.path.split("/").pop()}'s diff — added to the review summary instead.`,
           );
-          await invoke("gh_create_issue_comment", {
-            owner,
-            repo,
-            number,
-            body: `**${a.path}:${a.line}**\n\n${a.body}`,
-          });
-          qc.invalidateQueries({ queryKey: ["pull-issue-comments", owner, repo, number] });
-          break;
+        } else {
+          toast.success("Added to your pending review");
         }
-        await invoke("gh_create_review_comment", {
-          owner,
-          repo,
-          number,
-          commitId: headSha,
-          path: a.path,
-          line: a.line,
-          side: a.side,
-          body: a.body,
-        });
-        qc.invalidateQueries({ queryKey: ["pull-review-comments", owner, repo, number] });
-        qc.invalidateQueries({ queryKey: ["pull-review-threads-gql", owner, repo, number] });
-        break;
+        return;
       }
       case "label": {
         const names = new Set(labels.map((l) => l.name));
@@ -728,6 +1017,7 @@ export function PRDetailPage() {
     const existing = await WebviewWindow.getByLabel(label);
     if (existing) {
       await existing.setFocus();
+      chatDetachedRef.current = true;
       setChatOpen(false);
       return;
     }
@@ -741,11 +1031,29 @@ export function PRDetailPage() {
       resizable: true,
     });
     win.once("tauri://error", (e) => {
+      chatDetachedRef.current = false;
       toast.error(
         `Couldn't open the chat window — ${String((e as { payload?: unknown }).payload)}`,
       );
     });
+    chatDetachedRef.current = true;
     setChatOpen(false);
+  }
+
+  // Reveal the chat after code has been pinned to it from the diff.
+  async function revealChat() {
+    if (chatDetachedRef.current) {
+      const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
+      const label = `chat-${owner}-${repo}-${number}`.replace(/[^a-zA-Z0-9_-]/g, "_");
+      const existing = await WebviewWindow.getByLabel(label);
+      if (existing) {
+        await existing.setFocus();
+        return;
+      }
+      // The user closed it — fall back to the inline panel.
+      chatDetachedRef.current = false;
+    }
+    setChatOpen(true);
   }
 
   // Fetch the currently-viewed file's HEAD content so the diff viewer can
@@ -759,15 +1067,28 @@ export function PRDetailPage() {
         path: current as string,
         ref: headSha as string,
       }),
-    enabled: !!headSha && !!current,
+    // Images are fetched as bytes by the image preview, not as text.
+    enabled: !!headSha && !!current && !isImagePath(current),
     staleTime: 5 * 60_000,
     placeholderData: keepPreviousData,
   });
 
   const submit = useMutation({
     mutationFn: async (event: "COMMENT" | "APPROVE" | "REQUEST_CHANGES") => {
-      const body = draft?.body ?? "";
-      const comments = draft?.comments ?? [];
+      // A comment on a line that isn't in the diff (a renamed-only file, or a
+      // line a later push removed) would 422 the whole review, so it rides in
+      // the summary instead, labeled with its path:line.
+      const pending = draft?.comments ?? [];
+      const loose = pending.filter((c) => !canAnchor(fileList, c));
+      const comments = pending.filter((c) => canAnchor(fileList, c)).map(toSubmittable);
+      const body = [draft?.body ?? "", ...loose.map(locatedNote)]
+        .filter((s) => s.trim())
+        .join("\n\n");
+      if (loose.length) {
+        toast.warning(
+          `${loose.length} comment${loose.length === 1 ? " isn't" : "s aren't"} on a line in the diff — included in the review summary instead.`,
+        );
+      }
       // Non-blocking nudge (item 22): requesting changes with no summary is
       // usually a mistake, but we still let it through — just warn.
       if (event === "REQUEST_CHANGES" && !body.trim()) {
@@ -842,14 +1163,18 @@ export function PRDetailPage() {
   });
 
   // Self-contained review context: PR metadata + description + the full diff
-  // (capped) so the AI can review without filesystem access.
-  const reviewContext = useMemo(
-    () =>
+  // (capped) so the AI can review without filesystem access. Exposed as a
+  // BUILDER as well as a value: a deep tour rebuilds it scoped to one layer's
+  // files, and going through here keeps `detail` from having to be threaded
+  // down the component tree just to rebuild a context.
+  const buildContext = useCallback(
+    (subset: PullFile[], opts?: ContextOptions): ReviewContext =>
       detail.data
-        ? buildReviewContext(detail.data, files.data ?? [], `${owner}/${repo}`, number)
-        : "",
-    [detail.data, files.data, owner, repo, number],
+        ? buildReviewContext(detail.data, subset, `${owner}/${repo}`, number, opts)
+        : EMPTY_CONTEXT,
+    [detail.data, owner, repo, number],
   );
+  const reviewContext = useMemo(() => buildContext(fileList), [buildContext, fileList]);
 
   if (detail.isLoading) {
     return <PRDetailLoading />;
@@ -871,7 +1196,9 @@ export function PRDetailPage() {
 
   const d = detail.data;
   const pinned = isPinned("pr", `${owner}/${repo}#${number}`);
-  const compactGuidedHeader = tab === "files" && view === "guided" && guidedScrolled;
+  // The header folds to one line on demand (`z`), or on its own once the
+  // guided tour is scrolled.
+  const compactHeader = tab === "files" && (compactChrome || (view === "guided" && guidedScrolled));
 
   return (
     <div className="relative flex h-full flex-col">
@@ -879,14 +1206,14 @@ export function PRDetailPage() {
       <header
         className={cn(
           "flex flex-col border-b border-hairline px-6 transition-[gap,padding] duration-300 ease-out motion-reduce:transition-none",
-          compactGuidedHeader ? "gap-y-2 py-2.5" : "gap-y-3 py-4",
+          compactHeader ? "gap-y-2 py-2.5" : "gap-y-3 py-4",
         )}
       >
         <div className="flex items-start gap-3">
           <GitPullRequest
             className={cn(
               "shrink-0 transition-all duration-300 ease-out motion-reduce:transition-none",
-              compactGuidedHeader ? "mt-0.5 size-4" : "mt-1 size-5",
+              compactHeader ? "mt-0.5 size-4" : "mt-1 size-5",
               d.merged
                 ? "text-purple-400"
                 : d.state === "closed"
@@ -920,7 +1247,7 @@ export function PRDetailPage() {
                   <h1
                     className={cn(
                       "truncate font-semibold tracking-tight text-foreground transition-[font-size,line-height] duration-300 ease-out motion-reduce:transition-none",
-                      compactGuidedHeader ? "text-sm leading-5" : "text-xl",
+                      compactHeader ? "text-sm leading-5" : "text-xl",
                     )}
                   >
                     {d.title}
@@ -947,11 +1274,11 @@ export function PRDetailPage() {
             <div
               className={cn(
                 "overflow-hidden transition-[max-height,opacity,transform,margin] duration-300 ease-out motion-reduce:transition-none",
-                compactGuidedHeader
+                compactHeader
                   ? "pointer-events-none mt-0 max-h-0 -translate-y-1 opacity-0"
                   : "mt-1 max-h-24 translate-y-0 opacity-100",
               )}
-              aria-hidden={compactGuidedHeader}
+              aria-hidden={compactHeader}
             >
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs text-muted-foreground">
                 <span className="inline-flex items-center gap-1.5">
@@ -986,8 +1313,7 @@ export function PRDetailPage() {
                     </TooltipFor>
                   </>
                 )}
-              </div>
-              <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1.5">
+                <span className="text-muted-foreground/60">·</span>
                 <LabelPicker
                   owner={owner}
                   repo={repo}
@@ -1094,7 +1420,7 @@ export function PRDetailPage() {
                 defaultEvent={reviewStateToEvent(myReviewState)}
                 onJumpToComment={jumpToDraftComment}
                 onBodyChange={(b) => setBody(prKey, b)}
-                onRemoveComment={(i) => removeComment(prKey, i)}
+                onRemoveComment={(id) => removeComment(prKey, id)}
                 submitting={submit.isPending}
                 onSubmit={(event) => submit.mutate(event)}
               />
@@ -1130,6 +1456,30 @@ export function PRDetailPage() {
 
           {tab === "files" && (
             <div className="ml-auto flex items-center gap-2">
+              <div className="flex items-center">
+                <TooltipFor label="Back" shortcut="⌘[">
+                  <button
+                    type="button"
+                    onClick={nav.back}
+                    disabled={!nav.canBack}
+                    aria-label="Back"
+                    className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-foreground/[0.05] hover:text-foreground disabled:pointer-events-none disabled:opacity-35"
+                  >
+                    <ArrowLeft className="size-3.5" />
+                  </button>
+                </TooltipFor>
+                <TooltipFor label="Forward" shortcut="⌘]">
+                  <button
+                    type="button"
+                    onClick={nav.forward}
+                    disabled={!nav.canForward}
+                    aria-label="Forward"
+                    className="flex size-7 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-foreground/[0.05] hover:text-foreground disabled:pointer-events-none disabled:opacity-35"
+                  >
+                    <ArrowRight className="size-3.5" />
+                  </button>
+                </TooltipFor>
+              </div>
               {(d.additions ?? d.deletions) != null && (
                 <TooltipFor
                   label={
@@ -1165,6 +1515,25 @@ export function PRDetailPage() {
                   </button>
                 </TooltipFor>
               )}
+              {view !== "guided" && followUps.length > 0 && (
+                <TooltipFor label="Your comments — check whether new pushes addressed them">
+                  <button
+                    type="button"
+                    onClick={() => setFollowUpsOpen((o) => !o)}
+                    aria-label="Your comments"
+                    aria-pressed={followUpsOpen}
+                    className={cn(
+                      "flex h-7 items-center gap-1 rounded-md px-1.5 text-xs tabular-nums transition-colors",
+                      followUpsOpen
+                        ? "bg-primary/15 text-primary"
+                        : "text-muted-foreground hover:bg-foreground/[0.05] hover:text-foreground",
+                    )}
+                  >
+                    <MessageSquareText className="size-3.5" />
+                    {followUps.length}
+                  </button>
+                </TooltipFor>
+              )}
               {view !== "guided" && (
                 <TooltipFor label="Focus mode hides lockfiles, generated, snapshots, renames, and format-only changes">
                   <button
@@ -1180,6 +1549,29 @@ export function PRDetailPage() {
                     )}
                   >
                     <Focus className="size-3.5" />
+                  </button>
+                </TooltipFor>
+              )}
+              {view !== "guided" && (
+                <TooltipFor label="File tree" shortcut="t">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const tree = treePanelRef.current;
+                      if (!tree) return;
+                      if (tree.isCollapsed()) tree.expand();
+                      else tree.collapse();
+                    }}
+                    aria-label="Toggle file tree"
+                    aria-pressed={!treeCollapsed}
+                    className={cn(
+                      "flex size-6 items-center justify-center rounded transition-colors",
+                      !treeCollapsed
+                        ? "bg-foreground/[0.08] text-foreground"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    <PanelLeft className="size-3.5" />
                   </button>
                 </TooltipFor>
               )}
@@ -1249,6 +1641,39 @@ export function PRDetailPage() {
                   </button>
                 </TooltipFor>
               </div>
+              {view !== "guided" && (
+                <TooltipFor label="Review context — read a file beside the diff" shortcut="\\">
+                  <button
+                    type="button"
+                    onClick={toggleContext}
+                    aria-label="Toggle review context"
+                    aria-pressed={contextOpen}
+                    className={cn(
+                      "flex size-6 items-center justify-center rounded transition-colors",
+                      contextOpen
+                        ? "bg-foreground/[0.08] text-foreground"
+                        : "text-muted-foreground hover:text-foreground",
+                    )}
+                  >
+                    <PanelRight className="size-3.5" />
+                  </button>
+                </TooltipFor>
+              )}
+              <TooltipFor label={compactChrome ? "Expand header" : "Compact header"} shortcut="z">
+                <button
+                  type="button"
+                  onClick={toggleCompactChrome}
+                  aria-label="Compact header"
+                  aria-pressed={compactChrome}
+                  className="flex size-6 items-center justify-center rounded text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  {compactChrome ? (
+                    <ChevronsUpDown className="size-3.5" />
+                  ) : (
+                    <ChevronsDownUp className="size-3.5" />
+                  )}
+                </button>
+              </TooltipFor>
             </div>
           )}
         </div>
@@ -1262,18 +1687,13 @@ export function PRDetailPage() {
           <GuidedReview
             prKey={`${owner}/${repo}#${number}`}
             context={reviewContext}
+            buildContext={buildContext}
             files={fileList}
             headSha={headSha}
-            onAddComment={(c) => addComment(prKey, c)}
-            onPostComment={(c) =>
-              executeAiAction({
-                type: "inline_comment",
-                path: c.path,
-                line: c.line,
-                body: c.body,
-                side: "RIGHT",
-              })
-            }
+            prTitle={d.title}
+            prUrl={d.html_url}
+            onAddComment={addGuidedComment}
+            onPostComment={postInlineComment}
             onOpenFile={(path, line) => {
               setActiveFile(path);
               if (line != null) {
@@ -1283,6 +1703,9 @@ export function PRDetailPage() {
               setView("unified");
             }}
             onScrolledChange={setGuidedScrolled}
+            onAskAi={() => {
+              void revealChat();
+            }}
           />
         )}
 
@@ -1292,16 +1715,45 @@ export function PRDetailPage() {
             scope={layers}
             prKey={prViewKey}
             context={reviewContext}
+            buildContext={buildContext}
             files={fileList}
             headSha={headSha}
             viewedKey={vk}
+            activeFile={current}
             onSelectFile={setActiveFile}
+            onOpenGuided={() => setView("guided")}
           />
         )}
 
         {tab === "files" && view !== "guided" && (
-          <ResizablePanelGroup direction="horizontal" className="flex-1 min-h-0">
-            <ResizablePanel defaultSize={22} minSize={15}>
+          <SinceReviewBanner
+            state={since.state}
+            review={since.review}
+            view={sinceView}
+            onView={setSinceView}
+            inLayer={sinceInLayer}
+            myThreads={followUps.length}
+            onCheckComments={() => setFollowUpsOpen(true)}
+          />
+        )}
+
+        {tab === "files" && view !== "guided" && (
+          <ResizablePanelGroup
+            direction="horizontal"
+            className="flex-1 min-h-0"
+            autoSaveId="pr-files-panes"
+          >
+            <ResizablePanel
+              ref={treePanelRef}
+              id="tree"
+              order={1}
+              defaultSize={22}
+              minSize={15}
+              collapsible
+              collapsedSize={0}
+              onCollapse={() => setTreeCollapsed(true)}
+              onExpand={() => setTreeCollapsed(false)}
+            >
               <div className="flex h-full flex-col">
                 <div className="border-b border-hairline p-1.5">
                   <input
@@ -1323,7 +1775,7 @@ export function PRDetailPage() {
                 </div>
                 <div className="min-h-0 flex-1">
                   <FileTree
-                    files={visibleFiles}
+                    files={treeFiles}
                     active={current}
                     onSelect={setActiveFile}
                     loading={files.isLoading && fileList.length === 0}
@@ -1334,14 +1786,15 @@ export function PRDetailPage() {
               </div>
             </ResizablePanel>
             <ResizableHandle />
-            <ResizablePanel>
+            <ResizablePanel id="diff" order={2} minSize={30}>
               <div className="relative h-full">
                 {findOpen && <DiffFindBar onClose={() => setFindOpen(false)} />}
                 <ScrollArea className="h-full">
                   {currentFile ? (
                     <DiffViewer
                       path={currentFile.filename}
-                      patch={currentFile.patch}
+                      patch={rangeFile ? rangeFile.patch : currentFile.patch}
+                      commentableRight={commentableRight}
                       // Layered review is a mode on top of a layout, not a
                       // layout of its own — keep rendering the diff the way the
                       // reviewer last chose.
@@ -1369,9 +1822,19 @@ export function PRDetailPage() {
                       density={diffDensity}
                       focusLine={focusLine}
                       focusNonce={focusNonce}
+                      onOpenInEditor={localRepo ? openInEditor : undefined}
+                      onPeek={peek}
                       headSha={headSha}
-                      viewedKey={vk}
+                      baseSha={detail.data?.base.sha}
+                      status={currentFile.status}
+                      previousPath={currentFile.previous_filename}
+                      // Gap expansions and scroll are indexed by this diff's
+                      // hunks, so the since-review diff keeps its own.
+                      viewedKey={rangeFile && vk ? `${vk}#since` : vk}
                       fileLinesLoading={fileContent.isLoading && fileContent.dataUpdatedAt === 0}
+                      onAskAi={() => {
+                        void revealChat();
+                      }}
                     />
                   ) : (
                     <EmptyState
@@ -1383,6 +1846,43 @@ export function PRDetailPage() {
                 </ScrollArea>
               </div>
             </ResizablePanel>
+            {contextOpen && (
+              <>
+                <ResizableHandle />
+                <ResizablePanel id="context" order={3} defaultSize={30} minSize={20}>
+                  <ReviewContextPane
+                    owner={owner}
+                    repo={repo}
+                    prKey={prViewKey}
+                    headSha={headSha ?? null}
+                    changedPaths={changedPaths}
+                  />
+                </ResizablePanel>
+              </>
+            )}
+            {followUpsOpen && (
+              <>
+                <ResizableHandle />
+                <ResizablePanel id="followups" order={4} defaultSize={28} minSize={20}>
+                  <FollowUpsPanel
+                    owner={owner}
+                    repo={repo}
+                    number={number}
+                    prKey={prViewKey}
+                    headSha={headSha}
+                    prFiles={fileList}
+                    prAuthor={d.user?.login ?? null}
+                    cwd={localRepo?.path ?? null}
+                    followUps={followUps}
+                    gqlThreads={reviewThreadsGql.data ?? []}
+                    comments={threads.data ?? []}
+                    viewerLogin={viewerLogin}
+                    onJump={jumpToLine}
+                    onClose={() => setFollowUpsOpen(false)}
+                  />
+                </ResizablePanel>
+              </>
+            )}
           </ResizablePanelGroup>
         )}
 
@@ -1438,7 +1938,7 @@ export function PRDetailPage() {
               defaultEvent={reviewStateToEvent(myReviewState)}
               onJumpToComment={jumpToDraftComment}
               onBodyChange={(b) => setBody(prKey, b)}
-              onRemoveComment={(i) => removeComment(prKey, i)}
+              onRemoveComment={(id) => removeComment(prKey, id)}
               submitting={submit.isPending}
               onSubmit={(event) => submit.mutate(event)}
             />
@@ -1539,7 +2039,7 @@ export function PRDetailPage() {
             }}
             className="mb-2 flex h-[30rem] w-[26rem] max-w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-xl border border-hairline bg-popover/95 shadow-2xl backdrop-blur-md"
           >
-            <div className="flex items-center gap-1.5 border-b border-hairline px-3 py-2.5 text-[13px] font-medium text-muted-foreground">
+            <div className="flex items-center gap-1.5 border-b border-hairline px-3 py-2.5 text-sm font-medium text-muted-foreground">
               <Sparkles className="size-3.5 text-primary" />
               Ask about this PR
               <div className="ml-auto flex items-center gap-0.5">
@@ -1568,8 +2068,9 @@ export function PRDetailPage() {
             <div className="min-h-0 flex-1 px-3 py-3">
               <AiReview
                 prKey={`${owner}/${repo}#${number}`}
-                context={reviewContext}
+                context={reviewContext.text}
                 executeAction={executeAiAction}
+                files={fileList}
               />
             </div>
           </div>
@@ -1817,7 +2318,7 @@ function ChecksPlaceholder() {
 
   return (
     <div className="px-2 py-1.5">
-      <div className="px-2 py-1.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground/50">
+      <div className="px-2 py-1.5 text-2xs font-medium uppercase tracking-wide text-muted-foreground/50">
         Required
       </div>
       {rows.map((width, i) => (
@@ -1872,6 +2373,7 @@ function Conversation({
     queryKey: ["pull-issue-comments", owner, repo, number],
     queryFn: () => invoke<IssueComment[]>("gh_list_issue_comments", { owner, repo, number }),
     staleTime: 30_000,
+    refetchInterval: CONVERSATION_POLL_MS,
   });
   const comments = issueComments.data ?? [];
 
@@ -1948,7 +2450,7 @@ function Conversation({
             />
           ) : (
             <>
-              <MarkdownBody className="text-xs">{description ?? ""}</MarkdownBody>
+              <MarkdownBody remoteImages>{description ?? ""}</MarkdownBody>
               <div className="mt-2.5">
                 <ReactionsBar
                   target="issue"
@@ -2002,7 +2504,7 @@ function Conversation({
                   </span>
                 }
               />
-              {r.body && <MarkdownBody className="text-xs">{r.body}</MarkdownBody>}
+              {r.body && <MarkdownBody remoteImages>{r.body}</MarkdownBody>}
               <div className="mt-2.5">
                 <ReactionsBar
                   target="review"
@@ -2019,7 +2521,7 @@ function Conversation({
           {visibleComments.map((c) => (
             <article key={c.id} className="rounded-xl border border-hairline bg-card/50 p-4">
               <CommentByline className="mb-2" user={c.user} timestamp={c.created_at} />
-              <MarkdownBody className="text-xs">{c.body}</MarkdownBody>
+              <MarkdownBody remoteImages>{c.body}</MarkdownBody>
               <div className="mt-2.5">
                 <ReactionsBar
                   target="issue_comment"
@@ -2034,7 +2536,7 @@ function Conversation({
 
           {gqlThreads.length > 0 && (
             <section>
-              <h2 className="mb-2.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+              <h2 className="mb-2.5 text-2xs font-medium uppercase tracking-wide text-muted-foreground">
                 Inline comments
               </h2>
               <div className="space-y-2.5">
@@ -2209,10 +2711,10 @@ function CheckGroup({
   return (
     <section className="mb-1">
       <div className="flex items-baseline gap-2 px-2 pt-2 pb-1">
-        <span className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+        <span className="text-2xs font-medium uppercase tracking-wide text-muted-foreground">
           {title}
         </span>
-        {hint && <span className="text-[11px] text-muted-foreground/50">{hint}</span>}
+        {hint && <span className="text-2xs text-muted-foreground/50">{hint}</span>}
       </div>
       <ul>{children}</ul>
     </section>
@@ -2291,7 +2793,7 @@ function CheckRow({ run, owner, repo }: { run: CheckRun; owner: string; repo: st
           <span className="truncate text-xs text-foreground">{run.name}</span>
           {status && <span className={cn("shrink-0 text-xs", status.tone)}>{status.text}</span>}
         </button>
-        <span className="hidden shrink-0 text-[11px] text-muted-foreground/55 opacity-0 transition-opacity group-hover:opacity-100 sm:inline">
+        <span className="hidden shrink-0 text-2xs text-muted-foreground/55 opacity-0 transition-opacity group-hover:opacity-100 sm:inline">
           {run.app?.name ?? "Unknown"}
           {duration && ` · ${duration}`}
         </span>
@@ -2367,15 +2869,15 @@ function CheckDetail({ run, owner, repo }: { run: CheckRun; owner: string; repo:
       {run.output?.title && (
         <p className="text-xs font-medium text-foreground">{run.output.title}</p>
       )}
-      {summary && <MarkdownBody className="text-xs">{summary}</MarkdownBody>}
-      {text && text !== summary && <MarkdownBody className="text-xs">{text}</MarkdownBody>}
+      {summary && <MarkdownBody remoteImages>{summary}</MarkdownBody>}
+      {text && text !== summary && <MarkdownBody remoteImages>{text}</MarkdownBody>}
 
       {jobId != null &&
         (job.isLoading ? (
           <Skeleton className="h-16 w-full rounded-md" />
         ) : steps.length > 0 ? (
           <div>
-            <p className="mb-1 text-[11px] font-medium text-muted-foreground">
+            <p className="mb-1 text-2xs font-medium text-muted-foreground">
               Steps · {steps.length}
             </p>
             <ul className="space-y-0.5">

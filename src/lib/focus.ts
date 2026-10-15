@@ -1,4 +1,5 @@
 import { parsePatch } from "@/lib/diff";
+import { isImagePath } from "@/lib/images";
 import type { PullFile } from "@/lib/tauri";
 
 /* ─────────────────────── path-based hide rules ─────────────────────── */
@@ -49,6 +50,11 @@ const TEST_PATTERNS = [
   /\.(test|spec)\.[a-z]+$/,
   /_test\.(go|py|rb|rs)$/,
   /_spec\.rb$/,
+  // pytest's dominant convention is a `test_` PREFIX, not a `_test` suffix, and
+  // `conftest.py` holds the fixtures. Missing these meant a Python PR's tests
+  // were ranked and grouped as production code.
+  /(^|\/)test_[^/]*\.py$/,
+  /(^|\/)conftest\.py$/,
 ];
 
 /** True when the path is a test file or lives under a test directory. */
@@ -66,6 +72,10 @@ export function classify(file: PullFile): HideReason | null {
   if (file.status === "renamed" && file.additions === 0 && file.deletions === 0) {
     return "rename";
   }
+
+  // GitHub reports binary files as 0/0 with no patch — an image change is a
+  // real change (and has a preview), not an empty file.
+  if (isImagePath(file.filename)) return null;
 
   // Empty file additions/deletions.
   if ((file.additions === 0 && file.deletions === 0) || file.changes === 0) {

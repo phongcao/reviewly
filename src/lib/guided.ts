@@ -16,10 +16,146 @@ export interface GuidedStep {
   detail: string;
   /** Optional ready-to-post review comment (only when the stop deserves one). */
   suggestion?: string;
+  /** Which layer of a deep tour produced this stop. Never set by the model —
+   * stamped during `mergeDeepTour`, and absent on a classic whole-PR tour. */
+  layerId?: string;
 }
 
 /** The tour's overall recommendation, surfaced as a suggested review verdict. */
 export type GuidedVerdict = "approve" | "request_changes" | "comment";
+
+/** One layer heading in a merged deep tour, in the partition's reading order.
+ * Carries `index`/`total` so a heading can say "Layer 2 of 10" even when the
+ * layers in between haven't been toured yet. */
+export interface TourLayer {
+  id: string;
+  title: string;
+  /** 1-based position in the WHOLE partition, not among the landed layers. */
+  index: number;
+  total: number;
+  /** How many of this layer's stops are in the merged step list. */
+  steps: number;
+}
+
+/** One run of consecutive tour stops that share a layer, as the rail draws it. */
+export interface TourGroup {
+  /** The layer heading, or null for a classic tour's single unlabeled run. */
+  layer: TourLayer | null;
+  /** Original step indices in this run, in visible order. */
+  items: number[];
+  /** Position of `items[0]` in the visible list. The rail's spine BREAKS are
+   * group-local, but "is this stop behind the cursor" is still a question about
+   * the whole tour, so a row needs its global position too. */
+  start: number;
+}
+
+/**
+ * Fold the visible stops into per-layer runs, so the tour rail can hide one
+ * layer's stops without disturbing the spine running through the others.
+ *
+ * Adjacent runs with no resolvable layer merge into a single unlabeled group —
+ * which is what a classic (unlayered) tour is, and what keeps a step carrying
+ * an unknown `layerId` from splitting the rail at a heading that isn't there.
+ */
+export function groupTourStops(
+  visible: number[],
+  steps: GuidedStep[],
+  layers: TourLayer[] | undefined,
+): TourGroup[] {
+  if (!layers?.length) {
+    return visible.length > 0 ? [{ layer: null, items: [...visible], start: 0 }] : [];
+  }
+  const byId = new Map(layers.map((l) => [l.id, l]));
+  const out: TourGroup[] = [];
+  visible.forEach((i, p) => {
+    const id = steps[i]?.layerId;
+    const layer = (id ? byId.get(id) : undefined) ?? null;
+    const prev = out[out.length - 1];
+    if (prev && prev.layer?.id === layer?.id) prev.items.push(i);
+    else out.push({ layer, items: [i], start: p });
+  });
+  return out;
+}
+
+/** Everything the tour rail and reading pane need to know about a layered
+ * tour's visible stops, derived once per change of what's on screen. */
+export interface TourLayerIndex {
+  layerById: Map<string, TourLayer>;
+  /** Original step index → the layer heading drawn above it. Keyed off the
+   * VISIBLE order, so a filter that empties a layer drops its heading too, and
+   * a layer split by the filter still heads each run it survives in. */
+  layerHeads: Map<number, TourLayer>;
+  /** Visible stops per layer — the denominator of the layer-relative counter,
+   * and the "N stops" on each heading. */
+  layerCounts: Map<string, number>;
+  /** The rail's per-layer runs (`groupTourStops`). */
+  groups: TourGroup[];
+  /** Layers with stops ON SCREEN: collapse-all must not fold ids the rail can't
+   * show, and a layer a filter emptied has nothing to fold. */
+  collapsibleIds: string[];
+}
+
+export function tourLayerIndex(
+  visible: number[],
+  steps: GuidedStep[],
+  layers: TourLayer[] | undefined,
+): TourLayerIndex {
+  const layerById = new Map((layers ?? []).map((l) => [l.id, l]));
+  const layerHeads = new Map<number, TourLayer>();
+  if (layers?.length) {
+    let prev: string | undefined;
+    for (const i of visible) {
+      const id = steps[i].layerId;
+      const layer = id ? layerById.get(id) : undefined;
+      if (layer && id !== prev) layerHeads.set(i, layer);
+      prev = id;
+    }
+  }
+  const layerCounts = new Map<string, number>();
+  for (const i of visible) {
+    const id = steps[i].layerId;
+    if (id) layerCounts.set(id, (layerCounts.get(id) ?? 0) + 1);
+  }
+  const groups = groupTourStops(visible, steps, layers);
+  const collapsibleIds = [
+    ...new Set(groups.map((g) => g.layer?.id).filter((id): id is string => !!id)),
+  ];
+  return { layerById, layerHeads, layerCounts, groups, collapsibleIds };
+}
+
+/** Read stops per layer among the visible ones — what a folded rail heading
+ * reports in place of its rows. Separate from `tourLayerIndex` because read
+ * state changes on every cursor move and the rest doesn't. */
+export function layerReadCounts(
+  visible: number[],
+  steps: GuidedStep[],
+  seen: ReadonlySet<number>,
+): Map<string, number> {
+  const done = new Map<string, number>();
+  for (const i of visible) {
+    const id = steps[i].layerId;
+    if (id && seen.has(i)) done.set(id, (done.get(id) ?? 0) + 1);
+  }
+  return done;
+}
+
+/**
+ * Where the cursor sits INSIDE its layer. The global "3 / 40" is the wrong unit
+ * of progress once a tour is layered — the question a reader is actually
+ * asking is whether they're through the layer in front of them.
+ */
+export function activeLayerPos(
+  layerById: ReadonlyMap<string, TourLayer>,
+  visible: number[],
+  steps: GuidedStep[],
+  active: number,
+): { activeLayer?: TourLayer; layerPos: number } {
+  const activeLayer = layerById.get(steps[active]?.layerId ?? "");
+  const layerPos = activeLayer
+    ? visible.filter((i) => i <= active && steps[i].layerId === activeLayer.id).length
+    : 0;
+  return { activeLayer, layerPos };
+}
 
 export interface GuidedPlan {
   /** One sentence: what this PR does. */
@@ -31,6 +167,32 @@ export interface GuidedPlan {
   /** One-sentence justification for the verdict (why approve / what blocks). */
   verdictReason?: string;
   steps: GuidedStep[];
+  /** Layer headings for a merged deep tour, in plan order. Absent on a classic
+   * whole-PR tour, which has no layers to divide. */
+  layers?: TourLayer[];
+}
+
+/**
+ * Background-task key prefix for ONE layer of a deep tour. The backend keys AI
+ * runs by an opaque string and broadcasts `ai:done` to every listener, so each
+ * surface needs a disjoint namespace — a classic whole-PR tour uses the bare
+ * `prKey`, the layered planner uses `layers:`, and a deep tour uses this. Same
+ * reasoning as `LAYERS_KEY_PREFIX` in `@/lib/layers`.
+ */
+export const TOUR_KEY_PREFIX = "tour:";
+
+/** `tour:<layerId>@<owner>/<repo>#<number>` — `@` appears in neither half, so
+ * the split back apart is unambiguous. */
+export const tourKey = (prKey: string, layerId: string): string =>
+  `${TOUR_KEY_PREFIX}${layerId}@${prKey}`;
+
+/** Inverse of `tourKey`; null for any key that isn't a deep-tour layer. */
+export function parseTourKey(key: string): { prKey: string; layerId: string } | null {
+  if (!key.startsWith(TOUR_KEY_PREFIX)) return null;
+  const rest = key.slice(TOUR_KEY_PREFIX.length);
+  const at = rest.indexOf("@");
+  if (at <= 0 || at === rest.length - 1) return null;
+  return { layerId: rest.slice(0, at), prKey: rest.slice(at + 1) };
 }
 
 /** Coerce a raw verdict string to a known value, or undefined. */
@@ -203,4 +365,44 @@ export function parseGuided(content: string): GuidedPlan | null {
     return null;
   }
   return { summary, tour, verdict, verdictReason, steps };
+}
+
+/** How much of the PR a layer-by-layer tour has actually read. */
+export interface TourCoverage {
+  done: number;
+  total: number;
+}
+
+/** What the tour's verdict should look like, and whether it may act. */
+export interface VerdictDisplay {
+  kind: "none" | "verdict" | "withheld";
+  /** Coverage to name in the label, or null when the tour read everything. */
+  partial: TourCoverage | null;
+  /** May acting on the tour pre-set the reviewer's review verdict? */
+  seed: boolean;
+}
+
+/**
+ * Decide how to present a tour's verdict given how much of the PR it read.
+ *
+ * The asymmetry is the point. `request_changes` needs one objecting layer and
+ * is sound the moment one appears, so partial coverage doesn't weaken it — it
+ * is merely scoped, so the reviewer can see how much was read. "Nothing here
+ * blocks" is different: it is only true of code that has actually been read, so
+ * an `approve` folded from a fraction of the layers is withheld entirely rather
+ * than shown with a caveat, and never pre-sets the reviewer's verdict.
+ *
+ * A tour with no coverage information is a single-pass tour, which saw the
+ * whole PR (up to the diff budget) in one call.
+ */
+export function verdictDisplay(
+  verdict: GuidedVerdict | undefined,
+  coverage?: TourCoverage,
+): VerdictDisplay {
+  if (!verdict) return { kind: "none", partial: null, seed: false };
+
+  const partial = coverage && coverage.done < coverage.total ? coverage : null;
+  if (!partial) return { kind: "verdict", partial: null, seed: true };
+  if (verdict === "approve") return { kind: "withheld", partial, seed: false };
+  return { kind: "verdict", partial, seed: true };
 }

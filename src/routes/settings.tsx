@@ -15,18 +15,33 @@ import {
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
 import { UserHoverCard } from "@/components/user-hover-card";
+import {
+  BundleError,
+  type BundleStats,
+  applyBundle,
+  bundleStats,
+  collectBundle,
+  exportBundle,
+  importBundle,
+} from "@/lib/review-data";
 import { invoke } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import {
+  type AiEffort,
   type AiProvider,
   CLI_PROVIDERS,
+  EFFORT_PROVIDERS,
   MODEL_SUGGESTIONS,
   PROVIDER_LABEL,
+  WEB_PROVIDERS,
   useAiProvider,
 } from "@/stores/ai";
 import { LANDING_OPTIONS, useAppBehavior } from "@/stores/app-behavior";
 import { ACCENTS, useAppearance } from "@/stores/appearance";
 import { useAuth } from "@/stores/auth";
+import { useDeepTour } from "@/stores/deep-tour";
+import { useGuided } from "@/stores/guided";
+import { useLayers } from "@/stores/layers";
 import { NOTIF_REASONS, useNotifSettings } from "@/stores/notif-settings";
 import { useReviewPrefs } from "@/stores/review-prefs";
 import { useTheme } from "@/stores/theme";
@@ -36,7 +51,9 @@ import {
   Bell,
   Check,
   Compass,
+  Download,
   Eye,
+  FolderDown,
   GitCommitHorizontal,
   GitMerge,
   Github,
@@ -51,8 +68,9 @@ import {
   Sparkles,
   SquareTerminal,
   Star,
+  Upload,
 } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 type Activity = {
@@ -177,7 +195,7 @@ export function SettingsPage() {
                 </p>
               </div>
 
-              <p className="mt-3 mb-2 text-[11px] font-medium text-muted-foreground">Backend</p>
+              <p className="mt-3 mb-2 text-2xs font-medium text-muted-foreground">Backend</p>
               <div className="grid gap-2 sm:grid-cols-2">
                 {PROVIDERS.map((p) => (
                   <ProviderCard
@@ -198,7 +216,9 @@ export function SettingsPage() {
 
               {provider === "openai" ? <OpenAiConfig /> : <CliModelConfig provider={provider} />}
 
+              {EFFORT_PROVIDERS.includes(provider) && <AiEffortConfig provider={provider} />}
               <AiTimeoutConfig />
+              {WEB_PROVIDERS.includes(provider) && <ChatWebSearchConfig />}
 
               <AiInstructions />
             </Card>
@@ -209,6 +229,7 @@ export function SettingsPage() {
           <GuidedTourSection />
           <NotificationsSection />
           <BehaviorSection />
+          <ReviewDataSection />
         </div>
       </ScrollArea>
     </div>
@@ -262,7 +283,7 @@ function AiInstructions() {
     <div className="mt-4 border-t border-hairline pt-4">
       <div className="flex items-center justify-between gap-2">
         <p className="text-xs font-medium text-foreground">Review instructions</p>
-        <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
+        <span className="inline-flex items-center gap-1 text-2xs text-muted-foreground">
           {status === "saving" ? (
             "Saving…"
           ) : status === "saved" ? (
@@ -287,7 +308,7 @@ function AiInstructions() {
         className="mt-2 w-full resize-none font-sans text-xs"
       />
       <div className="mt-1.5 flex items-center justify-between gap-2">
-        <span className="text-[11px] tabular-nums text-muted-foreground/70">
+        <span className="text-2xs tabular-nums text-muted-foreground/70">
           {value.length} / {AI_INSTRUCTIONS_MAX}
         </span>
         {value.length > 0 && (
@@ -403,6 +424,10 @@ function CodeReviewSection() {
   const setDiffWrap = useReviewPrefs((s) => s.setDiffWrap);
   const hideWhitespace = useReviewPrefs((s) => s.hideWhitespace);
   const setHideWhitespace = useReviewPrefs((s) => s.setHideWhitespace);
+  const ignoreLineEndings = useReviewPrefs((s) => s.ignoreLineEndings);
+  const setIgnoreLineEndings = useReviewPrefs((s) => s.setIgnoreLineEndings);
+  const markdownPreview = useReviewPrefs((s) => s.markdownPreview);
+  const setMarkdownPreview = useReviewPrefs((s) => s.setMarkdownPreview);
   const diffView = useUi((s) => s.diffView);
   const setDiffView = useUi((s) => s.setDiffView);
   const focusMode = useUi((s) => s.focusMode);
@@ -474,6 +499,18 @@ function CodeReviewSection() {
           description="Collapse lines that differ only by whitespace when reading a diff."
           checked={hideWhitespace}
           onChange={setHideWhitespace}
+        />
+        <SettingToggle
+          label="Ignore line-ending changes"
+          description="Treat lines that only switched between CRLF and LF as unchanged, so a converted file shows just its real edits."
+          checked={ignoreLineEndings}
+          onChange={setIgnoreLineEndings}
+        />
+        <SettingToggle
+          label="Render Markdown files"
+          description="Open .md files as rendered documents instead of a raw diff. Toggle per file with the Preview button or m."
+          checked={markdownPreview}
+          onChange={setMarkdownPreview}
         />
       </Card>
     </CollapsibleSection>
@@ -730,6 +767,15 @@ const PROVIDERS: ProviderMeta[] = [
     install: "npm i -g @google/gemini-cli",
   },
   {
+    id: "copilot",
+    label: "GitHub Copilot",
+    blurb: "GitHub CLI · your Copilot plan",
+    icon: Github,
+    tint: "text-foreground",
+    tile: "bg-foreground/8",
+    install: "npm i -g @github/copilot",
+  },
+  {
     id: "openai",
     label: "OpenAI-compatible",
     blurb: "Ollama · OpenRouter · DeepSeek",
@@ -783,9 +829,7 @@ function ProviderCard({
             <Lock className="size-3 shrink-0 text-muted-foreground/45" aria-label="Runs locally" />
           )}
         </span>
-        <span className="mt-0.5 block truncate text-[11px] text-muted-foreground">
-          {meta.blurb}
-        </span>
+        <span className="mt-0.5 block truncate text-2xs text-muted-foreground">{meta.blurb}</span>
         <ProviderStatus status={status} install={meta.install} />
       </span>
       <span
@@ -802,22 +846,20 @@ function ProviderCard({
 
 function ProviderStatus({ status, install }: { status: CardStatus; install?: string }) {
   if (status === null)
-    return <span className="mt-1 block text-[11px] text-muted-foreground/60">checking…</span>;
+    return <span className="mt-1 block text-2xs text-muted-foreground/60">checking…</span>;
   if (status === true || status === "configured")
     return (
-      <span className="mt-1 inline-flex items-center gap-1.5 text-[11px] text-success">
+      <span className="mt-1 inline-flex items-center gap-1.5 text-2xs text-success">
         <span className="size-1.5 rounded-full bg-success" />
         {status === "configured" ? "configured" : "available"}
       </span>
     );
   if (status === "config")
-    return (
-      <span className="mt-1 block text-[11px] text-muted-foreground/70">needs a base URL</span>
-    );
+    return <span className="mt-1 block text-2xs text-muted-foreground/70">needs a base URL</span>;
   return (
-    <span className="mt-1 block text-[11px] text-warning">
+    <span className="mt-1 block text-2xs text-warning">
       not installed ·{" "}
-      <code className="rounded bg-foreground/[0.08] px-1 font-mono text-[10px] text-muted-foreground">
+      <code className="rounded bg-foreground/[0.08] px-1 font-mono text-3xs text-muted-foreground">
         {install}
       </code>
     </span>
@@ -845,13 +887,13 @@ function OpenAiConfig() {
   return (
     <div className="mt-2 space-y-2 rounded-xl border border-hairline bg-foreground/[0.02] p-3">
       <div className="flex flex-wrap items-center gap-1.5">
-        <span className="mr-0.5 text-[11px] text-muted-foreground/70">Quick setup:</span>
+        <span className="mr-0.5 text-2xs text-muted-foreground/70">Quick setup:</span>
         {presets.map((p) => (
           <button
             key={p.label}
             type="button"
             onClick={() => setOpenai({ baseUrl: p.baseUrl, model: model.trim() || p.model })}
-            className="rounded-md border border-border/50 bg-card/40 px-2 py-1 text-[11px] text-muted-foreground transition-colors hover:border-border hover:text-foreground"
+            className="rounded-md border border-border/50 bg-card/40 px-2 py-1 text-2xs text-muted-foreground transition-colors hover:border-border hover:text-foreground"
           >
             {p.label}
           </button>
@@ -876,7 +918,7 @@ function OpenAiConfig() {
         type="password"
         onChange={(v) => setOpenai({ apiKey: v })}
       />
-      <p className="text-[11px] text-muted-foreground/80">
+      <p className="text-2xs text-muted-foreground/80">
         Stored locally on this machine. The PR diff is sent to this endpoint over HTTP. Tip: Ollama
         is free &amp; offline; DeepSeek / OpenRouter cost roughly 10× less than Claude.
       </p>
@@ -900,7 +942,7 @@ function OpenAiField({
   return (
     // biome-ignore lint/a11y/noLabelWithoutControl: Input renders the native control
     <label className="block">
-      <span className="mb-1 block text-[11px] font-medium text-muted-foreground">{label}</span>
+      <span className="mb-1 block text-2xs font-medium text-muted-foreground">{label}</span>
       <Input
         value={value}
         onChange={(e) => onChange(e.target.value)}
@@ -912,6 +954,54 @@ function OpenAiField({
         className="w-full"
       />
     </label>
+  );
+}
+
+const EFFORT_OPTIONS: { value: string; label: string }[] = [
+  { value: "default", label: "Default" },
+  { value: "low", label: "Low" },
+  { value: "medium", label: "Medium" },
+  { value: "high", label: "High" },
+  { value: "xhigh", label: "Extra high" },
+  { value: "max", label: "Max" },
+];
+
+/** Reasoning effort for the providers that take one (`--effort` for Claude,
+ *  `--reasoning-effort` for Copilot). "Default" sends nothing, so the CLI's own
+ *  setting applies. */
+function AiEffortConfig({ provider }: { provider: AiProvider }) {
+  const name = PROVIDER_LABEL[provider];
+  const effortLabel = (label: string) => (label === "Default" ? `${name} default` : label);
+  const effort = useAiProvider((s) => s.claudeEffort);
+  const setEffort = useAiProvider((s) => s.setClaudeEffort);
+  const value = effort ?? "default";
+  return (
+    <div className="mt-4 flex items-center justify-between gap-4 border-t border-hairline pt-4">
+      <div className="min-w-0">
+        <p className="text-xs font-medium text-foreground">Effort</p>
+        <p className="mt-0.5 text-xs text-muted-foreground">
+          How hard {name} thinks before answering. Higher is slower and costs more, but plans and
+          reviews are more careful.
+        </p>
+      </div>
+      <Select
+        value={value}
+        onValueChange={(v) => v && setEffort(v === "default" ? null : (v as AiEffort))}
+      >
+        <SelectTrigger size="sm" className="w-36 text-xs text-foreground">
+          <SelectValue>
+            {(v) => effortLabel(EFFORT_OPTIONS.find((o) => o.value === v)?.label ?? String(v))}
+          </SelectValue>
+        </SelectTrigger>
+        <SelectContent>
+          {EFFORT_OPTIONS.map((o) => (
+            <SelectItem key={o.value} value={o.value} className="text-xs">
+              {effortLabel(o.label)}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+    </div>
   );
 }
 
@@ -959,6 +1049,22 @@ function AiTimeoutConfig() {
   );
 }
 
+/** Web search for the PR chat (Claude only). Reviews stay repo-only either way. */
+function ChatWebSearchConfig() {
+  const on = useAiProvider((s) => s.chatWebSearch);
+  const setOn = useAiProvider((s) => s.setChatWebSearch);
+  return (
+    <div className="mt-4 border-t border-hairline pt-4">
+      <SettingToggle
+        label="Web search in chat"
+        description="Let Ask AI search the web for up-to-date facts like API versions or model retirements. It can only open pages on official docs sites and package registries. Search queries go to the web, so turn this off for sensitive repos."
+        checked={on}
+        onChange={setOn}
+      />
+    </div>
+  );
+}
+
 /** Free-text model override (with suggestions) for a CLI provider — sent to the
  *  CLI as `--model`; blank keeps the CLI's own default. */
 function CliModelConfig({ provider }: { provider: AiProvider }) {
@@ -970,7 +1076,7 @@ function CliModelConfig({ provider }: { provider: AiProvider }) {
     <div className="mt-2 space-y-1.5 rounded-xl border border-hairline bg-foreground/[0.02] p-3">
       {/* biome-ignore lint/a11y/noLabelWithoutControl: Input renders the native control */}
       <label className="block">
-        <span className="mb-1 block text-[11px] font-medium text-muted-foreground">Model</span>
+        <span className="mb-1 block text-2xs font-medium text-muted-foreground">Model</span>
         <Input
           value={value}
           onChange={(e) => setCliModel(provider, e.target.value)}
@@ -987,10 +1093,143 @@ function CliModelConfig({ provider }: { provider: AiProvider }) {
           <option key={m} value={m} />
         ))}
       </datalist>
-      <p className="text-[11px] text-muted-foreground/80">
+      <p className="text-2xs text-muted-foreground/80">
         Any model id the {PROVIDER_LABEL[provider]} CLI accepts, passed as{" "}
-        <code className="font-mono text-[10px]">--model</code>. Leave blank for its default.
+        <code className="font-mono text-3xs">--model</code>. Leave blank for its default.
       </p>
     </div>
   );
+}
+
+/**
+ * Export / import the review data a PR accumulates — deep tours above all.
+ *
+ * Reviewly stores this locally and only locally, so the tours a reviewer paid
+ * AI tokens and wall-clock for are stranded on one machine. This makes them
+ * portable without asking anyone to copy a SQLite file around: a JSON bundle
+ * grouped by PR, merged on the way in.
+ */
+function ReviewDataSection() {
+  const [busy, setBusy] = useState<"export" | "import" | null>(null);
+  const stats = useLiveBundleStats();
+
+  async function exportData() {
+    setBusy("export");
+    try {
+      const bundle = await collectBundle();
+      if (Object.keys(bundle.prs).length === 0) {
+        toast.info("Nothing to export yet — review a PR first.");
+        return;
+      }
+      const name = await exportBundle(bundle);
+      if (!name) return;
+      const s = bundleStats(bundle);
+      toast.success(`Exported ${countLabel(s)} to ${name}`);
+    } catch (e) {
+      toast.error(`Export failed — ${String(e)}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function importData() {
+    setBusy("import");
+    try {
+      const bundle = await importBundle();
+      if (!bundle) return;
+      const r = applyBundle(bundle);
+      const landed = r.deepTours + r.guidedTours + r.layerPlans + r.viewedKeys + r.checks;
+      if (landed === 0) {
+        toast.info("Already up to date — nothing in that bundle was newer.");
+        return;
+      }
+      const parts = [
+        r.deepTours && `${r.deepTours} deep ${plural(r.deepTours, "tour")}`,
+        r.guidedTours && `${r.guidedTours} guided ${plural(r.guidedTours, "tour")}`,
+        r.layerPlans && `${r.layerPlans} layer ${plural(r.layerPlans, "plan")}`,
+        r.viewedKeys && `viewed marks for ${r.viewedKeys} ${plural(r.viewedKeys, "PR")}`,
+        r.checks && `${r.checks} stop ${plural(r.checks, "check")}`,
+      ].filter((p): p is string => !!p);
+      toast.success(`Imported ${parts.join(", ")}`, {
+        description: r.skipped > 0 ? `${r.skipped} kept — the local copy was newer.` : undefined,
+      });
+    } catch (e) {
+      const msg = e instanceof BundleError ? e.message : String(e);
+      toast.error(`Import failed — ${msg}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <CollapsibleSection id="review-data" title="Review data" icon={FolderDown}>
+      <Card className="space-y-4">
+        <div className="flex items-start justify-between gap-4">
+          <div className="min-w-0">
+            <p className="text-xs font-medium text-foreground">Deep tours and layer plans</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              {stats.prs === 0
+                ? "No review data stored yet."
+                : `${countLabel(stats)} stored across ${stats.prs} ${plural(stats.prs, "PR")}.`}
+            </p>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2 border-t border-hairline pt-4">
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={exportData}
+            disabled={busy !== null || stats.prs === 0}
+          >
+            <Upload className="size-3.5" strokeWidth={1.5} />
+            {busy === "export" ? "Exporting…" : "Export…"}
+          </Button>
+          <Button size="sm" variant="outline" onClick={importData} disabled={busy !== null}>
+            <Download className="size-3.5" strokeWidth={1.5} />
+            {busy === "import" ? "Importing…" : "Import…"}
+          </Button>
+          <p className="ml-auto text-2xs text-muted-foreground">
+            Import merges — a newer local tour is never overwritten.
+          </p>
+        </div>
+
+        <p className="text-xs text-muted-foreground">
+          Carry tours you've already generated to another machine instead of paying for them twice.
+          A tour whose PR has new commits since still imports, and shows as stale.
+        </p>
+      </Card>
+    </CollapsibleSection>
+  );
+}
+
+function plural(n: number, word: string): string {
+  return n === 1 ? word : `${word}s`;
+}
+
+/** "3 deep tours (214 stops)" — the stop count is what makes the size real. */
+function countLabel(s: BundleStats): string {
+  const head = `${s.deepTours} deep ${plural(s.deepTours, "tour")}`;
+  return s.deepStops > 0 ? `${head} (${s.deepStops} ${plural(s.deepStops, "stop")})` : head;
+}
+
+/** Live counts straight off the stores, so the line updates as tours land. */
+function useLiveBundleStats(): BundleStats {
+  const deep = useDeepTour((s) => s.byPr);
+  const layers = useLayers((s) => s.byPr);
+  const guided = useGuided((s) => s.byPr);
+  return useMemo(() => {
+    const keys = new Set([...Object.keys(deep), ...Object.keys(layers), ...Object.keys(guided)]);
+    return {
+      prs: keys.size,
+      deepTours: Object.keys(deep).length,
+      guidedTours: Object.keys(guided).length,
+      layerPlans: Object.keys(layers).length,
+      deepStops: Object.values(deep).reduce(
+        (n, e) =>
+          n + Object.values(e.byLayer ?? {}).reduce((m, b) => m + (b.plan?.steps?.length ?? 0), 0),
+        0,
+      ),
+    };
+  }, [deep, layers, guided]);
 }

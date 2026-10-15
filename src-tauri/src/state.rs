@@ -13,6 +13,13 @@ pub struct CacheEntry<T> {
     pub etag: Option<String>,
 }
 
+#[derive(Clone, Default, serde::Serialize)]
+pub struct ChatStream {
+    pub text: String,
+    /// The `ai:complete` payload, set when the turn ends and not yet claimed.
+    pub done: Option<serde_json::Value>,
+}
+
 pub struct AppState {
     pub http: Client,
     /// Generic JSON cache keyed by request URL (helps the GitHub poller dedupe between worker + UI).
@@ -26,6 +33,11 @@ pub struct AppState {
     /// Running guided-tour task handles, keyed by PR — so a generation can be
     /// canceled (aborting the task kills the spawned AI CLI via kill_on_drop).
     pub ai_tasks: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
+    /// Chat streams (`ai_stream`) by PR key: the text streamed so far and, once
+    /// finished, the `ai:complete` payload. Lets a chat surface that mounts
+    /// mid-turn — e.g. the pop-out window — adopt the stream, and makes the
+    /// commit exactly-once across windows (whoever claims it appends).
+    pub ai_streams: Arc<Mutex<HashMap<String, ChatStream>>>,
     /// Keys of Dependabot AI-fix jobs running in the background (`repo#number`),
     /// so the UI can recover the "fixing" state after navigating away/refreshing.
     pub dependabot_inflight: Arc<Mutex<HashSet<String>>>,
@@ -67,6 +79,13 @@ impl AppState {
         self.gh_cache.get(key).map(|e| e.value.clone())
     }
 
+    /// Drop every cached response. The cache is keyed by request alone, not by
+    /// account, so it's emptied whenever the signed-in token changes: search
+    /// results from one account can name another's private repositories.
+    pub fn cache_clear(&self) {
+        self.gh_cache.clear();
+    }
+
     /// Mark a key's cached value as fresh again (on a 304 Not Modified).
     pub fn cache_refresh(&self, key: &str) {
         if let Some(mut e) = self.gh_cache.get_mut(key) {
@@ -87,6 +106,7 @@ impl AppState {
             watched_repos: Arc::new(RwLock::new(Vec::new())),
             ai_inflight: Arc::new(Mutex::new(HashSet::new())),
             ai_tasks: Arc::new(Mutex::new(HashMap::new())),
+            ai_streams: Arc::new(Mutex::new(HashMap::new())),
             dependabot_inflight: Arc::new(Mutex::new(HashSet::new())),
             dependabot_tasks: Arc::new(Mutex::new(HashMap::new())),
             notify_enabled: AtomicBool::new(true),

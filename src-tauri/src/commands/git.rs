@@ -4,7 +4,7 @@ use base64::Engine;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
 use tokio::process::Command;
@@ -46,6 +46,9 @@ pub struct RepoInfo {
     pub remote_url: Option<String>,
     pub current_branch: String,
     pub dirty: bool,
+    /// `HEAD`'s full SHA — what a codebase map or tour is pinned to. Empty in
+    /// a repository with no commits yet.
+    pub head: String,
 }
 
 /// Inspect a local git work tree: origin remote, current branch, dirty flag.
@@ -56,7 +59,8 @@ pub async fn git_repo_info(path: String) -> AppResult<RepoInfo> {
     let remote_url = git(&path, &["remote", "get-url", "origin"]).await.ok();
     let current_branch = git(&path, &["branch", "--show-current"]).await.unwrap_or_default();
     let dirty = !git(&path, &["status", "--porcelain"]).await.unwrap_or_default().is_empty();
-    Ok(RepoInfo { remote_url, current_branch, dirty })
+    let head = git(&path, &["rev-parse", "HEAD"]).await.unwrap_or_default();
+    Ok(RepoInfo { remote_url, current_branch, dirty, head })
 }
 
 const CLONE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -123,9 +127,140 @@ pub async fn list_dir(path: String) -> AppResult<Vec<DirEntry>> {
 
 const MAX_FILE_BYTES: u64 = 2_000_000;
 
-/// Read a UTF-8 text file for the code viewer. Rejects large or binary files.
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileStat {
+    pub path: String,
+    pub bytes: u64,
+    /// Newline-terminated lines (a trailing unterminated line counts). 0 for
+    /// binary files and for text over the `read_file` cap, which the app can't
+    /// open anyway.
+    pub lines: u64,
+    pub binary: bool,
+}
+
+/// Size, line count, and binary flag for one file — the same binary sniff as
+/// `read_file` (a NUL in the first 8000 bytes).
+fn file_stat(root: &std::path::Path, rel: &str) -> Option<FileStat> {
+    let full = root.join(rel);
+    let meta = std::fs::metadata(&full).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let bytes = meta.len();
+    let mut binary = false;
+    let mut lines = 0;
+    if bytes <= MAX_FILE_BYTES {
+        let data = std::fs::read(&full).ok()?;
+        binary = data.iter().take(8000).any(|&b| b == 0);
+        if !binary {
+            lines = data.iter().filter(|&&b| b == b'\n').count() as u64;
+            if data.last().is_some_and(|&b| b != b'\n') {
+                lines += 1;
+            }
+        }
+    } else {
+        let mut head = vec![0u8; 8000];
+        if let Ok(mut f) = std::fs::File::open(&full) {
+            use std::io::Read;
+            let n = f.read(&mut head).unwrap_or(0);
+            binary = head[..n].contains(&0);
+        }
+    }
+    Some(FileStat { path: rel.to_string(), bytes, lines, binary })
+}
+
+/// Stats for every tracked file (`git ls-files -z`), for sizing a codebase
+/// map. Files tracked but missing from the work tree are skipped. Runs the
+/// file reads off the async runtime: a large repo is thousands of reads.
 #[tauri::command]
-pub async fn read_file(path: String) -> AppResult<String> {
+pub async fn git_file_stats(path: String) -> AppResult<Vec<FileStat>> {
+    let out = git(&path, &["ls-files", "-z"]).await?;
+    let files: Vec<String> =
+        out.split('\0').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect();
+    tokio::task::spawn_blocking(move || {
+        let root = PathBuf::from(&path);
+        files.iter().filter_map(|f| file_stat(&root, f)).collect()
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("file stats: {e}")))
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileHead {
+    pub path: String,
+    pub text: String,
+}
+
+/// `path` (relative to `root`, or absolute) resolved, if it exists and stays
+/// inside `root` — which must already be canonical. Catches `..` with either
+/// separator, an absolute path, and a symlink out of the tree.
+fn resolve_within(root: &Path, path: &Path) -> Option<PathBuf> {
+    let full = std::fs::canonicalize(root.join(path)).ok()?;
+    full.starts_with(root).then_some(full)
+}
+
+/// The first `max_lines` lines of one text file under `root` (canonical), or
+/// None for a missing, binary, or oversized file, or one outside `root`. Reads
+/// only as far as it needs.
+fn file_head(root: &Path, rel: &str, max_lines: usize) -> Option<FileHead> {
+    use std::io::{BufReader, Read};
+    let full = resolve_within(root, Path::new(rel))?;
+    let meta = std::fs::metadata(&full).ok()?;
+    if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
+        return None;
+    }
+    let mut reader = BufReader::new(std::fs::File::open(&full).ok()?);
+    let mut sniff = Vec::new();
+    reader.by_ref().take(8000).read_to_end(&mut sniff).ok()?;
+    if sniff.contains(&0) {
+        return None;
+    }
+    let mut text = String::from_utf8_lossy(&sniff).into_owned();
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).ok();
+    text.push_str(&rest);
+    let head: Vec<&str> = text.lines().take(max_lines).collect();
+    Some(FileHead { path: rel.to_string(), text: head.join("\n") })
+}
+
+/// The first `max_lines` (default 200) lines of each listed text file, in one
+/// call. A codebase map reads imports from every source file; one IPC call per
+/// file — and whole files sent to the webview — would cost more than the map.
+/// Imports almost always sit at the top of a file. Binary, missing, and
+/// oversized files are left out.
+#[tauri::command]
+pub async fn read_file_heads(
+    path: String,
+    files: Vec<String>,
+    max_lines: Option<usize>,
+) -> AppResult<Vec<FileHead>> {
+    let max = max_lines.unwrap_or(200);
+    tokio::task::spawn_blocking(move || {
+        let Ok(root) = std::fs::canonicalize(&path) else { return Vec::new() };
+        files.iter().filter_map(|f| file_head(&root, f, max)).collect()
+    })
+    .await
+    .map_err(|e| AppError::Other(format!("file heads: {e}")))
+}
+
+/// `path` (relative to `root`, or absolute) resolved inside the repository at
+/// `root`, or an error. Every webview read names its repository: paths come
+/// from tours, model replies and PR file lists, and none of them may reach
+/// past the clone.
+fn confine(root: &str, path: &str) -> AppResult<PathBuf> {
+    std::fs::canonicalize(root)
+        .ok()
+        .and_then(|root| resolve_within(&root, Path::new(path)))
+        .ok_or_else(|| AppError::Other("path is outside the repository".into()))
+}
+
+/// Read a UTF-8 text file under `root` for the code viewer. Rejects large or
+/// binary files, and a `path` that resolves outside `root`.
+#[tauri::command]
+pub async fn read_file(path: String, root: String) -> AppResult<String> {
+    let path = confine(&root, &path)?;
     let meta = std::fs::metadata(&path).map_err(|e| AppError::Other(format!("stat: {e}")))?;
     if meta.len() > MAX_FILE_BYTES {
         return Err(AppError::Other("file too large to preview".into()));
@@ -137,19 +272,11 @@ pub async fn read_file(path: String) -> AppResult<String> {
     String::from_utf8(bytes).map_err(|_| AppError::Other("file is not valid UTF-8".into()))
 }
 
-const MAX_IMAGE_BYTES: u64 = 16_000_000;
+pub(crate) const MAX_IMAGE_BYTES: u64 = 16_000_000;
 
-/// Read a small image file and return it as a `data:<mime>;base64,…` URL the UI
-/// can drop straight into an `<img src>`. The text `read_file` rejects these
-/// (null bytes) — this is the image-preview path. MIME is inferred from the
-/// extension; unknown types fall back to octet-stream.
-#[tauri::command]
-pub async fn read_file_data_url(path: String) -> AppResult<String> {
-    let meta = std::fs::metadata(&path).map_err(|e| AppError::Other(format!("stat: {e}")))?;
-    if meta.len() > MAX_IMAGE_BYTES {
-        return Err(AppError::Other("image too large to preview".into()));
-    }
-    let mime = match std::path::Path::new(&path)
+/// Image MIME type from a path's extension; unknown types → octet-stream.
+pub(crate) fn image_mime(path: &str) -> &'static str {
+    match std::path::Path::new(path)
         .extension()
         .and_then(|e| e.to_str())
         .map(str::to_ascii_lowercase)
@@ -164,7 +291,22 @@ pub async fn read_file_data_url(path: String) -> AppResult<String> {
         Some("avif") => "image/avif",
         Some("ico") => "image/x-icon",
         _ => "application/octet-stream",
-    };
+    }
+}
+
+/// Read a small image file and return it as a `data:<mime>;base64,…` URL the UI
+/// can drop straight into an `<img src>`. The text `read_file` rejects these
+/// (null bytes) — this is the image-preview path. MIME is inferred from the
+/// extension; unknown types fall back to octet-stream. Like `read_file`, only
+/// inside `root`.
+#[tauri::command]
+pub async fn read_file_data_url(path: String, root: String) -> AppResult<String> {
+    let path = confine(&root, &path)?;
+    let meta = std::fs::metadata(&path).map_err(|e| AppError::Other(format!("stat: {e}")))?;
+    if meta.len() > MAX_IMAGE_BYTES {
+        return Err(AppError::Other("image too large to preview".into()));
+    }
+    let mime = image_mime(&path.to_string_lossy());
     let bytes = std::fs::read(&path).map_err(|e| AppError::Other(format!("read: {e}")))?;
     Ok(format!(
         "data:{mime};base64,{}",
@@ -973,7 +1115,9 @@ const EDITOR_CANDIDATES: &[EditorCandidate] = &[
         apps: &["Xcode"],
         commands: &["xed"],
         aliases: &["xcode", "xed"],
-        default_candidate: true,
+        // Xcode is rarely the editor a reviewer means for an arbitrary repo,
+        // so it is offered in the menu but never picked as the fallback.
+        default_candidate: false,
     },
     EditorCandidate {
         id: "code",
@@ -1035,6 +1179,28 @@ async fn command_available(bin: &str) -> bool {
         .output()
         .await
         .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+/// `/usr/bin/xed` is an `xcrun` shim that ships with the Command Line Tools, so
+/// `which` finds it even when it can't run: with the developer directory set to
+/// the CLT it only prints an `xcode-select` error. Treat it as missing then, and
+/// let Xcode open through `open -a` instead.
+async fn command_usable(bin: &str) -> bool {
+    if !command_available(bin).await {
+        return false;
+    }
+    if bin != "xed" {
+        return true;
+    }
+    Command::new("xcode-select")
+        .arg("-p")
+        .output()
+        .await
+        .map(|out| {
+            out.status.success()
+                && !String::from_utf8_lossy(&out.stdout).trim().ends_with("CommandLineTools")
+        })
         .unwrap_or(false)
 }
 
@@ -1211,7 +1377,7 @@ async fn env_editor() -> Option<(String, String)> {
 async fn target_for_candidate(c: EditorCandidate) -> Option<LocalEditorTarget> {
     let mut command = None;
     for cmd in c.commands {
-        if command_available(cmd).await {
+        if command_usable(cmd).await {
             command = Some((*cmd).to_string());
             break;
         }
@@ -1297,31 +1463,303 @@ pub async fn local_editor_targets() -> AppResult<Vec<LocalEditorTarget>> {
     Ok(targets)
 }
 
+/// Per-editor CLI syntax for "open this file, at this line".
+///
+/// Every editor spells this differently, and the spelling is a property of the
+/// editor rather than of the review UI — so it lives here, next to the table
+/// that detects them, instead of being assembled in React.
+///
+/// An editor we don't have syntax for (including a synthetic `env-*` target
+/// built from `$EDITOR`) falls back to opening the file: landing in the right
+/// file and scrolling is still far better than opening the repository root, and
+/// guessing a flag risks the editor treating it as a filename.
+fn editor_cli_args(target_id: &str, file: &str, line: Option<u32>, column: Option<u32>) -> Vec<String> {
+    let Some(line) = line else {
+        return vec![file.to_string()];
+    };
+    // `<file>:<line>[:<col>]`, shared by the VS Code family, Zed and Sublime.
+    let suffixed = || {
+        let mut at = format!("{file}:{line}");
+        if let Some(c) = column {
+            at.push_str(&format!(":{c}"));
+        }
+        at
+    };
+    match target_id {
+        // VS Code and its forks need `-g` to read the suffix as a location
+        // rather than as a path containing colons.
+        "code" | "cursor" | "windsurf" => vec!["-g".to_string(), suffixed()],
+        "zed" | "sublime" => vec![suffixed()],
+        // JetBrains takes explicit flags, with the file last.
+        "webstorm" | "intellij" => {
+            let mut v = vec!["--line".to_string(), line.to_string()];
+            if let Some(c) = column {
+                v.push("--column".to_string());
+                v.push(c.to_string());
+            }
+            v.push(file.to_string());
+            v
+        }
+        "xcode" => vec!["-l".to_string(), line.to_string(), file.to_string()],
+        _ => vec![file.to_string()],
+    }
+}
+
+/// Resolve what to hand the editor: a file inside the repo when one is named,
+/// otherwise the repository itself (the long-standing behaviour). A named file
+/// must exist inside the repo, relative or absolute.
+fn editor_open_path(repo_path: &str, file: Option<&str>) -> AppResult<String> {
+    match file.map(str::trim).filter(|f| !f.is_empty()) {
+        Some(f) => Ok(confine(repo_path, f)?.to_string_lossy().into_owned()),
+        None => Ok(repo_path.to_string()),
+    }
+}
+
 #[tauri::command]
-pub async fn open_local_editor(path: String, target_id: String) -> AppResult<()> {
+pub async fn open_local_editor(
+    path: String,
+    target_id: String,
+    file: Option<String>,
+    line: Option<u32>,
+    column: Option<u32>,
+) -> AppResult<()> {
     let target = local_editor_targets()
         .await?
         .into_iter()
         .find(|target| target.id == target_id)
         .ok_or_else(|| AppError::Other("editor is not installed".into()))?;
 
+    let opened = editor_open_path(&path, file.as_deref())?;
+
     if let Some(cmd) = target.command {
-        crate::commands::ai::cli_command(&cmd)
-            .arg(path)
+        let mut args = editor_cli_args(&target_id, &opened, line, column);
+        // Opening the repo itself (not a file in it): give the VS Code family a
+        // window of its own rather than replacing whatever project the last
+        // window holds. A window already showing this folder is just focused.
+        if opened == path && matches!(target_id.as_str(), "code" | "cursor" | "windsurf") {
+            args.insert(0, "--new-window".to_string());
+        }
+        let mut child = crate::commands::ai::cli_command(&cmd)
+            .args(args)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|e| AppError::Other(format!("failed to open editor: {e}")))?;
+        // Editor CLIs hand off to the app and exit at once, so a quick non-zero
+        // exit means nothing opened. One still running is assumed fine.
+        if let Ok(Ok(status)) = tokio::time::timeout(Duration::from_millis(1500), child.wait()).await {
+            if !status.success() {
+                return Err(AppError::Other(format!("{cmd} exited with {status}")));
+            }
+        }
         return Ok(());
     }
 
     if let Some(app) = target.app_name {
+        // `open -a` has no line syntax; the file itself is as close as it gets.
         Command::new("open")
             .arg("-a")
             .arg(app)
-            .arg(path)
+            .arg(opened)
             .spawn()
             .map_err(|e| AppError::Other(format!("failed to open editor: {e}")))?;
         return Ok(());
     }
 
     Err(AppError::Other("editor is not installed".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        editor_cli_args, editor_open_path, git_file_stats, git_repo_info, read_file,
+        read_file_data_url, read_file_heads, FileHead, FileStat,
+    };
+
+    /// A throwaway git repo with a text file, a file with no trailing newline,
+    /// a binary file, and an untracked file that must not be listed.
+    fn temp_repo(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("reviewly-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/a.ts"), "one\ntwo\nthree\n").unwrap();
+        std::fs::write(dir.join("b.txt"), "x\ny").unwrap();
+        std::fs::write(dir.join("logo.png"), [0x89u8, b'P', b'N', b'G', 0, 1, 2]).unwrap();
+        let run = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["add", "."]);
+        run(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "init"]);
+        std::fs::write(dir.join("untracked.ts"), "nope\n").unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn file_stats_cover_tracked_files_only() {
+        let dir = temp_repo("stats");
+        let mut stats = git_file_stats(dir.to_string_lossy().into_owned()).await.unwrap();
+        stats.sort_by(|a, b| a.path.cmp(&b.path));
+        assert_eq!(
+            stats,
+            vec![
+                FileStat { path: "b.txt".into(), bytes: 3, lines: 2, binary: false },
+                FileStat { path: "logo.png".into(), bytes: 7, lines: 0, binary: true },
+                FileStat { path: "src/a.ts".into(), bytes: 14, lines: 3, binary: false },
+            ]
+        );
+        let heads = read_file_heads(
+            dir.to_string_lossy().into_owned(),
+            vec!["src/a.ts".into(), "logo.png".into(), "missing.ts".into(), "../x".into()],
+            Some(2),
+        )
+        .await
+        .unwrap();
+        assert_eq!(heads, vec![FileHead { path: "src/a.ts".into(), text: "one\ntwo".into() }]);
+        let info = git_repo_info(dir.to_string_lossy().into_owned()).await.unwrap();
+        assert_eq!(info.head.len(), 40);
+        assert!(info.dirty, "the untracked file makes the tree dirty");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn file_reads_stay_inside_the_root() {
+        let base = std::env::temp_dir().join(format!("reviewly-within-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("in.txt"), "inside").unwrap();
+        std::fs::write(base.join("secret.txt"), "outside").unwrap();
+        let root_s = root.to_string_lossy().into_owned();
+        let outside = base.join("secret.txt").to_string_lossy().into_owned();
+
+        let heads = read_file_heads(
+            root_s.clone(),
+            vec!["in.txt".into(), "../secret.txt".into(), outside.clone()],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(heads, vec![FileHead { path: "in.txt".into(), text: "inside".into() }]);
+
+        let read = |path: String| read_file(path, root_s.clone());
+        assert_eq!(read(format!("{root_s}/in.txt")).await.unwrap(), "inside");
+        assert_eq!(read("in.txt".into()).await.unwrap(), "inside");
+        assert!(read(format!("{root_s}/../secret.txt")).await.is_err());
+        assert!(read(outside.clone()).await.is_err());
+        // The image read is confined the same way.
+        assert!(read_file_data_url(outside.clone(), root_s.clone()).await.is_err());
+        assert!(read_file_data_url(format!("{root_s}/in.txt"), root_s.clone()).await.is_ok());
+        // So is the editor: it opens files in the repo, never beside it.
+        assert!(editor_open_path(&root_s, Some(&outside)).is_err());
+        assert!(editor_open_path(&root_s, Some("../secret.txt")).is_err());
+        assert!(editor_open_path(&root_s, Some("in.txt")).unwrap().ends_with("in.txt"));
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn without_a_line_every_editor_just_gets_the_path() {
+        for id in ["code", "cursor", "zed", "sublime", "intellij", "xcode", "env-vim"] {
+            assert_eq!(editor_cli_args(id, "/r/a.ts", None, None), vec!["/r/a.ts"], "{id}");
+        }
+    }
+
+    #[test]
+    fn vscode_family_uses_goto() {
+        assert_eq!(
+            editor_cli_args("code", "/r/a.ts", Some(42), None),
+            vec!["-g", "/r/a.ts:42"]
+        );
+        assert_eq!(
+            editor_cli_args("cursor", "/r/a.ts", Some(42), Some(7)),
+            vec!["-g", "/r/a.ts:42:7"]
+        );
+        assert_eq!(
+            editor_cli_args("windsurf", "/r/a.ts", Some(1), None),
+            vec!["-g", "/r/a.ts:1"]
+        );
+    }
+
+    #[test]
+    fn zed_and_sublime_take_the_suffix_bare() {
+        assert_eq!(editor_cli_args("zed", "/r/a.ts", Some(9), None), vec!["/r/a.ts:9"]);
+        assert_eq!(
+            editor_cli_args("sublime", "/r/a.ts", Some(9), Some(3)),
+            vec!["/r/a.ts:9:3"]
+        );
+    }
+
+    #[test]
+    fn jetbrains_uses_flags_with_the_file_last() {
+        assert_eq!(
+            editor_cli_args("intellij", "/r/a.ts", Some(12), None),
+            vec!["--line", "12", "/r/a.ts"]
+        );
+        assert_eq!(
+            editor_cli_args("webstorm", "/r/a.ts", Some(12), Some(4)),
+            vec!["--line", "12", "--column", "4", "/r/a.ts"]
+        );
+    }
+
+    #[test]
+    fn xcode_uses_dash_l() {
+        assert_eq!(
+            editor_cli_args("xcode", "/r/a.swift", Some(5), None),
+            vec!["-l", "5", "/r/a.swift"]
+        );
+    }
+
+    #[test]
+    fn an_unknown_editor_opens_the_file_rather_than_guessing_a_flag() {
+        assert_eq!(
+            editor_cli_args("env-helix", "/r/a.ts", Some(5), Some(2)),
+            vec!["/r/a.ts"]
+        );
+    }
+
+    #[test]
+    fn a_path_with_spaces_is_passed_through_untouched() {
+        // Args are handed to the process individually, so no quoting is needed
+        // — and adding any would reach the editor as literal characters.
+        assert_eq!(
+            editor_cli_args("code", "/r/my dir/a b.ts", Some(3), None),
+            vec!["-g", "/r/my dir/a b.ts:3"]
+        );
+    }
+
+    #[test]
+    fn no_file_still_opens_the_repository() {
+        assert_eq!(editor_open_path("/r", None).unwrap(), "/r");
+        assert_eq!(editor_open_path("/r", Some("")).unwrap(), "/r");
+        assert_eq!(editor_open_path("/r", Some("   ")).unwrap(), "/r");
+    }
+
+    /// Back-compat guard: the header menu still calls this command with only
+    /// `{path, targetId}`. Making `file`/`line`/`column` required would break
+    /// "open the repository" at runtime, where nothing else would catch it.
+    #[test]
+    fn the_legacy_two_argument_payload_still_deserializes() {
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Args {
+            path: String,
+            target_id: String,
+            file: Option<String>,
+            line: Option<u32>,
+            column: Option<u32>,
+        }
+        // Exactly what the legacy header-menu call site sends.
+        let a: Args = serde_json::from_str(r#"{"path":"/r","targetId":"code"}"#).unwrap();
+        assert_eq!(a.path, "/r");
+        assert_eq!(a.target_id, "code");
+        assert!(a.file.is_none() && a.line.is_none() && a.column.is_none());
+    }
 }

@@ -8,6 +8,8 @@ pub enum AppError {
     Auth(String),
     #[error("upstream github returned {status}: {body}")]
     Upstream { status: u16, body: String },
+    #[error("github search rate-limited; paused for {0}s")]
+    RateLimited(u64),
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("keyring error: {0}")]

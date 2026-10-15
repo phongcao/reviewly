@@ -4,10 +4,10 @@ import { Input } from "@/components/ui/input";
 import type { DeviceStart, Viewer } from "@/lib/tauri";
 import { invoke } from "@/lib/tauri";
 import { safeOpenUrl } from "@/lib/ui";
+import { useRepoSearch } from "@/lib/use-repo-search";
 import { cn } from "@/lib/utils";
 import { useAuth } from "@/stores/auth";
 import { useWatchedRepos } from "@/stores/watched-repos";
-import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import {
   ArrowRight,
@@ -78,7 +78,7 @@ function StepRail({ current }: { current: Step }) {
         <div key={s.id} className="flex flex-1 items-center gap-2">
           <span
             className={cn(
-              "flex size-5 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold transition-colors",
+              "flex size-5 shrink-0 items-center justify-center rounded-full text-3xs font-semibold transition-colors",
               i < idx
                 ? "bg-primary text-primary-foreground"
                 : i === idx
@@ -90,7 +90,7 @@ function StepRail({ current }: { current: Step }) {
           </span>
           <span
             className={cn(
-              "text-[11px] font-medium",
+              "text-2xs font-medium",
               i <= idx ? "text-foreground" : "text-muted-foreground/50",
             )}
           >
@@ -284,18 +284,10 @@ function ReposStep({ onContinue }: { onContinue: () => void }) {
   const watched = useWatchedRepos((s) => s.repos);
   const toggle = useWatchedRepos((s) => s.toggle);
   const [query, setQuery] = useState("");
-  const repos = useQuery({
-    queryKey: ["repos"],
-    queryFn: () => invoke<string[]>("gh_list_repos"),
-    staleTime: 5 * 60_000,
-  });
+  const repos = useRepoSearch(query);
 
   const watchedSet = useMemo(() => new Set(watched), [watched]);
-  const filtered = useMemo(() => {
-    const all = repos.data ?? [];
-    const q = query.trim().toLowerCase();
-    return (q ? all.filter((r) => r.toLowerCase().includes(q)) : all).slice(0, 200);
-  }, [repos.data, query]);
+  const filtered = useMemo(() => repos.results.slice(0, 200), [repos.results]);
 
   return (
     <div className="space-y-3">
@@ -313,7 +305,7 @@ function ReposStep({ onContinue }: { onContinue: () => void }) {
           autoFocus
           value={query}
           onChange={(e) => setQuery(e.target.value)}
-          placeholder={repos.isLoading ? "Loading your repos…" : "Filter your repositories…"}
+          placeholder={repos.isLoading ? "Loading your repos…" : "Search your repositories…"}
           size="sm"
           className="w-full pl-8"
         />
@@ -323,7 +315,9 @@ function ReposStep({ onContinue }: { onContinue: () => void }) {
         {repos.isLoading ? (
           <p className="px-2 py-6 text-center text-xs text-muted-foreground">Loading…</p>
         ) : filtered.length === 0 ? (
-          <p className="px-2 py-6 text-center text-xs text-muted-foreground">No repositories.</p>
+          <p className="px-2 py-6 text-center text-xs text-muted-foreground">
+            {repos.isSearching ? "Searching…" : "No repositories."}
+          </p>
         ) : (
           filtered.map((r) => {
             const on = watchedSet.has(r);
@@ -353,7 +347,7 @@ function ReposStep({ onContinue }: { onContinue: () => void }) {
       </div>
 
       <div className="flex items-center justify-between pt-1">
-        <span className="text-[11px] text-muted-foreground/70">
+        <span className="text-2xs text-muted-foreground/70">
           {watched.length > 0 ? `${watched.length} selected` : "Watching everything"}
         </span>
         <Button size="sm" onClick={onContinue}>
@@ -479,7 +473,7 @@ function AuthError({ raw }: { raw: string }) {
         <summary className="cursor-pointer text-muted-foreground/60 transition-colors hover:text-muted-foreground">
           Technical details
         </summary>
-        <pre className="mt-1.5 overflow-auto rounded-md border border-hairline bg-background/50 p-2 text-[11px] text-muted-foreground">
+        <pre className="mt-1.5 overflow-auto rounded-md border border-hairline bg-background/50 p-2 text-2xs text-muted-foreground">
           {raw}
         </pre>
       </details>

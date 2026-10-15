@@ -178,7 +178,7 @@ export function Composer({
       />
       <div className="flex items-center justify-between gap-2 border-t border-border/40 px-2.5 py-2">
         {footerStatus ?? (
-          <span className="flex items-center gap-1 pl-0.5 text-[11px] text-muted-foreground/45">
+          <span className="flex items-center gap-1 pl-0.5 text-2xs text-muted-foreground/45">
             <span className="inline-flex items-center gap-px">
               <KbdCmd />
               <KbdEnter />

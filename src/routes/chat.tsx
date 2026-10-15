@@ -1,7 +1,8 @@
 import { AiReview } from "@/components/ai-review";
 import type { AiAction } from "@/lib/ai-actions";
+import { useAttachBridge } from "@/lib/ai/attach-bridge";
 import { buildReviewContext } from "@/lib/ai/context";
-import { parsePatch } from "@/lib/diff";
+import { addToPendingReview } from "@/lib/review-draft-bridge";
 import { type PullDetail, type PullFile, invoke } from "@/lib/tauri";
 import { useQuery } from "@tanstack/react-query";
 import { useParams } from "@tanstack/react-router";
@@ -24,6 +25,9 @@ export function ChatWindowPage() {
   const { owner, repo, number: numberStr } = useParams({ from: "/chat/$owner/$repo/$number" });
   const number = Number(numberStr);
   const prKey = `${owner}/${repo}#${number}`;
+  // Attachments pinned in the main window arrive over this bridge (and our own
+  // removals go back the same way).
+  useAttachBridge(prKey);
 
   const detail = useQuery({
     queryKey: ["pull", owner, repo, number],
@@ -39,7 +43,7 @@ export function ChatWindowPage() {
   const context = useMemo(
     () =>
       detail.data
-        ? buildReviewContext(detail.data, files.data ?? [], `${owner}/${repo}`, number)
+        ? buildReviewContext(detail.data, files.data ?? [], `${owner}/${repo}`, number).text
         : "",
     [detail.data, files.data, owner, repo, number],
   );
@@ -65,36 +69,16 @@ export function ChatWindowPage() {
         });
         break;
       case "inline_comment": {
-        if (!headSha) throw new Error("PR head commit unavailable — reopen the chat.");
-        const target = (files.data ?? []).find((f) => f.filename === a.path);
-        const commentable =
-          !!target?.patch &&
-          parsePatch(target.patch).some((h) =>
-            h.lines.some((l) => l.kind !== "hunk" && l.newLine === a.line),
-          );
-        if (!commentable) {
+        // Sent to the main window's pending review — edited and submitted there.
+        const where = await addToPendingReview({ owner, repo, number }, files.data ?? [], a);
+        if (where === "body") {
           toast.warning(
-            `Line ${a.line} isn't in ${a.path.split("/").pop()}'s diff — posting as a file comment.`,
+            `Line ${a.line} isn't in ${a.path.split("/").pop()}'s diff — added to the review summary instead.`,
           );
-          await invoke("gh_create_issue_comment", {
-            owner,
-            repo,
-            number,
-            body: `**${a.path}:${a.line}**\n\n${a.body}`,
-          });
-          break;
+        } else {
+          toast.success("Added to your pending review");
         }
-        await invoke("gh_create_review_comment", {
-          owner,
-          repo,
-          number,
-          commitId: headSha,
-          path: a.path,
-          line: a.line,
-          side: a.side,
-          body: a.body,
-        });
-        break;
+        return;
       }
       case "label": {
         const names = new Set((detail.data?.labels ?? []).map((l) => l.name));
@@ -111,7 +95,7 @@ export function ChatWindowPage() {
     <div className="flex h-full min-h-0 flex-col">
       <header
         data-tauri-drag-region
-        className="flex items-center gap-1.5 border-b border-hairline px-3 py-2.5 text-[13px] font-medium text-muted-foreground"
+        className="flex items-center gap-1.5 border-b border-hairline px-3 py-2.5 text-sm font-medium text-muted-foreground"
       >
         <Sparkles className="size-3.5 shrink-0 text-primary" />
         <span className="truncate">
@@ -126,7 +110,12 @@ export function ChatWindowPage() {
         ) : detail.error || !detail.data ? (
           <p className="px-1 py-6 text-center text-xs text-destructive">Couldn't load this PR.</p>
         ) : (
-          <AiReview prKey={prKey} context={context} executeAction={executeAction} />
+          <AiReview
+            prKey={prKey}
+            context={context}
+            executeAction={executeAction}
+            files={files.data ?? []}
+          />
         )}
       </div>
     </div>

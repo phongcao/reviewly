@@ -29,7 +29,7 @@ export function TooltipFor({
       <TooltipContent side={side} align={align} className="inline-flex items-center gap-2">
         <span>{label}</span>
         {shortcut && (
-          <kbd className="rounded bg-foreground/[0.08] px-1 py-px font-mono text-[11px] text-muted-foreground">
+          <kbd className="rounded bg-foreground/[0.08] px-1 py-px font-mono text-2xs text-muted-foreground">
             {shortcut}
           </kbd>
         )}

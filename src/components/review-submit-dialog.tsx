@@ -10,9 +10,9 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
-import type { DraftComment } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import { useAppBehavior } from "@/stores/app-behavior";
+import type { PendingComment } from "@/stores/review-draft";
 import { type ReviewEvent, useReviewVerdict } from "@/stores/review-verdict";
 import { Check, MessageSquare, X } from "lucide-react";
 import { type ReactElement, cloneElement, useEffect, useState } from "react";
@@ -29,9 +29,9 @@ interface Props {
   /** The button that anchors and toggles the popover. */
   trigger: ReactElement<{ onClick?: () => void }>;
   draftBody: string;
-  draftComments: DraftComment[];
+  draftComments: PendingComment[];
   onBodyChange: (body: string) => void;
-  onRemoveComment: (idx: number) => void;
+  onRemoveComment: (id: string) => void;
   submitting: boolean;
   onSubmit: (event: Event) => void;
   side?: "top" | "bottom";
@@ -45,7 +45,7 @@ interface Props {
    * Jump to the file+line of a pending inline comment. When provided, the
    * inline-comment rows become clickable (and the popover closes on jump).
    */
-  onJumpToComment?: (comment: DraftComment, idx: number) => void;
+  onJumpToComment?: (comment: PendingComment) => void;
 }
 
 /** Map the GitHub review state word to our Event verdict. */
@@ -177,41 +177,39 @@ export function ReviewSubmitPopover({
             {draftComments.length > 0 && (
               <div className="space-y-1">
                 <p className="text-xs font-medium text-muted-foreground">Inline comments</p>
-                <ul className="max-h-40 space-y-1 overflow-y-auto rounded-md bg-foreground/[0.04] p-2">
-                  {draftComments.map((c, i) => {
-                    const jumpable = !!onJumpToComment;
+                <ul className="max-h-40 space-y-1 overflow-y-auto overflow-x-hidden rounded-md bg-foreground/[0.04] p-2">
+                  {draftComments.map((c) => {
+                    const location = (
+                      <CommentLocation path={c.path} line={c.line} startLine={c.start_line} />
+                    );
                     return (
                       <li
-                        key={i}
+                        key={c.id}
                         className="flex items-start gap-2 rounded p-1.5 text-xs hover:bg-foreground/[0.04]"
                       >
-                        {jumpable ? (
+                        {onJumpToComment ? (
                           <button
                             type="button"
                             onClick={() => {
-                              onJumpToComment?.(c, i);
+                              onJumpToComment(c);
                               setOpen(false);
                             }}
-                            className="min-w-0 flex-1 cursor-pointer text-left"
+                            className="group/loc min-w-0 flex-1 cursor-pointer text-left"
                             aria-label={`Jump to ${c.path}${c.line != null ? `:${c.line}` : ""}`}
                           >
-                            <p className="font-mono text-xs text-muted-foreground hover:text-primary">
-                              {c.path}:{c.line}
-                            </p>
+                            {location}
                             <p className="mt-0.5 truncate text-foreground/90">{c.body}</p>
                           </button>
                         ) : (
                           <div className="min-w-0 flex-1">
-                            <p className="font-mono text-xs text-muted-foreground">
-                              {c.path}:{c.line}
-                            </p>
+                            {location}
                             <p className="mt-0.5 truncate text-foreground/90">{c.body}</p>
                           </div>
                         )}
                         <button
                           type="button"
-                          onClick={() => onRemoveComment(i)}
-                          className="text-muted-foreground/60 hover:text-destructive"
+                          onClick={() => onRemoveComment(c.id)}
+                          className="shrink-0 text-muted-foreground/60 hover:text-destructive"
                           aria-label="Remove inline comment"
                         >
                           <X className="size-3" />
@@ -317,5 +315,41 @@ function EventChoice({
       <Icon className={cn("size-4 shrink-0", active ? t.activeText : t.idle)} strokeWidth={2} />
       <span>{label}</span>
     </button>
+  );
+}
+
+/**
+ * `dir/…/file.ts:12` on one line. Long paths elide the directory part and keep
+ * the file name + line visible; the full path is in the tooltip.
+ */
+function CommentLocation({
+  path,
+  line,
+  startLine,
+}: {
+  path: string;
+  line?: number | null;
+  startLine?: number | null;
+}) {
+  const slash = path.lastIndexOf("/");
+  const dir = slash >= 0 ? path.slice(0, slash + 1) : "";
+  const name = slash >= 0 ? path.slice(slash + 1) : path;
+  const lines =
+    line == null
+      ? ""
+      : startLine != null && startLine !== line
+        ? `:${startLine}–${line}`
+        : `:${line}`;
+  return (
+    <p
+      title={`${path}${lines}`}
+      className="flex min-w-0 font-mono text-xs text-muted-foreground group-hover/loc:text-primary"
+    >
+      {dir && <span className="min-w-0 truncate">{dir}</span>}
+      <span className="max-w-full shrink-0 truncate">
+        {name}
+        {lines}
+      </span>
+    </p>
   );
 }

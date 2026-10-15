@@ -35,3 +35,11 @@ src-tauri/gen
 # Env
 .env
 .env.local
+
+# Playwright
+.playwright-mcp/
+
+# Temporary files
+reviewly_review_workbench_feature_plan.md
+reviewly_conceptual_diff_feature_spec.md
+.tmp

@@ -7,15 +7,17 @@ import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Switch } from "@/components/ui/switch";
 import { readPrs } from "@/lib/prs-db";
-import { invoke } from "@/lib/tauri";
+import { type RepoInfo, invoke } from "@/lib/tauri";
 import { safeOpenUrl } from "@/lib/ui";
+import { useRepoSearch } from "@/lib/use-repo-search";
+import { useEditorPrefs } from "@/stores/editor-prefs";
 import { type LocalRepo, parseGitRemote, useLocalRepos } from "@/stores/local-repos";
 import { usePrFilters } from "@/stores/pr-filters";
 import { useWatchedRepos } from "@/stores/watched-repos";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
 import { open } from "@tauri-apps/plugin-dialog";
-import { openPath, revealItemInDir } from "@tauri-apps/plugin-opener";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import {
   Code2,
   DownloadCloud,
@@ -31,10 +33,10 @@ import {
 import { useMemo, useState } from "react";
 import { toast } from "sonner";
 
-interface RepoInfo {
-  remoteUrl: string | null;
-  currentBranch: string;
-  dirty: boolean;
+interface LocalEditorTarget {
+  id: string;
+  label: string;
+  isDefault: boolean;
 }
 
 /** One row in the unified list — a repo you watch and/or have cloned. */
@@ -186,20 +188,11 @@ function AddRepoMenu({
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const ghRepos = useQuery({
-    queryKey: ["repos"],
-    queryFn: () => invoke<string[]>("gh_list_repos"),
-    enabled: menuOpen,
-    staleTime: 5 * 60_000,
-  });
   const q = query.trim();
   const isUrl = /^(https?:\/\/|git@|ssh:\/\/)/.test(q) || q.endsWith(".git");
-  const list = useMemo(() => {
-    const all = ghRepos.data ?? [];
-    if (isUrl) return [];
-    const f = q.toLowerCase();
-    return f ? all.filter((r) => r.toLowerCase().includes(f)) : all;
-  }, [ghRepos.data, q, isUrl]);
+  // Don't burn a search request on something that's plainly a clone URL.
+  const ghRepos = useRepoSearch(isUrl ? "" : query, menuOpen);
+  const list = isUrl ? [] : ghRepos.results;
 
   return (
     <div className="relative">
@@ -233,7 +226,7 @@ function AddRepoMenu({
                 <li className="px-2 py-1.5 text-xs text-muted-foreground">Loading your repos…</li>
               ) : list.length === 0 ? (
                 <li className="px-2 py-1.5 text-xs text-muted-foreground">
-                  No repositories found.
+                  {ghRepos.isSearching ? "Searching…" : "No repositories found."}
                 </li>
               ) : (
                 // Toggle watch; keep the menu open so you can pick several at once.
@@ -248,6 +241,9 @@ function AddRepoMenu({
                       {full}
                     </PopoverItem>
                   ))
+              )}
+              {ghRepos.isSearching && list.length > 0 && (
+                <li className="px-2 py-1.5 text-xs text-muted-foreground">Searching…</li>
               )}
             </ul>
           )}
@@ -300,6 +296,40 @@ function RepoCard({
     queryFn: async () => (await readPrs([slug], "open")).length,
     staleTime: 30_000,
   });
+  // Installed editors, detected natively — the same list (and cache) the PR
+  // page's "Open in…" menu uses, so the reviewer's last pick carries over.
+  const lastEditorTargetId = useEditorPrefs((s) => s.lastTargetId);
+  const editors = useQuery({
+    queryKey: ["local-editor-targets"],
+    queryFn: () => invoke<LocalEditorTarget[]>("local_editor_targets"),
+    enabled: Boolean(local?.path),
+    staleTime: 60_000,
+  });
+  const editorTargets = editors.data ?? [];
+  const editor =
+    editorTargets.find((t) => t.id === lastEditorTargetId) ??
+    editorTargets.find((t) => t.isDefault) ??
+    editorTargets[0] ??
+    null;
+  const editorLabel = `Open in ${editor?.label ?? "editor"}`;
+
+  // Open the clone through the native command rather than the opener plugin:
+  // its path scope is deliberately empty, so `openPath` is always forbidden.
+  async function openInEditor(path: string) {
+    if (!editor) {
+      toast.info("No supported editor found", {
+        description: "Install Zed, VS Code, or Cursor, or set $EDITOR to an installed editor.",
+      });
+      return;
+    }
+    try {
+      await invoke("open_local_editor", { path, targetId: editor.id });
+    } catch {
+      toast.error(`Couldn't open ${editor.label}`, {
+        description: "The editor may have been removed or renamed.",
+      });
+    }
+  }
 
   // Click the PR count → the list, pre-filtered to this repo.
   function browsePrs() {
@@ -330,9 +360,9 @@ function RepoCard({
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-medium text-foreground">{slug}</p>
           {local ? (
-            <p className="truncate font-mono text-[11px] text-muted-foreground">{local.path}</p>
+            <p className="truncate font-mono text-2xs text-muted-foreground">{local.path}</p>
           ) : (
-            <p className="text-[11px] text-muted-foreground/70">Not cloned</p>
+            <p className="text-2xs text-muted-foreground/70">Not cloned</p>
           )}
         </div>
         {/* Watch switch — always visible; the name keeps the full row width. */}
@@ -354,11 +384,11 @@ function RepoCard({
         {/* Left: branch chip when cloned, otherwise a Clone call-to-action. */}
         {local ? (
           info.isError ? (
-            <span className="inline-flex items-center gap-1 rounded-md bg-destructive/10 px-1.5 py-0.5 text-[11px] text-destructive">
+            <span className="inline-flex items-center gap-1 rounded-md bg-destructive/10 px-1.5 py-0.5 text-2xs text-destructive">
               folder missing
             </span>
           ) : (
-            <span className="inline-flex min-w-0 items-center gap-1 rounded-md bg-foreground/[0.06] px-1.5 py-0.5 text-[11px] text-muted-foreground">
+            <span className="inline-flex min-w-0 items-center gap-1 rounded-md bg-foreground/[0.06] px-1.5 py-0.5 text-2xs text-muted-foreground">
               <GitBranch className="size-3 shrink-0" />
               <span className="truncate">{info.data?.currentBranch || "—"}</span>
               {info.data?.dirty && (
@@ -376,7 +406,7 @@ function RepoCard({
               variant="outline"
               loading={cloning}
               onClick={onClone}
-              className="h-6 px-2 text-[11px]"
+              className="h-6 px-2 text-2xs"
             >
               <DownloadCloud className="size-3.5" />
               Clone
@@ -388,7 +418,7 @@ function RepoCard({
                 size="sm"
                 variant="ghost"
                 onClick={onLocate}
-                className="h-6 px-2 text-[11px] text-muted-foreground"
+                className="h-6 px-2 text-2xs text-muted-foreground"
               >
                 <FolderSearch className="size-3.5" />
                 Locate…
@@ -412,16 +442,12 @@ function RepoCard({
             </TooltipFor>
             {local && (
               <>
-                <TooltipFor label="Open in VS Code">
+                <TooltipFor label={editorLabel}>
                   <Button
                     size="icon-sm"
                     variant="ghost"
-                    aria-label="Open in VS Code"
-                    onClick={() =>
-                      openPath(local.path, "Visual Studio Code").catch(() =>
-                        toast.error("Couldn't open the editor — is VS Code installed?"),
-                      )
-                    }
+                    aria-label={editorLabel}
+                    onClick={() => void openInEditor(local.path)}
                   >
                     <Code2 className="size-4" />
                   </Button>

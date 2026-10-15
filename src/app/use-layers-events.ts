@@ -12,6 +12,8 @@ interface AiDone {
   error?: string;
   provider?: string;
   headSha?: string;
+  model?: string | null;
+  effort?: string | null;
   canceled?: boolean;
 }
 
@@ -28,7 +30,7 @@ export function useLayersEvents() {
     let unsub: (() => void) | undefined;
     (async () => {
       unsub = await subscribe<AiDone>("ai:done", (e) => {
-        const { key, ok, output, error, provider, headSha, canceled } = e.payload;
+        const { key, ok, output, error, provider, headSha, model, effort, canceled } = e.payload;
         if (!key.startsWith(LAYERS_KEY_PREFIX)) return;
         const prKey = key.slice(LAYERS_KEY_PREFIX.length);
         const gen = useLayersGen.getState();
@@ -56,14 +58,23 @@ export function useLayersEvents() {
           const h = hint(output ?? "");
           gen.fail(
             prKey,
-            h
-              ? `The AI didn't return a usable split — it said: “${h}”`
-              : "The AI didn't return a usable split. Try again, or split by structure.",
+            // A well-formed plan that `parseLayers` still rejected kept everything
+            // in one layer — echoing its JSON back as the "reason" says nothing.
+            /"layers"\s*:/.test(output ?? "")
+              ? "The AI kept the whole PR in one layer — it may be small enough to read as-is. Try again, or split by structure."
+              : h
+                ? `The AI didn't return a usable split — it said: “${h}”`
+                : "The AI didn't return a usable split. Try again, or split by structure.",
           );
           toast.error(`Layering failed · ${ref}`);
           return;
         }
-        useLayers.getState().set(prKey, plan, { headSha: headSha ?? "", source: provider ?? "" });
+        useLayers.getState().set(prKey, plan, {
+          headSha: headSha ?? "",
+          source: provider ?? "",
+          model: model ?? undefined,
+          effort: effort ?? undefined,
+        });
         toast.success(`Layers ready · ${ref}`, {
           description: `${plan.layers.length} layers to read in order`,
         });

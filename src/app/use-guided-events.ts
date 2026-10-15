@@ -1,10 +1,12 @@
 import { parseGuided } from "@/lib/guided";
-import { LAYERS_KEY_PREFIX } from "@/lib/layers";
 import { subscribe } from "@/lib/tauri";
 import { useGuided } from "@/stores/guided";
 import { useGuidedGen } from "@/stores/guided-gen";
 import { useEffect } from "react";
 import { toast } from "sonner";
+
+/** `layers:`, `tour:`, `synth:`, `repo-map:`, … — any `name:` key prefix. */
+const NAMESPACED = /^[a-z][a-z-]*:/;
 
 interface AiDone {
   key: string;
@@ -29,9 +31,12 @@ export function useGuidedEvents() {
       unsub = await subscribe<AiDone>("ai:done", (e) => {
         const { key, ok, output, error, provider, headSha, canceled } = e.payload;
         // `ai:done` is broadcast for every AI background task. A layered-review
-        // plan is another surface's reply — parsing it here would fail and
-        // report a phantom "tour failed" for a tour nobody asked for.
-        if (key.startsWith(LAYERS_KEY_PREFIX)) return;
+        // plan, one layer of a deep tour, a synthesis, or a codebase map is
+        // another surface's reply — parsing it here would fail and report a
+        // phantom "tour failed" for a tour nobody asked for. Every other
+        // surface keys its runs with a `name:` namespace; a classic whole-PR
+        // tour uses the bare `owner/repo#number`, which never starts with one.
+        if (NAMESPACED.test(key)) return;
         const gen = useGuidedGen.getState();
         gen.done(key);
         // Canceled by the user — just clear the pending state, no error/toast.

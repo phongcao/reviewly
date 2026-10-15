@@ -1,29 +1,70 @@
+import { BehaviorPanel } from "@/components/behavior-panel";
 import { CommentByline } from "@/components/comment-byline";
 import { Composer } from "@/components/composer";
+import { DiffSelectionToolbar } from "@/components/diff-selection-toolbar";
+import { ImagePreview } from "@/components/image-preview";
 import { MarkdownBody } from "@/components/markdown-body";
+import { MarkdownPreview } from "@/components/markdown-preview";
 import { ReactionsBar } from "@/components/reactions-bar";
 import { ReviewThreadGroup } from "@/components/review-thread";
 import { TooltipFor } from "@/components/tooltip-for";
-import { type DiffLine, type Hunk, parsePatch, toSplit } from "@/lib/diff";
+import { buildSnippet, refFromLines } from "@/lib/ai/attach";
+import { attachContext } from "@/lib/ai/attach-bridge";
+import { useBehavior } from "@/lib/ai/use-behavior";
+import type { BehaviorDiff } from "@/lib/behavior";
+import {
+  type DiffLine,
+  type Hunk,
+  hasLineEndingChanges,
+  ignoreLineEndings,
+  parseHunkHeader,
+  parsePatch,
+  sharedRatio,
+  toSplit,
+} from "@/lib/diff";
+import { isImagePath } from "@/lib/images";
 import { detectLanguage, highlightLine } from "@/lib/lang";
-import type { DraftComment, ReviewThread, ReviewThreadGraphQL } from "@/lib/tauri";
+import { isMarkdownPath } from "@/lib/markdown";
+import type { ReviewLocation } from "@/lib/review-context";
+import type { DraftComment, PullFile, ReviewThread, ReviewThreadGraphQL } from "@/lib/tauri";
 import { safeOpenUrl } from "@/lib/ui";
 import { cn } from "@/lib/utils";
+import { useLocalRepos } from "@/stores/local-repos";
+import { type PendingComment, useReviewDraft } from "@/stores/review-draft";
 import { useReviewPrefs } from "@/stores/review-prefs";
 import { useViewedFiles } from "@/stores/viewed-files";
 import { diffWordsWithSpace } from "diff";
 import {
+  BookOpenText,
   ChevronDown,
   ChevronUp,
   Copy,
+  CornerDownLeft,
   ExternalLink,
+  FileCode,
+  GitCompare,
   Link as LinkIcon,
+  MessageSquare,
   MessageSquarePlus,
+  PanelRight,
+  Pencil,
+  Sparkles,
+  SquarePen,
   TextQuote,
+  Trash2,
   UnfoldVertical,
   WrapText,
 } from "lucide-react";
-import { Fragment, createContext, useContext, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Fragment,
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { toast } from "sonner";
 
 interface Props {
@@ -50,8 +91,16 @@ interface Props {
   focusLine?: number | null;
   /** Bumps on every focus request so repeat clicks re-trigger the scroll/flash. */
   focusNonce?: number;
+  /** Hand off to the local editor at an exact line. Omitted with no clone. */
+  onOpenInEditor?: (path: string, line: number) => void;
   /** PR head sha — enables GitHub permalinks for the file/line copy actions. */
   headSha?: string | null;
+  /** PR base sha — the "before" side of an image preview. */
+  baseSha?: string | null;
+  /** GitHub file status (added, removed, modified, renamed, …). */
+  status?: string;
+  /** Pre-rename path, when the file was renamed. */
+  previousPath?: string | null;
   /**
    * Stable per-PR+head-sha key for persisting expanded context gaps so
    * re-opening a file keeps its expansions. Null disables persistence.
@@ -59,6 +108,16 @@ interface Props {
   viewedKey?: string | null;
   /** True while the full HEAD file content is still loading (for context UX). */
   fileLinesLoading?: boolean;
+  /** Opens (or focuses) the AI chat after code is pinned to it from the diff. */
+  onAskAi?: () => void;
+  /** Opens a location in the review context pane, beside the diff. */
+  onPeek?: (loc: ReviewLocation) => void;
+  /**
+   * Set when `patch` is not the PR's own diff (e.g. "since your review"): the
+   * new-file lines GitHub will accept a comment on. Old-side lines then belong
+   * to another commit, so they take no comments and show no threads.
+   */
+  commentableRight?: ReadonlySet<number> | null;
 }
 
 interface GapInfo {
@@ -82,6 +141,24 @@ interface ThreadMeta {
   number: number;
   reviewThreads: ReviewThreadGraphQL[];
   viewerLogin?: string;
+  /** Enough to let the comment popover pin its line range to the chat. */
+  patch: string | null;
+  fileLines?: string[];
+  onAskAi?: () => void;
+  /** Open this file at a line in the reviewer's editor; absent with no clone. */
+  onOpenInEditor?: (line: number) => void;
+  /** Open this file at a line in the context pane, beside the diff. */
+  onPeek?: (line: number) => void;
+  /** Explain the symbol at this hunk as behavior. Absent = feature off. */
+  onExplainBehavior?: (line: number, symbol: string) => void;
+  /** The hunk (by new-file start line) currently waiting on an explanation. */
+  behaviorPending?: number | null;
+  /** This file's not-yet-submitted review comments, shown under their line. */
+  pending: PendingComment[];
+  onEditPending: (id: string) => (body: string) => void;
+  onRemovePending: (c: PendingComment) => void;
+  /** See `Props.commentableRight`. Absent = every line takes a comment. */
+  commentableRight?: ReadonlySet<number> | null;
 }
 const ThreadMetaContext = createContext<ThreadMeta | null>(null);
 
@@ -95,6 +172,56 @@ interface Anchor {
 interface LineRenderCtx {
   /** Wrap long lines (whitespace-pre-wrap) vs. overflow horizontally (pre). */
   wrap: boolean;
+  /**
+   * Approx. monospace characters that fit on one visual line of the code
+   * column, or 0 when unknown. Only used to size off-screen hunks (see
+   * `estimateRowsHeight`) — never to lay out real rows.
+   */
+  charsPerLine: number;
+}
+
+/**
+ * Total fixed chrome to the left of (and right of) the code column on a
+ * unified row: two w-10 gutters, a w-4 slot, the w-5 comment trigger, the w-3
+ * +/- marker and the pre's pr-4.
+ */
+const ROW_CHROME_PX = 40 + 40 + 16 + 20 + 12 + 16;
+
+/**
+ * Approximate characters per visual line in the code column, or 0 before the
+ * first measurement. Measures the real mono advance width rather than assuming
+ * one, so a zoom change or a different fallback font stays accurate.
+ */
+function useCodeColumnChars(ref: React.RefObject<HTMLDivElement | null>): number {
+  const [chars, setChars] = useState(0);
+
+  useEffect(() => {
+    const root = ref.current;
+    if (!root) return;
+
+    const probe = document.createElement("span");
+    probe.className = "font-mono text-xs";
+    probe.style.cssText =
+      "position:absolute;visibility:hidden;white-space:pre;pointer-events:none;left:-9999px";
+    probe.textContent = "0".repeat(100);
+    root.appendChild(probe);
+
+    const measure = () => {
+      const advance = probe.getBoundingClientRect().width / 100;
+      const codeWidth = root.clientWidth - ROW_CHROME_PX;
+      setChars(advance > 0 && codeWidth > 0 ? Math.floor(codeWidth / advance) : 0);
+    };
+    measure();
+
+    const ro = new ResizeObserver(measure);
+    ro.observe(root);
+    return () => {
+      ro.disconnect();
+      probe.remove();
+    };
+  }, [ref]);
+
+  return chars;
 }
 
 /** State shared across all rows so we can show one popover and extend ranges. */
@@ -126,20 +253,133 @@ export function DiffViewer({
   density = "comfortable",
   focusLine,
   focusNonce,
+  onOpenInEditor,
+  onPeek,
   headSha,
+  baseSha,
+  status,
+  previousPath,
   viewedKey,
   fileLinesLoading = false,
+  onAskAi,
+  commentableRight = null,
 }: Props) {
   const hunks = useMemo(() => parsePatch(patch), [patch]);
+
+  // Pending (not-yet-submitted) review comments on this file, edited and
+  // removed in place under the line they're anchored to.
+  const draftKey = { owner, repo, number };
+  const draftComments = useReviewDraft((s) => s.drafts[`${owner}/${repo}#${number}`]?.comments);
+  const pending = useMemo(
+    () => (draftComments ?? []).filter((c) => c.path === path),
+    [draftComments, path],
+  );
+  const updateDraftComment = useReviewDraft((s) => s.updateComment);
+  const removeDraftComment = useReviewDraft((s) => s.removeComment);
+  const addDraftComment = useReviewDraft((s) => s.addComment);
+  const onEditPending = (id: string) => (body: string) => updateDraftComment(draftKey, id, body);
+  const onRemovePending = (c: PendingComment) => {
+    removeDraftComment(draftKey, c.id);
+    toast("Pending comment deleted", {
+      action: { label: "Undo", onClick: () => addDraftComment(draftKey, c) },
+    });
+  };
+
+  // Behavior explanations requested from this file's diff — by the hunk header
+  // or by a selection. Keyed by the enclosing hunk's new-file start so the
+  // panel renders under the code it describes, and cleared when the file
+  // changes since the answer is about this diff only.
+  const localRepos = useLocalRepos((r) => r.repos);
+  const behaviorCwd = useMemo(
+    () => localRepos.find((r) => r.owner === owner && r.repo === repo)?.path ?? null,
+    [localRepos, owner, repo],
+  );
+  const { explain } = useBehavior(behaviorCwd);
+  // Keyed by path so an answer can't outlive the file it describes when this
+  // viewer is pointed at another one — a render-time guard rather than a reset
+  // effect, so there is no frame where the stale panel is still on screen.
+  const [behavior, setBehavior] = useState<{
+    path: string;
+    anchor: number;
+    diff: BehaviorDiff;
+  } | null>(null);
+  const [pendingHunk, setPendingHunk] = useState<number | null>(null);
+  /** Bring a freshly-rendered panel into view — it may be inserted above the
+   * current scroll position, which would otherwise look like nothing happened. */
+  const revealBehavior = useCallback((el: HTMLDivElement | null) => {
+    el?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, []);
+
+  /** New-file start of the hunk containing `line`, for anchoring the panel. */
+  const hunkAt = useCallback(
+    (line: number): number =>
+      hunks.find((h) => h.lines.some((l) => l.newLine !== null && l.newLine >= line))?.newStart ??
+      hunks[0]?.newStart ??
+      line,
+    [hunks],
+  );
+
+  const runExplain = useCallback(
+    async (line: number, endLine: number | undefined, subject: string | undefined) => {
+      const anchor = hunkAt(line);
+      setPendingHunk(anchor);
+      try {
+        const d = await explain({ path, line, endLine, subject, patch }, `${path}:${line}`);
+        if (d) setBehavior({ path, anchor, diff: d });
+      } finally {
+        setPendingHunk(null);
+      }
+    },
+    [explain, hunkAt, patch, path],
+  );
+
+  const explainHunk = useCallback(
+    (line: number, symbol: string) => void runExplain(line, undefined, symbol || undefined),
+    [runExplain],
+  );
+
+  // A selection carries no symbol name, so the model is told only the range and
+  // works out the enclosing symbol itself — the same job it already does for a
+  // hunk, with one less hint.
+  // Verification needs a PullFile list; inside the viewer we have exactly one
+  // file, which is also the only one its claims may cite.
+  const behaviorFiles = useMemo(() => [{ filename: path, patch } as PullFile], [path, patch]);
+
+  /** Scroll to a new-file line in this diff — same row lookup as `navComment`. */
+  const goToLine = useCallback((line: number) => {
+    const el = rootRef.current?.querySelector<HTMLElement>(`[data-line="${line}"]`);
+    if (el) el.scrollIntoView({ behavior: "smooth", block: "center" });
+    else toast.info(`Line ${line} isn't rendered in this diff.`);
+  }, []);
+
+  const explainSelection = useCallback(
+    (from: number, to: number) => void runExplain(from, to > from ? to : undefined, undefined),
+    [runExplain],
+  );
   const lang = useMemo(() => detectLanguage(path), [path]);
   const bounds = useMemo(() => hunks.map(hunkBounds), [hunks]);
   const rootRef = useRef<HTMLDivElement>(null);
+  // The rendered Markdown alone — not the file toolbar above it — so selecting
+  // the header's text never offers to attach it.
+  const proseRef = useRef<HTMLDivElement>(null);
 
   // Line-wrapping + whitespace-only collapsing are review-wide prefs.
   const diffWrap = useReviewPrefs((s) => s.diffWrap);
   const setDiffWrap = useReviewPrefs((s) => s.setDiffWrap);
   const hideWhitespace = useReviewPrefs((s) => s.hideWhitespace);
   const setHideWhitespace = useReviewPrefs((s) => s.setHideWhitespace);
+  // CRLF <-> LF noise: review-wide like the above, but the toggle only shows on
+  // files whose diff actually has line-ending-only changes.
+  const ignoreEolPref = useReviewPrefs((s) => s.ignoreLineEndings);
+  const setIgnoreEol = useReviewPrefs((s) => s.setIgnoreLineEndings);
+  const hasEolChanges = useMemo(() => hasLineEndingChanges(hunks), [hunks]);
+  const ignoreEol = ignoreEolPref && hasEolChanges;
+  // Render Markdown files as documents rather than diffs. Review-wide (not
+  // per-file) so a docs-heavy PR is read in one mode instead of re-toggled
+  // twenty times; the toggle only appears on files it applies to.
+  const markdownPreview = useReviewPrefs((s) => s.markdownPreview);
+  const setMarkdownPreview = useReviewPrefs((s) => s.setMarkdownPreview);
+  const isMarkdown = useMemo(() => isMarkdownPath(path), [path]);
 
   // Persisted expanded context gaps for this file (keyed by viewedKey → path).
   const persistedGaps = useViewedFiles((s) =>
@@ -147,13 +387,30 @@ export function DiffViewer({
   );
   const setGapExpanded = useViewedFiles((s) => s.setGapExpanded);
 
-  const lineCtx: LineRenderCtx = { wrap: diffWrap };
+  // Width of the code column in monospace characters, remeasured when the pane
+  // resizes. Feeds the off-screen hunk size estimate only (see
+  // `estimateRowsHeight`); rows themselves are always laid out by the browser.
+  const charsPerLine = useCodeColumnChars(rootRef);
 
-  // Scroll to + flash a target line when the guided tour jumps here. The
-  // `focusLine` carries a fresh value per request (incl. repeat clicks).
+  const lineCtx: LineRenderCtx = { wrap: diffWrap, charsPerLine };
+
+  // Has a *new* focus request arrived on this render? Derived here rather than
+  // tracked inside one of the effects below, so both consumers (the scroll-to-
+  // line effect and the scroll-position restore) read the same answer without
+  // depending on the order React happens to run them in. Retired by the effect
+  // at the end of this component.
+  const seenFocusNonce = useRef(focusNonce);
+  const freshFocus = focusNonce !== seenFocusNonce.current;
+
+  // Scroll to + flash a target line when the guided tour jumps here.
+  //
+  // Gated on `freshFocus`, not just `focusLine != null`: the caller never clears
+  // `focusLine` back to null, so without this the effect re-fires on every
+  // later file change and flashes whatever unrelated line happens to share that
+  // number in the newly-opened file.
   // biome-ignore lint/correctness/useExhaustiveDependencies: re-run on focusLine even when path is unchanged
   useEffect(() => {
-    if (focusLine == null) return;
+    if (focusLine == null || !freshFocus) return;
     const root = rootRef.current;
     if (!root) return;
     let raf = 0;
@@ -197,14 +454,52 @@ export function DiffViewer({
   // biome-ignore lint/correctness/useExhaustiveDependencies: reset on file change
   useEffect(() => setNullPatchExpanded(false), [path]);
 
-  // Reset the diff scroll back to the top whenever the file changes.
-  // biome-ignore lint/correctness/useExhaustiveDependencies: scroll reset on file change
+  // Remember where the reviewer was in each file's diff, so leaving a file and
+  // coming back resumes mid-file instead of snapping to the top — the position
+  // is half of "where was I", and losing it on every `[` / `]` is what makes a
+  // long file feel unreviewable.
+  //
+  // Read through `getState()` rather than a selector on purpose: subscribing
+  // would re-render the whole diff on every write.
   useEffect(() => {
     const root = rootRef.current;
     if (!root) return;
     const sc = scrollParent(root);
-    if (sc) sc.scrollTop = 0;
-  }, [path]);
+    if (!sc) return;
+
+    // A guided-tour jump owns the scroll for this render — it rAFs its own
+    // scrollIntoView off the same `path` change, and restoring underneath it
+    // would yank the reviewer away from the step they just opened.
+    //
+    if (!freshFocus) {
+      const saved = viewedKey
+        ? (useViewedFiles.getState().scrollOffsets?.[viewedKey]?.[path] ?? 0)
+        : 0;
+      if (saved > 0) {
+        // Defer: the incoming file's rows haven't laid out yet, so the
+        // container isn't tall enough to accept a non-zero offset.
+        const raf = requestAnimationFrame(() => {
+          sc.scrollTop = saved;
+        });
+        return () => {
+          cancelAnimationFrame(raf);
+          if (viewedKey) useViewedFiles.getState().setScrollOffset(viewedKey, path, sc.scrollTop);
+        };
+      }
+      sc.scrollTop = 0;
+    }
+
+    return () => {
+      if (viewedKey) useViewedFiles.getState().setScrollOffset(viewedKey, path, sc.scrollTop);
+    };
+    // `freshFocus` is derived from `focusNonce`, so it belongs in the deps.
+  }, [path, viewedKey, freshFocus]);
+
+  // Declared after both readers so `freshFocus` stays true for the whole commit
+  // in which the request arrived, then goes false.
+  useEffect(() => {
+    seenFocusNonce.current = focusNonce;
+  });
 
   const gapFor = (idx: number): GapInfo | null => {
     if (!fileLines || fileLines.length === 0) return null;
@@ -316,6 +611,11 @@ export function DiffViewer({
       setRangeStart(null);
     },
     startDrag: (anchor) => {
+      // Drop any leftover text selection: a gutter drag makes none of its own
+      // (the gutter is select-none + preventDefault), so a stale one from an
+      // earlier drag would keep the "Ask AI" toolbar floating over the comment
+      // popover we're about to open.
+      window.getSelection()?.removeAllRanges();
       setDragAnchor(anchor);
       setDragEnd(anchor);
       setPopoverAt(null);
@@ -337,8 +637,12 @@ export function DiffViewer({
       const ln = t.line ?? t.original_line;
       if (ln != null) set.add(ln);
     }
+    // Rows are addressed by new-file line, so only RIGHT-side drafts can be.
+    for (const c of pending) {
+      if (c.line != null && (c.side ?? "RIGHT") === "RIGHT") set.add(c.line);
+    }
     return [...set].sort((a, b) => a - b);
-  }, [threads, path]);
+  }, [threads, path, pending]);
 
   const navComment = (dir: 1 | -1) => {
     const root = rootRef.current;
@@ -382,12 +686,25 @@ export function DiffViewer({
     }
   }
 
+  const showPreview = isMarkdown && markdownPreview;
+  // Images have no text patch; show the picture instead of the line view.
+  const showImage = hunks.length === 0 && isImagePath(path);
+
   const toolbar = (
     <DiffToolbar
+      path={path}
+      previousPath={previousPath}
+      markdown={isMarkdown}
+      preview={showPreview}
+      image={showImage}
+      onTogglePreview={() => setMarkdownPreview(!markdownPreview)}
       wrap={diffWrap}
       onToggleWrap={() => setDiffWrap(!diffWrap)}
       hideWhitespace={hideWhitespace}
       onToggleHideWhitespace={() => setHideWhitespace(!hideWhitespace)}
+      eolChanges={hasEolChanges}
+      ignoreEol={ignoreEol}
+      onToggleIgnoreEol={() => setIgnoreEol(!ignoreEolPref)}
       commentCount={commentLines.length}
       onPrevComment={() => navComment(-1)}
       onNextComment={() => navComment(1)}
@@ -396,6 +713,62 @@ export function DiffViewer({
       onOpenGitHub={() => safeOpenUrl(permalink())}
     />
   );
+
+  // Rendered Markdown replaces the rows entirely — the diff's line gutters,
+  // comment popovers and context expanders have nothing to attach to in prose;
+  // only the "Ask AI" selection toolbar carries over. The file toolbar stays
+  // put so one click is always the way back.
+  if (showPreview) {
+    return (
+      <div ref={rootRef}>
+        {toolbar}
+        {/* Prose has no line rows, but it's still what the reviewer is reading:
+            highlight a passage and it pins to the chat as quoted text plus the
+            source lines behind it. */}
+        <DiffSelectionToolbar
+          rootRef={proseRef}
+          path={path}
+          patch={patch}
+          view="prose"
+          prKey={`${owner}/${repo}#${number}`}
+          fileLines={fileLines}
+          onAskAi={onAskAi}
+          onPeek={onPeek}
+        />
+        <div ref={proseRef}>
+          <MarkdownPreview
+            path={path}
+            owner={owner}
+            repo={repo}
+            headSha={headSha}
+            fileLines={fileLines}
+            hunks={hunks}
+            loading={fileLinesLoading}
+          />
+        </div>
+        <div ref={endRef} aria-hidden className="h-px" />
+      </div>
+    );
+  }
+
+  if (showImage) {
+    return (
+      <div ref={rootRef}>
+        {toolbar}
+        <ImagePreview
+          key={path}
+          owner={owner}
+          repo={repo}
+          path={path}
+          status={status}
+          previousPath={previousPath}
+          headSha={headSha}
+          baseSha={baseSha}
+        />
+        <div ref={endRef} aria-hidden className="h-px" />
+      </div>
+    );
+  }
 
   if (hunks.length === 0) {
     // Better null-patch handling: instead of a dead-end message, offer to load
@@ -434,8 +807,43 @@ export function DiffViewer({
           </div>
         </div>
         {nullPatchExpanded && fullLines.length > 0 && (
-          <ThreadMetaContext.Provider value={{ owner, repo, number, reviewThreads, viewerLogin }}>
+          <ThreadMetaContext.Provider
+            value={{
+              owner,
+              repo,
+              number,
+              reviewThreads,
+              viewerLogin,
+              patch,
+              fileLines,
+              onAskAi,
+              onOpenInEditor: onOpenInEditor
+                ? (line: number) => onOpenInEditor(path, line)
+                : undefined,
+              onPeek: onPeek ? (line: number) => onPeek({ path, line }) : undefined,
+              onExplainBehavior: explainHunk,
+              behaviorPending: pendingHunk,
+              pending,
+              onEditPending,
+              onRemovePending,
+              commentableRight,
+            }}
+          >
+            <DiffSelectionToolbar
+              rootRef={rootRef}
+              path={path}
+              patch={patch}
+              view={view}
+              prKey={`${owner}/${repo}#${number}`}
+              fileLines={fileLines}
+              onAskAi={onAskAi}
+              onPeek={onPeek}
+              onExplainBehavior={explainSelection}
+            />
             <div
+              ref={rootRef}
+              data-selectable
+              data-path={path}
               className={cn(
                 "font-mono text-xs",
                 density === "compact" ? "leading-[1.3]" : "leading-[1.55]",
@@ -459,11 +867,45 @@ export function DiffViewer({
   }
 
   return (
-    <ThreadMetaContext.Provider value={{ owner, repo, number, reviewThreads, viewerLogin }}>
+    <ThreadMetaContext.Provider
+      value={{
+        owner,
+        repo,
+        number,
+        reviewThreads,
+        viewerLogin,
+        patch,
+        fileLines,
+        onAskAi,
+        // Both of these used to be omitted here and supplied only in the
+        // null-patch branch above, so the gutter popover's "Open in editor"
+        // never appeared on an ordinary diff — the one place it matters.
+        onOpenInEditor: onOpenInEditor ? (line: number) => onOpenInEditor(path, line) : undefined,
+        onPeek: onPeek ? (line: number) => onPeek({ path, line }) : undefined,
+        onExplainBehavior: explainHunk,
+        behaviorPending: pendingHunk,
+        pending,
+        onEditPending,
+        onRemovePending,
+        commentableRight,
+      }}
+    >
       {toolbar}
+      <DiffSelectionToolbar
+        rootRef={rootRef}
+        path={path}
+        patch={patch}
+        view={view}
+        prKey={`${owner}/${repo}#${number}`}
+        fileLines={fileLines}
+        onAskAi={onAskAi}
+        onPeek={onPeek}
+        onExplainBehavior={explainSelection}
+      />
       <div
         ref={rootRef}
         data-selectable
+        data-path={path}
         className={cn(
           "font-mono text-xs",
           density === "compact" ? "leading-[1.3]" : "leading-[1.55]",
@@ -485,6 +927,21 @@ export function DiffViewer({
               onAddComment={onAddComment}
               line={lineCtx}
             />
+            {/* ABOVE the hunk, not after it. A hunk can be hundreds of rows
+                long (a new file is one hunk), so a panel appended after the
+                block lands far below the header the reviewer just clicked —
+                indistinguishable from nothing happening. */}
+            {behavior?.path === path && behavior.anchor === h.newStart && (
+              <div ref={revealBehavior} className="px-3 pt-2 font-sans">
+                <BehaviorPanel
+                  diff={behavior.diff}
+                  path={path}
+                  files={behaviorFiles}
+                  onGoToLine={goToLine}
+                  onClose={() => setBehavior(null)}
+                />
+              </div>
+            )}
             <HunkBlock
               path={path}
               lang={lang}
@@ -494,6 +951,7 @@ export function DiffViewer({
               ui={ui}
               onAddComment={onAddComment}
               hideWhitespace={hideWhitespace}
+              ignoreEol={ignoreEol}
               line={lineCtx}
             />
           </Fragment>
@@ -564,12 +1022,26 @@ function ToolBtn({
   );
 }
 
-/** Top toolbar: wrap toggle, hide-whitespace toggle, comment nav, copy actions. */
+/**
+ * Top toolbar: Markdown preview toggle (Markdown files only), wrap toggle,
+ * hide-whitespace toggle, comment nav, copy actions. In preview mode the
+ * row-level controls drop out — they describe rows that aren't rendered —
+ * leaving the preview toggle, the comment count, and the copy/open actions.
+ */
 function DiffToolbar({
+  path,
+  previousPath,
+  markdown,
+  preview,
+  image = false,
+  onTogglePreview,
   wrap,
   onToggleWrap,
   hideWhitespace,
   onToggleHideWhitespace,
+  eolChanges,
+  ignoreEol,
+  onToggleIgnoreEol,
   commentCount,
   onPrevComment,
   onNextComment,
@@ -577,10 +1049,21 @@ function DiffToolbar({
   onCopyPermalink,
   onOpenGitHub,
 }: {
+  path: string;
+  previousPath?: string | null;
+  markdown: boolean;
+  preview: boolean;
+  /** An image preview: no lines, so no wrap/whitespace/comment tools. */
+  image?: boolean;
+  onTogglePreview: () => void;
   wrap: boolean;
   onToggleWrap: () => void;
   hideWhitespace: boolean;
   onToggleHideWhitespace: () => void;
+  /** The diff has CRLF <-> LF-only changes — the only time the EOL toggle shows. */
+  eolChanges: boolean;
+  ignoreEol: boolean;
+  onToggleIgnoreEol: () => void;
   commentCount: number;
   onPrevComment: () => void;
   onNextComment: () => void;
@@ -590,32 +1073,84 @@ function DiffToolbar({
 }) {
   return (
     <div className="flex flex-wrap items-center gap-1 border-b border-hairline bg-card/95 px-2 py-1 font-sans">
-      <ToolBtn
-        tip={wrap ? "Wrapping long lines" : "Not wrapping (overflow)"}
-        onClick={onToggleWrap}
-        pressed={wrap}
-        active={wrap}
-      >
-        <WrapText className="size-3.5" />
-        Wrap
-      </ToolBtn>
-      <ToolBtn
-        tip="Collapse changes that differ only in whitespace"
-        onClick={onToggleHideWhitespace}
-        pressed={hideWhitespace}
-        active={hideWhitespace}
-      >
-        <TextQuote className="size-3.5" />
-        Hide whitespace
-      </ToolBtn>
+      <FilePathLabel path={path} previousPath={previousPath} />
       <div className="mx-0.5 h-4 w-px bg-border/50" aria-hidden />
-      <ToolBtn tip="Previous comment" onClick={onPrevComment} disabled={commentCount === 0}>
-        <ChevronUp className="size-3.5" />
-      </ToolBtn>
-      <span className="text-xs tabular-nums text-muted-foreground/70">{commentCount}</span>
-      <ToolBtn tip="Next comment" onClick={onNextComment} disabled={commentCount === 0}>
-        <ChevronDown className="size-3.5" />
-      </ToolBtn>
+      {markdown && (
+        <>
+          <ToolBtn
+            tip={
+              preview
+                ? "Showing rendered Markdown — switch back to the raw diff (m)"
+                : "Render this Markdown file as a document (m)"
+            }
+            onClick={onTogglePreview}
+            pressed={preview}
+            active={preview}
+          >
+            <BookOpenText className="size-3.5" />
+            Preview
+          </ToolBtn>
+          <div className="mx-0.5 h-4 w-px bg-border/50" aria-hidden />
+        </>
+      )}
+      {preview ? (
+        <ToolBtn
+          tip={
+            commentCount === 0
+              ? "No inline comments on this file"
+              : "Inline comments live on the diff — switch back to read them"
+          }
+          onClick={onTogglePreview}
+          disabled={commentCount === 0}
+        >
+          <MessageSquare className="size-3.5" />
+          {commentCount}
+        </ToolBtn>
+      ) : image ? null : (
+        <>
+          <ToolBtn
+            tip={wrap ? "Wrapping long lines" : "Not wrapping (overflow)"}
+            onClick={onToggleWrap}
+            pressed={wrap}
+            active={wrap}
+          >
+            <WrapText className="size-3.5" />
+            Wrap
+          </ToolBtn>
+          <ToolBtn
+            tip="Collapse changes that differ only in whitespace"
+            onClick={onToggleHideWhitespace}
+            pressed={hideWhitespace}
+            active={hideWhitespace}
+          >
+            <TextQuote className="size-3.5" />
+            Hide whitespace
+          </ToolBtn>
+          {eolChanges && (
+            <ToolBtn
+              tip={
+                ignoreEol
+                  ? "Ignoring CRLF ↔ LF changes — show every line whose ending changed"
+                  : "Line endings changed (CRLF ↔ LF) — hide those lines to see the real edits"
+              }
+              onClick={onToggleIgnoreEol}
+              pressed={ignoreEol}
+              active={ignoreEol}
+            >
+              <CornerDownLeft className="size-3.5" />
+              Ignore EOL
+            </ToolBtn>
+          )}
+          <div className="mx-0.5 h-4 w-px bg-border/50" aria-hidden />
+          <ToolBtn tip="Previous comment" onClick={onPrevComment} disabled={commentCount === 0}>
+            <ChevronUp className="size-3.5" />
+          </ToolBtn>
+          <span className="text-xs tabular-nums text-muted-foreground/70">{commentCount}</span>
+          <ToolBtn tip="Next comment" onClick={onNextComment} disabled={commentCount === 0}>
+            <ChevronDown className="size-3.5" />
+          </ToolBtn>
+        </>
+      )}
       <div className="ml-auto flex items-center gap-1">
         <ToolBtn tip="Copy file path" onClick={onCopyPath}>
           <Copy className="size-3.5" />
@@ -628,6 +1163,29 @@ function DiffToolbar({
         </ToolBtn>
       </div>
     </div>
+  );
+}
+
+/**
+ * The open file's full path — directory muted, basename emphasized. Folders can
+ * repeat a filename (`__init__.py`, `README.md`), so the basename alone doesn't
+ * say which file this is. The directory truncates first; hover for all of it.
+ */
+function FilePathLabel({ path, previousPath }: { path: string; previousPath?: string | null }) {
+  const slash = path.lastIndexOf("/");
+  const dir = slash >= 0 ? path.slice(0, slash + 1) : "";
+  const base = path.slice(slash + 1);
+  const renamed = previousPath && previousPath !== path;
+  return (
+    <TooltipFor label={renamed ? `${previousPath} → ${path}` : path} align="start">
+      <span className="flex min-w-0 flex-1 basis-40 items-center gap-1.5 px-1 font-mono text-xs">
+        <FileCode className="size-3.5 shrink-0 text-muted-foreground" />
+        <span className="flex min-w-0">
+          {dir && <span className="min-w-0 truncate text-muted-foreground">{dir}</span>}
+          <span className="shrink-0 text-foreground">{base}</span>
+        </span>
+      </span>
+    </TooltipFor>
   );
 }
 
@@ -745,20 +1303,28 @@ function GapExpander({
   );
 }
 
-function parseHunkHeader(text: string): { range: string; symbol: string } {
-  const m = text.match(/^(@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@)\s?(.*)$/);
-  if (!m) return { range: text, symbol: "" };
-  return { range: m[1], symbol: m[2] };
-}
-
 /** Sticky breadcrumb shown at the top of each hunk — keeps the enclosing
- * symbol in view while you scroll through the changes. */
+ * symbol in view while you scroll through the changes.
+ *
+ * Also the per-hunk entry point for a behavior explanation: the `@@ … @@`
+ * suffix is git's own guess at the enclosing symbol, which is a free, exact
+ * anchor with no parser of our own. The button is revealed on hover rather than
+ * always drawn — a always-visible button on every hunk of a 120-file PR turns
+ * "explain this" into the default way to read the diff, which is the one thing
+ * this feature must not become. */
 function HunkHeaderBar({ text, gutter }: { text: string; gutter?: string }) {
-  const { range, symbol } = parseHunkHeader(text);
+  const { range, symbol, newStart } = parseHunkHeader(text);
+  const meta = useContext(ThreadMetaContext);
+  const explain = meta?.onExplainBehavior;
+  const busy = meta?.behaviorPending === newStart;
   return (
-    <div className="sticky top-0 z-10 flex border-y border-hairline bg-card/95 backdrop-blur-md">
+    // Opaque card-over-background rather than a translucent card + backdrop
+    // blur: this bar stays pinned over the rows for as long as its hunk is on
+    // screen (a whole rewritten file), and a backdrop filter there re-blurs
+    // the scrolling content on every frame.
+    <div className="group/hunk sticky top-0 z-10 flex items-center border-y border-hairline [background:linear-gradient(var(--color-card),var(--color-card)),var(--color-background)]">
       {gutter && <span className={cn("shrink-0", gutter)} />}
-      <pre className="flex-1 select-text truncate px-3 py-1 text-xs">
+      <pre className="min-w-0 flex-1 select-text truncate px-3 py-1 text-xs">
         {symbol ? (
           <>
             <span className="text-muted-foreground/45">{range} </span>
@@ -768,17 +1334,45 @@ function HunkHeaderBar({ text, gutter }: { text: string; gutter?: string }) {
           <span className="text-muted-foreground/80">{range}</span>
         )}
       </pre>
+      {explain && newStart > 0 && (
+        <button
+          type="button"
+          disabled={busy}
+          onClick={() => explain(newStart, symbol)}
+          title={symbol ? `Explain the behavior of ${symbol}` : "Explain this hunk's behavior"}
+          className={cn(
+            "mr-2 inline-flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 font-sans text-2xs text-muted-foreground transition-opacity hover:bg-foreground/8 hover:text-foreground disabled:opacity-50",
+            busy
+              ? "opacity-100"
+              : "opacity-0 focus-visible:opacity-100 group-hover/hunk:opacity-100",
+          )}
+        >
+          <GitCompare className="size-3" />
+          {busy ? "Explaining…" : "Behavior"}
+        </button>
+      )}
     </div>
   );
 }
 
-/** Fixed-width gutter slot, kept so line content stays aligned. Reserved for
- * future per-line markers (e.g. guided-tour steps). */
-function GutterSlot() {
-  return <span className="w-4 shrink-0" aria-hidden />;
+/** Fixed-width gutter slot, kept so line content stays aligned. Marks lines
+ * that carry a pending review comment. */
+function GutterSlot({ pending = 0 }: { pending?: number }) {
+  if (pending === 0) return <span className="w-4 shrink-0" aria-hidden />;
+  return (
+    <span
+      className="flex w-4 shrink-0 select-none items-center justify-center text-primary"
+      title={`${pending} pending comment${pending === 1 ? "" : "s"}`}
+    >
+      <MessageSquare className="size-3" aria-hidden />
+    </span>
+  );
 }
 
 /* ────────────────────────────────────────────────────────────────── */
+
+/** Below this `sharedRatio`, a del/add pair is treated as unrelated lines. */
+const MIN_SHARED_RATIO = 0.4;
 
 interface PairWordDiff {
   oldHtml: string;
@@ -792,6 +1386,13 @@ interface PairWordDiff {
  */
 function wordDiff(oldText: string, newText: string, lang: string): PairWordDiff {
   const parts = diffWordsWithSpace(oldText, newText);
+  // A pair is just whichever del and add happen to sit side by side, so in a
+  // rewritten block it's often two unrelated lines. Their word diff marks
+  // nearly every token — noise to read, and thousands of extra spans to paint
+  // — so show them as plain removed and added lines instead.
+  if (sharedRatio(parts) < MIN_SHARED_RATIO) {
+    return { oldHtml: highlightLine(oldText, lang), newHtml: highlightLine(newText, lang) };
+  }
   let oldHtml = "";
   let newHtml = "";
   for (const part of parts) {
@@ -812,6 +1413,12 @@ interface DecoratedLine extends DiffLine {
   html: string;
   /** Marks a del/add pair collapsed because it differs only in whitespace. */
   whitespaceOnly?: boolean;
+}
+
+/** The muted tag on a row collapsed by hide-whitespace or ignore-EOL. */
+function collapsedLabel(line: DecoratedLine): string | null {
+  if (line.eolChange) return line.eolChange === "crlf-to-lf" ? "CRLF→LF" : "LF→CRLF";
+  return line.whitespaceOnly ? "whitespace" : null;
 }
 
 /** True when two strings are identical once all whitespace is stripped. */
@@ -877,6 +1484,7 @@ function HunkBlock({
   ui,
   onAddComment,
   hideWhitespace = false,
+  ignoreEol = false,
   line,
 }: {
   path: string;
@@ -887,11 +1495,12 @@ function HunkBlock({
   ui: CommentUiState;
   onAddComment: (c: DraftComment) => void;
   hideWhitespace?: boolean;
+  ignoreEol?: boolean;
   line: LineRenderCtx;
 }) {
   const decorated = useMemo(
-    () => decorateHunk(hunk, lang, hideWhitespace),
-    [hunk, lang, hideWhitespace],
+    () => decorateHunk(ignoreEol ? ignoreLineEndings(hunk) : hunk, lang, hideWhitespace),
+    [hunk, lang, hideWhitespace, ignoreEol],
   );
 
   if (view === "split") {
@@ -907,29 +1516,157 @@ function HunkBlock({
     );
   }
 
-  // Big-diff perf (SAFE): let the browser skip layout/paint for off-screen
-  // hunks via `content-visibility:auto`, reserving an estimated height so the
-  // scrollbar stays stable. ~22px/row is a rough line-height estimate. No
-  // virtualization or logic change — purely a rendering hint.
-  const estHeight = Math.max(1, decorated.length) * 22;
   return (
-    <div
-      className="border-b border-border/20 [content-visibility:auto]"
-      style={{ containIntrinsicSize: `auto ${estHeight}px` }}
-    >
-      {decorated.map((row, i) => (
-        <RowUnified
-          key={i}
-          line={row}
-          path={path}
-          threads={threads}
-          ui={ui}
-          onAddComment={onAddComment}
-          render={line}
-        />
+    <div className="border-b border-border/20">
+      {chunked(decorated).map(({ start, rows }) => (
+        <RowChunk key={start} height={estimateRowsHeight(rows, line.charsPerLine, line.wrap)}>
+          {rows.map((row, i) => (
+            <RowUnified
+              key={start + i}
+              line={row}
+              path={path}
+              threads={threads}
+              ui={ui}
+              onAddComment={onAddComment}
+              render={line}
+            />
+          ))}
+        </RowChunk>
       ))}
     </div>
   );
+}
+
+/**
+ * Rows per `content-visibility` boundary. Hunk-sized boundaries aren't enough:
+ * a rewritten file is often a single hunk of a thousand-plus rows that is
+ * always partly on screen, so the browser never gets to skip any of it.
+ */
+const CHUNK_ROWS = 100;
+
+function chunked<T>(rows: T[]): { start: number; rows: T[] }[] {
+  const out: { start: number; rows: T[] }[] = [];
+  for (let start = 0; start < rows.length; start += CHUNK_ROWS) {
+    out.push({ start, rows: rows.slice(start, start + CHUNK_ROWS) });
+  }
+  return out;
+}
+
+/**
+ * Big-diff perf (SAFE): let the browser skip layout/paint for off-screen rows
+ * via `content-visibility:auto`, reserving an estimated height so the
+ * scrollbar stays stable. No virtualization or logic change — every row stays
+ * in the DOM for find, `data-line` lookups and selection; purely a rendering
+ * hint.
+ *
+ * `bg-background` is load-bearing, not cosmetic. A skipped subtree paints
+ * nothing, and every ancestor up to <html> is translucent (the macOS
+ * vibrancy setup in globals.css) over a `transparent: true` window whose
+ * base colour is #00000000. Without an opaque surface *inside* the
+ * containment boundary, a chunk that WebKit hasn't finished painting yet
+ * composites as window black — the flash seen when scrolling fast.
+ */
+function RowChunk({
+  height,
+  className,
+  children,
+}: {
+  height: number;
+  className?: string;
+  children: React.ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => (ref.current ? renderAhead(ref.current) : undefined), []);
+  return (
+    <div
+      ref={ref}
+      className={cn("bg-background [content-visibility:auto]", className)}
+      style={{ containIntrinsicSize: `auto ${height}px` }}
+    >
+      {children}
+    </div>
+  );
+}
+
+const ROW_LINE_HEIGHT = 18.6; // 12px * 1.55 leading
+const ROW_PADDING_Y = 4; // py-0.5, top + bottom
+
+/** One observer per scroll container, shared by every chunk inside it. */
+const renderAheadObservers = new WeakMap<Element, IntersectionObserver>();
+
+/**
+ * `content-visibility:auto` only starts laying out and painting a chunk once
+ * it reaches the viewport, and macOS scrolls on its own thread, so on a fast
+ * scroll the chunk arrives on screen as an empty background and its text pops
+ * in a few frames later. Force chunks within one screen-height of the
+ * viewport to render — a back buffer — and hand them back to `auto` (which
+ * remembers their real size) once they're far away again.
+ */
+function renderAhead(el: HTMLElement): () => void {
+  const root = scrollParent(el);
+  const key = root ?? document.documentElement;
+  let io = renderAheadObservers.get(key);
+  if (!io) {
+    io = new IntersectionObserver(
+      (entries) => {
+        for (const e of entries) {
+          (e.target as HTMLElement).style.contentVisibility = e.isIntersecting ? "visible" : "";
+        }
+      },
+      { root, rootMargin: "100% 0px" },
+    );
+    renderAheadObservers.set(key, io);
+  }
+  const observer = io;
+  observer.observe(el);
+  return () => observer.unobserve(el);
+}
+
+/**
+ * Height a run of rows will occupy once rendered, used only as the reserved
+ * size for `content-visibility:auto`.
+ *
+ * A row is one 12px/1.55 line box plus 4px of vertical padding (~22.6px), which
+ * is why the old flat `rows * 22` estimate was fine — but only while lines do
+ * not wrap. With `diffWrap` on (the default) a long prose line in a Markdown
+ * diff occupies several visual lines: measured against this component's own
+ * type ramp, a 600-char paragraph renders ~97px against the 22px reserved, so
+ * the block grew >4x the instant it scrolled into view. Every such reveal
+ * shifted content under the scroll offset and forced another layout+paint pass,
+ * which is what made fast scrolling drop frames.
+ */
+function estimateRowsHeight(rows: DecoratedLine[], charsPerLine: number, wrap: boolean): number {
+  if (!wrap || charsPerLine <= 0) {
+    return Math.max(1, rows.length) * (ROW_LINE_HEIGHT + ROW_PADDING_Y);
+  }
+  let total = 0;
+  for (const row of rows) total += rowHeight(row.text, charsPerLine);
+  return Math.max(1, Math.round(total));
+}
+
+function rowHeight(text: string, charsPerLine: number): number {
+  const visualLines = Math.max(1, Math.ceil(text.length / charsPerLine));
+  return visualLines * ROW_LINE_HEIGHT + ROW_PADDING_Y;
+}
+
+/**
+ * `estimateRowsHeight` for split view: each side gets roughly half the code
+ * width (a split half's chrome is ~56px narrower than a unified row's two
+ * halves combined), and a row is as tall as its taller side.
+ */
+function estimateSplitRowsHeight(rows: SplitRow[], ctx: LineRenderCtx): number {
+  const perSide = Math.floor(ctx.charsPerLine / 2) - 4;
+  if (!ctx.wrap || perSide <= 0) {
+    return Math.max(1, rows.length) * (ROW_LINE_HEIGHT + ROW_PADDING_Y);
+  }
+  let total = 0;
+  for (const r of rows) {
+    total += Math.max(
+      rowHeight(r.left?.text ?? "", perSide),
+      rowHeight(r.right?.text ?? "", perSide),
+    );
+  }
+  return Math.max(1, Math.round(total));
 }
 
 /* ───────────────────── selection helpers ───────────────────── */
@@ -1004,21 +1741,23 @@ function RowUnified({
   onAddComment: (c: DraftComment) => void;
   render: LineRenderCtx;
 }) {
+  const meta = useContext(ThreadMetaContext);
   const isHunk = line.kind === "hunk";
   const lineNum = line.newLine ?? line.oldLine;
   const side: Side = line.newLine != null ? "RIGHT" : "LEFT";
+  // Either side can land on a unified row: a context line carries both numbers.
+  const pendingHere = isHunk
+    ? []
+    : [
+        ...pendingAt(meta?.pending, "LEFT", line.oldLine),
+        ...pendingAt(meta?.pending, "RIGHT", line.newLine),
+      ];
   const matchingThreads = !isHunk
-    ? threads.filter(
-        (t) =>
-          t.path === path &&
-          ((side === "RIGHT" && t.line === line.newLine) ||
-            (side === "LEFT" && t.original_line === line.oldLine)),
-      )
+    ? threads.filter((t) => threadOnLine(meta, t, path, side, line))
     : [];
   const selected = isInRange(lineNum, side, ui);
   const isPopoverHere =
     ui.popoverAt != null && ui.popoverAt.side === side && ui.popoverAt.line === lineNum;
-  const canComment = lineNum != null;
 
   if (isHunk) {
     return <HunkHeaderBar text={line.text} gutter="w-24" />;
@@ -1026,33 +1765,36 @@ function RowUnified({
 
   return (
     <>
+      {/* No role/tabIndex on the row: `[role="button"] { user-select: none }`
+          (globals.css) would beat the inherited `text` from [data-selectable]
+          and make the diff unselectable. Keyboard commenting lives on the
+          CommentTrigger button instead, which is a real focusable button. */}
       <div
         data-line={line.newLine ?? undefined}
-        // Keyboard-focusable so a comment can be placed without the mouse:
-        // Enter (or space) opens the comment popover for this line.
-        tabIndex={canComment ? 0 : undefined}
-        role={canComment ? "button" : undefined}
-        aria-label={canComment ? `Line ${lineNum} — press Enter to comment` : undefined}
-        onKeyDown={
-          canComment
-            ? (e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  ui.open({ side, line: lineNum as number }, e.shiftKey);
-                }
-              }
-            : undefined
-        }
+        // Selection → "Ask AI" reads the file/line range off these (see lib/ai/attach).
+        // `data-line` stays new-line-only — focusLine/navComment need it unique.
+        data-diff-row=""
+        data-side={side}
+        data-new-line={line.newLine ?? undefined}
+        data-old-line={line.oldLine ?? undefined}
         className={cn(
-          "group flex outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-primary",
+          "group flex",
           selected ? "border-l-2 border-l-primary bg-primary/15" : lineBgClass(line.kind),
         )}
       >
-        <Gutter num={line.oldLine} side="LEFT" ui={ui} />
-        <Gutter num={line.newLine} side="RIGHT" ui={ui} />
-        <GutterSlot />
+        <Gutter
+          num={line.oldLine}
+          side="LEFT"
+          ui={canCommentAt(meta, "LEFT", line.oldLine) ? ui : undefined}
+        />
+        <Gutter
+          num={line.newLine}
+          side="RIGHT"
+          ui={canCommentAt(meta, "RIGHT", line.newLine) ? ui : undefined}
+        />
+        <GutterSlot pending={pendingHere.length} />
         <CommentTrigger
-          disabled={lineNum == null}
+          disabled={!canCommentAt(meta, side, lineNum)}
           onClick={(shift) => ui.open({ side, line: lineNum as number }, shift)}
         />
         <span
@@ -1077,9 +1819,9 @@ function RowUnified({
           // biome-ignore lint/security/noDangerouslySetInnerHtml: pre-sanitized via Prism / escapeHtml
           dangerouslySetInnerHTML={{ __html: line.html || "&nbsp;" }}
         />
-        {line.whitespaceOnly && (
-          <span className="shrink-0 self-center pr-1 text-[10px] text-muted-foreground/50">
-            whitespace
+        {collapsedLabel(line) && (
+          <span className="shrink-0 self-center pr-1 text-3xs text-muted-foreground/50">
+            {collapsedLabel(line)}
           </span>
         )}
         <CopyLineButton text={line.text} />
@@ -1095,6 +1837,7 @@ function RowUnified({
         />
       )}
       {matchingThreads.length > 0 && <ThreadsBlock threads={matchingThreads} />}
+      {pendingHere.length > 0 && <PendingBlock comments={pendingHere} />}
     </>
   );
 }
@@ -1141,39 +1884,49 @@ function SplitHunk({
   line: LineRenderCtx;
 }) {
   const rows = useMemo(() => toSplitDecorated(lines), [lines]);
+  // Chunked split rows, so a del/add pair never straddles two grids.
   return (
-    <div className="grid grid-cols-2 divide-x divide-border/20 border-b border-border/20">
-      {rows.map((row, i) => {
-        if (row.left?.kind === "hunk") {
-          return (
-            <div key={i} className="col-span-2">
-              <HunkHeaderBar text={row.left.text} />
-            </div>
-          );
-        }
-        return (
-          <div key={i} className="col-span-2 contents">
-            <Half
-              line={row.left}
-              side="LEFT"
-              path={path}
-              threads={threads}
-              ui={ui}
-              onAddComment={onAddComment}
-              render={render}
-            />
-            <Half
-              line={row.right}
-              side="RIGHT"
-              path={path}
-              threads={threads}
-              ui={ui}
-              onAddComment={onAddComment}
-              render={render}
-            />
-          </div>
-        );
-      })}
+    <div className="border-b border-border/20">
+      {chunked(rows).map(({ start, rows: chunk }) => (
+        <RowChunk
+          key={start}
+          height={estimateSplitRowsHeight(chunk, render)}
+          className="grid grid-cols-2 divide-x divide-border/20"
+        >
+          {chunk.map((row, j) => {
+            const i = start + j;
+            if (row.left?.kind === "hunk") {
+              return (
+                <div key={i} className="col-span-2">
+                  <HunkHeaderBar text={row.left.text} />
+                </div>
+              );
+            }
+            return (
+              <div key={i} className="col-span-2 contents">
+                <Half
+                  line={row.left}
+                  side="LEFT"
+                  path={path}
+                  threads={threads}
+                  ui={ui}
+                  onAddComment={onAddComment}
+                  render={render}
+                />
+                <Half
+                  line={row.right}
+                  side="RIGHT"
+                  path={path}
+                  threads={threads}
+                  ui={ui}
+                  onAddComment={onAddComment}
+                  render={render}
+                />
+              </div>
+            );
+          })}
+        </RowChunk>
+      ))}
     </div>
   );
 }
@@ -1214,47 +1967,35 @@ function Half({
   onAddComment: (c: DraftComment) => void;
   render: LineRenderCtx;
 }) {
+  const meta = useContext(ThreadMetaContext);
   if (!line) {
     return <div className="border-l-2 border-transparent bg-foreground/[0.03]" />;
   }
   const lineNum = side === "RIGHT" ? line.newLine : line.oldLine;
-  const matchingThreads = threads.filter(
-    (t) =>
-      t.path === path &&
-      ((side === "RIGHT" && t.line === line.newLine) ||
-        (side === "LEFT" && t.original_line === line.oldLine)),
-  );
+  const pendingHere = pendingAt(meta?.pending, side, lineNum);
+  const matchingThreads = threads.filter((t) => threadOnLine(meta, t, path, side, line));
   const selected = isInRange(lineNum, side, ui);
   const isPopoverHere =
     ui.popoverAt != null && ui.popoverAt.side === side && ui.popoverAt.line === lineNum;
-  const canComment = lineNum != null;
 
   return (
     <div className="min-w-0">
+      {/* See RowUnified: no role="button" here, or the row stops being selectable. */}
       <div
         data-line={side === "RIGHT" ? (line.newLine ?? undefined) : undefined}
-        tabIndex={canComment ? 0 : undefined}
-        role={canComment ? "button" : undefined}
-        aria-label={canComment ? `Line ${lineNum} — press Enter to comment` : undefined}
-        onKeyDown={
-          canComment
-            ? (e) => {
-                if (e.key === "Enter" || e.key === " ") {
-                  e.preventDefault();
-                  ui.open({ side, line: lineNum as number }, e.shiftKey);
-                }
-              }
-            : undefined
-        }
+        data-diff-row=""
+        data-side={side}
+        data-new-line={line.newLine ?? undefined}
+        data-old-line={line.oldLine ?? undefined}
         className={cn(
-          "group flex outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-primary",
+          "group flex",
           selected ? "border-l-2 border-l-primary bg-primary/15" : lineBgClass(line.kind),
         )}
       >
-        <Gutter num={lineNum} side={side} ui={ui} />
-        <GutterSlot />
+        <Gutter num={lineNum} side={side} ui={canCommentAt(meta, side, lineNum) ? ui : undefined} />
+        <GutterSlot pending={pendingHere.length} />
         <CommentTrigger
-          disabled={lineNum == null}
+          disabled={!canCommentAt(meta, side, lineNum)}
           onClick={(shift) => ui.open({ side, line: lineNum as number }, shift)}
         />
         <pre
@@ -1265,6 +2006,11 @@ function Half({
           // biome-ignore lint/security/noDangerouslySetInnerHtml: Prism output
           dangerouslySetInnerHTML={{ __html: line.html || "&nbsp;" }}
         />
+        {side === "RIGHT" && collapsedLabel(line) && (
+          <span className="shrink-0 self-center pr-1 text-3xs text-muted-foreground/50">
+            {collapsedLabel(line)}
+          </span>
+        )}
         <CopyLineButton text={line.text} />
       </div>
       {isPopoverHere && (
@@ -1278,11 +2024,37 @@ function Half({
         />
       )}
       {matchingThreads.length > 0 && <ThreadsBlock threads={matchingThreads} />}
+      {pendingHere.length > 0 && <PendingBlock comments={pendingHere} />}
     </div>
   );
 }
 
 /* ───────────────────── pieces ───────────────────── */
+
+/** Whether a line takes a new review comment (see `Props.commentableRight`). */
+function canCommentAt(
+  meta: ThreadMeta | null,
+  side: Side,
+  line: number | null | undefined,
+): boolean {
+  if (line == null) return false;
+  const only = meta?.commentableRight;
+  if (!only) return true;
+  return side === "RIGHT" && only.has(line);
+}
+
+/** Old-side threads sit on the PR base's line numbers; hide them over another diff. */
+function threadOnLine(
+  meta: ThreadMeta | null,
+  t: ReviewThread,
+  path: string,
+  side: Side,
+  line: DiffLine,
+): boolean {
+  if (t.path !== path) return false;
+  if (side === "RIGHT") return t.line === line.newLine;
+  return !meta?.commentableRight && t.original_line === line.oldLine;
+}
 
 function Gutter({
   num,
@@ -1335,7 +2107,7 @@ function CommentTrigger({
         type="button"
         onClick={(e) => onClick(e.shiftKey)}
         className="absolute inset-0 m-auto flex h-4 w-4 items-center justify-center rounded text-primary opacity-0 hover:bg-primary/20 hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-1 focus-visible:ring-primary group-hover:opacity-80"
-        aria-label="Add comment (shift-click to extend range)"
+        aria-label="Add comment (shift-click, or shift+Enter, to extend range)"
       >
         <MessageSquarePlus className="size-3" />
       </button>
@@ -1352,9 +2124,24 @@ function CommentPopover({
   ui: CommentUiState;
   onSubmit: (c: DraftComment) => void;
 }) {
+  const meta = useContext(ThreadMetaContext);
   const r = rangeBounds(ui);
   if (!r) return null;
   const multi = r.from !== r.to;
+
+  // The same "pin this range to the chat" action the selection toolbar offers,
+  // reachable here without a mouse drag over the code itself.
+  function askAi(range: { side: Side; from: number; to: number }) {
+    if (!meta) return;
+    const code = buildSnippet(meta.patch, range.side, range.from, range.to, meta.fileLines);
+    attachContext(
+      `${meta.owner}/${meta.repo}#${meta.number}`,
+      refFromLines(path, range.side, range.from, range.to, code),
+    );
+    ui.close();
+    meta.onAskAi?.();
+  }
+
   return (
     <div className="mx-2 my-1.5 rounded-md border border-border/40 bg-popover/95 px-4 py-3 font-sans shadow-md backdrop-blur-xl">
       {/* The same Composer used in the Conversation tab — with a line chip in
@@ -1368,9 +2155,45 @@ function CommentPopover({
         onSubmit={(b) => onSubmit(buildComment(path, r, b))}
         header={
           <>
-            <span className="rounded-md bg-primary/15 px-1.5 py-0.5 font-mono text-[11px] font-medium text-primary">
+            <span className="rounded-md bg-primary/15 px-1.5 py-0.5 font-mono text-2xs font-medium text-primary">
               {multi ? `Lines ${r.from}–${r.to}` : `Line ${r.from}`}
             </span>
+            {meta?.onAskAi && (
+              <button
+                type="button"
+                onClick={() => askAi(r)}
+                className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-2xs font-medium text-muted-foreground/70 transition-colors hover:bg-primary/10 hover:text-primary"
+              >
+                <Sparkles className="size-3" />
+                Ask AI
+              </button>
+            )}
+            {meta?.onPeek && (
+              <button
+                type="button"
+                onClick={() => {
+                  meta.onPeek?.(r.from);
+                  ui.close();
+                }}
+                className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-2xs font-medium text-muted-foreground/70 transition-colors hover:bg-primary/10 hover:text-primary"
+              >
+                <PanelRight className="size-3" />
+                Open in context
+              </button>
+            )}
+            {meta?.onOpenInEditor && (
+              <button
+                type="button"
+                onClick={() => {
+                  meta.onOpenInEditor?.(r.from);
+                  ui.close();
+                }}
+                className="inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-2xs font-medium text-muted-foreground/70 transition-colors hover:bg-primary/10 hover:text-primary"
+              >
+                <SquarePen className="size-3" />
+                Open in editor
+              </button>
+            )}
             {!multi && (
               <span className="inline-flex items-center gap-1 text-muted-foreground/55">
                 Shift-click another <MessageSquarePlus className="size-3" /> to extend
@@ -1401,6 +2224,95 @@ function buildComment(
   };
 }
 
+/** Pending comments anchored at `line` on `side`. A draft with no side is RIGHT,
+ * as GitHub defaults it. Multi-line drafts anchor at their last line. */
+function pendingAt(
+  pending: PendingComment[] | undefined,
+  side: Side,
+  line: number | null | undefined,
+): PendingComment[] {
+  if (!pending || line == null) return [];
+  return pending.filter((c) => c.line === line && (c.side ?? "RIGHT") === side);
+}
+
+/** Not-yet-submitted review comments under their line, editable in place. */
+function PendingBlock({ comments }: { comments: PendingComment[] }) {
+  return (
+    <div className="space-y-2 px-10 py-2.5 font-sans">
+      {comments.map((c) => (
+        <PendingCommentCard key={c.id} comment={c} />
+      ))}
+    </div>
+  );
+}
+
+function PendingCommentCard({ comment: c }: { comment: PendingComment }) {
+  const meta = useContext(ThreadMetaContext);
+  const [editing, setEditing] = useState(false);
+  const range =
+    c.start_line != null && c.start_line !== c.line
+      ? `Lines ${c.start_line}–${c.line}`
+      : `Line ${c.line}`;
+  const header = (
+    <>
+      <span className="rounded-md bg-primary/15 px-1.5 py-0.5 text-2xs font-medium text-primary">
+        Pending
+      </span>
+      <span className="font-mono text-2xs text-muted-foreground">{range}</span>
+    </>
+  );
+
+  if (editing && meta) {
+    return (
+      <Composer
+        autoFocus
+        className="mx-auto max-w-3xl"
+        initialValue={c.body}
+        submitLabel="Save"
+        header={header}
+        onCancel={() => setEditing(false)}
+        onSubmit={(body) => {
+          meta.onEditPending(c.id)(body);
+          setEditing(false);
+        }}
+      />
+    );
+  }
+
+  return (
+    <div className="rounded-lg border border-dashed border-primary/40 bg-primary/[0.04] p-3 text-xs">
+      <div className="mb-1.5 flex items-center gap-2">
+        {header}
+        {meta && (
+          <div className="ml-auto flex items-center gap-0.5">
+            <TooltipFor label="Edit">
+              <button
+                type="button"
+                onClick={() => setEditing(true)}
+                className="rounded p-1 text-muted-foreground/70 transition-colors hover:bg-foreground/[0.07] hover:text-foreground"
+                aria-label="Edit pending comment"
+              >
+                <Pencil className="size-3" />
+              </button>
+            </TooltipFor>
+            <TooltipFor label="Delete">
+              <button
+                type="button"
+                onClick={() => meta.onRemovePending(c)}
+                className="rounded p-1 text-muted-foreground/70 transition-colors hover:bg-destructive/10 hover:text-destructive"
+                aria-label="Delete pending comment"
+              >
+                <Trash2 className="size-3" />
+              </button>
+            </TooltipFor>
+          </div>
+        )}
+      </div>
+      <MarkdownBody>{c.body}</MarkdownBody>
+    </div>
+  );
+}
+
 function ThreadsBlock({ threads }: { threads: ReviewThread[] }) {
   const meta = useContext(ThreadMetaContext);
 
@@ -1421,7 +2333,7 @@ function ThreadsBlock({ threads }: { threads: ReviewThread[] }) {
   const ungrouped = threads.filter((t) => !grouped.has(t.id));
 
   return (
-    <div className="space-y-2 px-10 py-2.5 font-sans backdrop-blur-md">
+    <div className="space-y-2 px-10 py-2.5 font-sans">
       {meta &&
         groups.map(({ thread, comments }) => (
           <ReviewThreadGroup
@@ -1445,7 +2357,7 @@ function ThreadsBlock({ threads }: { threads: ReviewThread[] }) {
                 timestamp={t.created_at}
                 avatarClassName="size-4"
               />
-              <MarkdownBody className="text-xs">{t.body}</MarkdownBody>
+              <MarkdownBody remoteImages>{t.body}</MarkdownBody>
               {meta && (
                 <div className="mt-1.5">
                   <ReactionsBar

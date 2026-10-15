@@ -211,7 +211,7 @@ export function RepoQuickOpen({
           )}
         </div>
 
-        <div className="flex items-center justify-between border-t border-hairline px-3 py-1.5 text-[10px] text-muted-foreground/55">
+        <div className="flex items-center justify-between border-t border-hairline px-3 py-1.5 text-3xs text-muted-foreground/55">
           <span>↑↓ navigate · esc close</span>
           <span className="inline-flex items-center gap-1">
             <CornerDownLeft className="size-3" /> open

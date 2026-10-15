@@ -62,7 +62,7 @@ export function PinboardBar() {
   return (
     <div className="group/pinbar border-t border-hairline bg-background/95 shadow-[0_-1px_0_rgba(255,255,255,0.04)] backdrop-blur-xl">
       <div className="flex h-8 items-center gap-2 px-2.5">
-        <div className="inline-flex h-5 shrink-0 items-center gap-1 rounded-md bg-foreground/[0.07] px-1.5 text-[11px] font-medium tabular-nums text-muted-foreground">
+        <div className="inline-flex h-5 shrink-0 items-center gap-1 rounded-md bg-foreground/[0.07] px-1.5 text-2xs font-medium tabular-nums text-muted-foreground">
           <Pin className="size-3" />
           <span>{items.length}</span>
         </div>
@@ -89,11 +89,11 @@ export function PinboardBar() {
                         )}
                       >
                         <Icon className={cn("size-3 shrink-0", iconTone)} />
-                        <span className="shrink-0 text-[11px] font-medium text-foreground">
+                        <span className="shrink-0 text-2xs font-medium text-foreground">
                           {item.label}
                         </span>
                         {item.hint && (
-                          <span className="truncate text-[11px] text-muted-foreground/75">
+                          <span className="truncate text-2xs text-muted-foreground/75">
                             {item.hint}
                           </span>
                         )}
