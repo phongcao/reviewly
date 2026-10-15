@@ -686,7 +686,8 @@ function PRDetail() {
         setLastEditorTargetId(target.id);
       } catch {
         toast.error(`Couldn't open ${target.label}`, {
-          description: "The editor may have been removed or renamed.",
+          description:
+            "The file may not be in your local clone, or the editor may have been removed or renamed.",
         });
       }
     },
@@ -2449,7 +2450,7 @@ function Conversation({
             />
           ) : (
             <>
-              <MarkdownBody>{description ?? ""}</MarkdownBody>
+              <MarkdownBody remoteImages>{description ?? ""}</MarkdownBody>
               <div className="mt-2.5">
                 <ReactionsBar
                   target="issue"
@@ -2503,7 +2504,7 @@ function Conversation({
                   </span>
                 }
               />
-              {r.body && <MarkdownBody>{r.body}</MarkdownBody>}
+              {r.body && <MarkdownBody remoteImages>{r.body}</MarkdownBody>}
               <div className="mt-2.5">
                 <ReactionsBar
                   target="review"
@@ -2520,7 +2521,7 @@ function Conversation({
           {visibleComments.map((c) => (
             <article key={c.id} className="rounded-xl border border-hairline bg-card/50 p-4">
               <CommentByline className="mb-2" user={c.user} timestamp={c.created_at} />
-              <MarkdownBody>{c.body}</MarkdownBody>
+              <MarkdownBody remoteImages>{c.body}</MarkdownBody>
               <div className="mt-2.5">
                 <ReactionsBar
                   target="issue_comment"
@@ -2868,8 +2869,8 @@ function CheckDetail({ run, owner, repo }: { run: CheckRun; owner: string; repo:
       {run.output?.title && (
         <p className="text-xs font-medium text-foreground">{run.output.title}</p>
       )}
-      {summary && <MarkdownBody>{summary}</MarkdownBody>}
-      {text && text !== summary && <MarkdownBody>{text}</MarkdownBody>}
+      {summary && <MarkdownBody remoteImages>{summary}</MarkdownBody>}
+      {text && text !== summary && <MarkdownBody remoteImages>{text}</MarkdownBody>}
 
       {jobId != null &&
         (job.isLoading ? (

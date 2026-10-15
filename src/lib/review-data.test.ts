@@ -64,6 +64,18 @@ describe("parseBundle", () => {
     expect(Object.keys(parsed.prs)).toEqual(["o/r#2"]);
   });
 
+  it("keeps only PR-shaped keys, so `__proto__` can't swap the result's prototype", () => {
+    // JSON.parse makes `__proto__` an own key; a plain object literal wouldn't.
+    const raw = JSON.stringify(bundle({ "o/r#2": { deepTour: deepEntry(2) } })).replace(
+      '"prs":{',
+      `"prs":{"__proto__":{"deepTour":${JSON.stringify(deepEntry(3))}},"not a key":{"deepTour":${JSON.stringify(deepEntry(4))}},`,
+    );
+    expect(raw).toContain('"__proto__"');
+    const parsed = parseBundle(raw);
+    expect(Object.keys(parsed.prs)).toEqual(["o/r#2"]);
+    expect(Object.getPrototypeOf(parsed.prs)).toBe(Object.prototype);
+  });
+
   it("throws when nothing usable survives, so the UI can say why", () => {
     const raw = JSON.stringify(bundle({ "o/r#1": {} }));
     expect(() => parseBundle(raw)).toThrow(/no usable review data/);

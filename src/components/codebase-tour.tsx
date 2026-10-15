@@ -41,8 +41,9 @@ import {
 } from "@/lib/guided";
 import { detectLanguage, highlightLine } from "@/lib/lang";
 import { repoCoverage } from "@/lib/repo-coverage";
+import { HEAD_LINES } from "@/lib/repo-structure";
 import { buildRepoTourJobs, mergeRepoTour, parseRepoTourKey, pendingLayers } from "@/lib/repo-tour";
-import { type RepoInfo, invoke } from "@/lib/tauri";
+import { type FileHead, type RepoInfo, invoke } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
 import { useRepoExplain } from "@/stores/repo-explain";
 import type { RepoMapEntry } from "@/stores/repo-map";
@@ -174,10 +175,10 @@ export function CodebaseTour({
   const heads = useQuery({
     queryKey: ["repo-heads", root, headSha],
     queryFn: () =>
-      invoke<{ path: string; text: string }[]>("read_file_heads", {
+      invoke<FileHead[]>("read_file_heads", {
         path: root,
         files: entry.modules.flatMap((m) => m.files),
-        maxLines: 200,
+        maxLines: HEAD_LINES,
       }),
     enabled: !!tour,
     staleTime: Number.POSITIVE_INFINITY,
@@ -810,7 +811,8 @@ function SourceExcerpt({
   const abs = `${root}/${path}`;
   const file = useQuery({
     queryKey: ["file", abs],
-    queryFn: () => invoke<string>("read_file", { path: abs }),
+    // The path came from the model: keep the read inside the clone.
+    queryFn: () => invoke<string>("read_file", { path: abs, root }),
     retry: false,
     staleTime: 30_000,
   });

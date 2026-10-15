@@ -2357,7 +2357,7 @@ function ThreadsBlock({ threads }: { threads: ReviewThread[] }) {
                 timestamp={t.created_at}
                 avatarClassName="size-4"
               />
-              <MarkdownBody>{t.body}</MarkdownBody>
+              <MarkdownBody remoteImages>{t.body}</MarkdownBody>
               {meta && (
                 <div className="mt-1.5">
                   <ReactionsBar

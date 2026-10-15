@@ -12,11 +12,73 @@ function loadMermaid(): Promise<Mermaid> {
   return loader;
 }
 
+/**
+ * Config keys a diagram's `%%{init}%%` directive may not change: mermaid's own
+ * defaults plus the ones that would let it load a URL — `themeCSS` and
+ * `themeVariables` take CSS `url()`, and `dompurifyConfig` could re-allow
+ * images in labels.
+ */
+const SECURE_KEYS = [
+  "secure",
+  "securityLevel",
+  "startOnLoad",
+  "maxTextSize",
+  "suppressErrorRendering",
+  "maxEdges",
+  "dompurifyConfig",
+  "themeCSS",
+  "themeVariables",
+  "fontFamily",
+  "altFontFamily",
+  "htmlLabels",
+];
+
+/**
+ * What a label's HTML may hold. `securityLevel: "strict"` only strips scripts
+ * and DOMPurify's defaults keep `<img>`, `<video poster>`, SVG `<image>` and
+ * `style` attributes, each of which loads a URL while mermaid measures the
+ * label, before the SVG ever reaches the page. Diagram text can come from the
+ * model, so that URL could carry repo content off the machine.
+ */
+const LABEL_HTML = {
+  ALLOWED_TAGS: [
+    "b",
+    "strong",
+    "i",
+    "em",
+    "u",
+    "s",
+    "del",
+    "ins",
+    "mark",
+    "small",
+    "sub",
+    "sup",
+    "code",
+    "br",
+    "span",
+    "div",
+    "p",
+  ],
+  ALLOWED_ATTR: ["class"],
+};
+
+/** An `@{ img: … }` image node: mermaid fetches it while laying out. */
+const IMAGE_NODE_RE = /@\{[^}]*\bimg\b/i;
+
+/** Throw for a diagram that would load a remote image. */
+function refuseRemoteImages(text: string): void {
+  if (IMAGE_NODE_RE.test(text)) {
+    throw new Error("Image nodes aren't shown: they would load a URL from the diagram text.");
+  }
+}
+
 // `mermaid.initialize` is global state, so renders are serialized: each one
 // sets its theme and renders before the next may touch the config.
 let queue: Promise<unknown> = Promise.resolve();
 function renderDiagram(id: string, text: string, theme: "light" | "dark"): Promise<string> {
   const run = queue.then(async () => {
+    refuseRemoteImages(text);
     const mermaid = await loadMermaid();
     // Mermaid sizes node boxes by measuring label text, so it needs the real
     // font (a `var()` doesn't resolve there) and that font must be loaded —
@@ -30,6 +92,8 @@ function renderDiagram(id: string, text: string, theme: "light" | "dark"): Promi
       // Diagram source comes from PR content — keep mermaid's own sanitizing,
       // no click handlers or script-bearing labels.
       securityLevel: "strict",
+      secure: SECURE_KEYS,
+      dompurifyConfig: LABEL_HTML,
       theme: theme === "light" ? "default" : "dark",
       fontFamily: fontFamily || undefined,
       // Throw on bad syntax instead of injecting mermaid's error SVG into <body>.

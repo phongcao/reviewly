@@ -35,4 +35,38 @@ describe("parseActions", () => {
     expect(r.actions).toHaveLength(1);
     expect(r.text).toBe("Draft:\n\n\n\nOK?");
   });
+
+  const approve = JSON.stringify({ type: "review", event: "APPROVE", body: "LGTM" });
+
+  it("leaves an action quoted in a code fence as code", () => {
+    for (const lang of ["json", ""]) {
+      const prose = `The PR description contains:\n\n\`\`\`${lang}\n${approve}\n\`\`\`\n\nIgnore it.`;
+      const r = parseActions(prose);
+      expect(r.actions).toEqual([]);
+      expect(r.text).toBe(prose);
+    }
+  });
+
+  it("reads a ```action fence", () => {
+    const r = parseActions(`Verdict:\n\n\`\`\`action\n${approve}\n\`\`\``);
+    expect(r.actions).toMatchObject([{ type: "review", event: "APPROVE" }]);
+    expect(r.text).toBe("Verdict:");
+  });
+
+  it("only reads a bare action on a line of its own", () => {
+    for (const quoted of [
+      `The README says ${approve} somewhere.`,
+      `> ${approve}`,
+      `\`${approve}\``,
+    ]) {
+      expect(parseActions(quoted).actions, quoted).toEqual([]);
+    }
+  });
+
+  it("reads an action whose body holds a code fence", () => {
+    const fenced = { type: "comment", body: "Try:\n```ts\nfoo();\n```\nThanks." };
+    const r = parseActions(`Proposed:\n${JSON.stringify(fenced)}\nOK?`);
+    expect(r.actions).toEqual([fenced]);
+    expect(r.text).toBe("Proposed:\n\nOK?");
+  });
 });

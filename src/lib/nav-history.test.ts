@@ -1,5 +1,5 @@
+import { NAV_CAP, type NavEntry, emptyNav, navKey, recordNav, stepNav } from "@/lib/nav-history";
 import { describe, expect, it } from "vitest";
-import { NAV_CAP, type NavEntry, emptyNav, navKey, recordNav, stepNav } from "./nav-history";
 
 const tour: NavEntry = { view: "guided", file: null };
 const file = (f: string, view: NavEntry["view"] = "unified"): NavEntry => ({ view, file: f });

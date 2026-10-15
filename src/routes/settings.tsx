@@ -19,11 +19,10 @@ import {
   BundleError,
   type BundleStats,
   applyBundle,
-  bundleFilename,
   bundleStats,
   collectBundle,
-  readBundle,
-  writeBundle,
+  exportBundle,
+  importBundle,
 } from "@/lib/review-data";
 import { invoke } from "@/lib/tauri";
 import { cn } from "@/lib/utils";
@@ -48,7 +47,6 @@ import { useReviewPrefs } from "@/stores/review-prefs";
 import { useTheme } from "@/stores/theme";
 import { useUi } from "@/stores/ui";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { open, save } from "@tauri-apps/plugin-dialog";
 import {
   Bell,
   Check,
@@ -1123,15 +1121,10 @@ function ReviewDataSection() {
         toast.info("Nothing to export yet — review a PR first.");
         return;
       }
-      const path = await save({
-        title: "Export review data",
-        defaultPath: bundleFilename(),
-        filters: [{ name: "Reviewly review data", extensions: ["json"] }],
-      });
-      if (!path) return;
-      await writeBundle(path, bundle);
+      const name = await exportBundle(bundle);
+      if (!name) return;
       const s = bundleStats(bundle);
-      toast.success(`Exported ${countLabel(s)} to ${basename(path)}`);
+      toast.success(`Exported ${countLabel(s)} to ${name}`);
     } catch (e) {
       toast.error(`Export failed — ${String(e)}`);
     } finally {
@@ -1142,13 +1135,8 @@ function ReviewDataSection() {
   async function importData() {
     setBusy("import");
     try {
-      const picked = await open({
-        title: "Import review data",
-        multiple: false,
-        filters: [{ name: "Reviewly review data", extensions: ["json"] }],
-      });
-      if (!picked || typeof picked !== "string") return;
-      const bundle = await readBundle(picked);
+      const bundle = await importBundle();
+      if (!bundle) return;
       const r = applyBundle(bundle);
       const landed = r.deepTours + r.guidedTours + r.layerPlans + r.viewedKeys + r.checks;
       if (landed === 0) {
@@ -1217,12 +1205,6 @@ function ReviewDataSection() {
 
 function plural(n: number, word: string): string {
   return n === 1 ? word : `${word}s`;
-}
-
-/** Last path segment, for the toast. Split on both separators — the save dialog
- * hands back backslashes on Windows. */
-function basename(path: string): string {
-  return path.split(/[/\\]/).pop() ?? path;
 }
 
 /** "3 deep tours (214 stops)" — the stop count is what makes the size real. */

@@ -13,7 +13,10 @@ import type { CoverageBucket } from "@/lib/coverage";
 import type { GuidedVerdict, StepKind } from "@/lib/guided";
 import type { ReportStep, ReviewReport } from "@/lib/report";
 
-export const REPORT_CSP = "default-src 'none'; style-src 'unsafe-inline'; img-src data:";
+// `form-action` and `base-uri` don't fall back to `default-src`, so they're
+// spelled out: no form posts, and no `<base>` re-pointing relative URLs.
+export const REPORT_CSP =
+  "default-src 'none'; style-src 'unsafe-inline'; img-src data:; form-action 'none'; base-uri 'none'";
 
 /** Escape text for an HTML text node or a double-quoted attribute. */
 export function esc(s: string): string {
@@ -78,7 +81,19 @@ const fmtDate = (ms: number): string =>
 
 const safeUrl = (u: string): string | null => (/^https?:\/\//i.test(u) ? u : null);
 
-const chip = (cls: string, text: string): string => `<span class="chip ${cls}">${esc(text)}</span>`;
+/**
+ * A value as a class-name token: letters, digits, `_` and `-` only. Kinds,
+ * grades and verdicts are enums when the app makes them, but a report can be
+ * built from an imported bundle, where they are whatever the file says.
+ */
+const token = (v: unknown): string => String(v).replace(/[^\w-]/g, "");
+
+/** A number from the report, or nothing — same reason as `token`. */
+const num = (v: unknown): string => (typeof v === "number" && Number.isFinite(v) ? String(v) : "");
+
+/** A label chip. `text` is a lookup by one of those values, so it may be missing. */
+const chip = (cls: string, text: string | undefined): string =>
+  `<span class="chip ${token(cls)}">${esc(text ?? "")}</span>`;
 
 function stepHtml(s: ReportStep): string {
   const loc = `${s.path}:${s.line}${s.endLine ? `-${s.endLine}` : ""}`;
@@ -112,10 +127,12 @@ function stepHtml(s: ReportStep): string {
     const rows = s.check.claims
       .map(
         (c) =>
-          `<li class="claim c-${c.verdict}"><span class="verdict">${esc(c.verdict)}</span> ${inline(c.text)}${
+          `<li class="claim c-${token(c.verdict)}"><span class="verdict">${esc(c.verdict)}</span> ${inline(c.text)}${
             c.note ? `<span class="muted"> — ${inline(c.note)}</span>` : ""
           }${c.downgraded ? `<span class="muted"> (${esc(c.downgraded)})</span>` : ""}${
-            c.path && c.line != null ? ` <code class="loc">${esc(c.path)}:${c.line}</code>` : ""
+            c.path && c.line != null
+              ? ` <code class="loc">${esc(c.path)}:${num(c.line)}</code>`
+              : ""
           }</li>`,
       )
       .join("");
@@ -170,7 +187,7 @@ export function renderReportHtml(report: ReviewReport, opts?: { diagramSvg?: str
   // 3. Partial banner.
   if (tour.layersToured && tour.layersToured.done < tour.layersToured.total) {
     out.push(
-      `<div class="banner warn" id="partial">Partial tour: ${tour.layersToured.done} of ${tour.layersToured.total} layers toured. Files in the other layers are listed as pending.</div>`,
+      `<div class="banner warn" id="partial">Partial tour: ${num(tour.layersToured.done)} of ${num(tour.layersToured.total)} layers toured. Files in the other layers are listed as pending.</div>`,
     );
   }
 
@@ -218,7 +235,7 @@ ${
     const items = report.layers
       .map(
         (l) =>
-          `<li><strong>${l.index}. ${inline(l.title)}</strong> ${chip(`r-${l.risk}`, `${l.risk} risk`)}${
+          `<li><strong>${num(l.index)}. ${inline(l.title)}</strong> ${chip(`r-${l.risk}`, `${l.risk} risk`)}${
             l.toured ? "" : ` ${chip("t-unchecked", "not toured")}`
           }<br>${inline(l.intent)}${
             l.focus.length ? `<ul>${l.focus.map((f) => `<li>${inline(f)}</li>`).join("")}</ul>` : ""

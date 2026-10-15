@@ -11,11 +11,14 @@ import { FileCode } from "lucide-react";
 const IMAGE_RE = /\.(png|jpe?g|gif|webp|svg|bmp|avif|ico)$/i;
 
 export function RepoCodeView({
+  root,
   path,
   line,
   lineNonce,
   preview,
 }: {
+  /** The clone `path` is in; reads are refused outside it. */
+  root: string;
   path: string | null;
   /** 1-based line to scroll to and mark — set by the Explain tab. */
   line?: number | null;
@@ -28,14 +31,14 @@ export function RepoCodeView({
   const isImage = !!path && IMAGE_RE.test(path);
   const file = useQuery({
     queryKey: ["file", path],
-    queryFn: () => invoke<string>("read_file", { path: path as string }),
+    queryFn: () => invoke<string>("read_file", { path: path as string, root }),
     enabled: !!path && !isImage,
     retry: false,
     staleTime: 30_000,
   });
   const image = useQuery({
     queryKey: ["file-image", path],
-    queryFn: () => invoke<string>("read_file_data_url", { path: path as string }),
+    queryFn: () => invoke<string>("read_file_data_url", { path: path as string, root }),
     enabled: isImage,
     retry: false,
     staleTime: 30_000,

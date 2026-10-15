@@ -34,13 +34,13 @@ export async function loadEdgeTexts(files: PullFile[], cwd: string | null): Prom
   const worker = async () => {
     for (let f = queue.shift(); f; f = queue.shift()) {
       const file = f;
-      await invoke<string>("read_file", { path: `${cwd}/${file.filename}` })
+      await invoke<string>("read_file", { path: file.filename, root: cwd })
         .then((t) => texts.set(file.filename, t))
         .catch(() => {});
     }
   };
   await Promise.all(Array.from({ length: READ_CONCURRENCY }, worker));
-  const tsconfig = await invoke<string>("read_file", { path: `${cwd}/tsconfig.json` }).catch(
+  const tsconfig = await invoke<string>("read_file", { path: "tsconfig.json", root: cwd }).catch(
     () => "",
   );
   const fromConfig = tsconfig ? aliasesFromTsconfig(tsconfig) : {};

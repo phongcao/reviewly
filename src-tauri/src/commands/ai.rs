@@ -184,20 +184,27 @@ fn add_effort(cmd: &mut Command, effort: Option<&str>) {
 /// older ones.
 const CLAUDE_REPO_TOOLS: [&str; 4] = ["Read", "Grep", "Glob", "LS"];
 
+/// `--allowedTools` rules for `CLAUDE_REPO_TOOLS`: reads under the working
+/// directory (the clone) only. `Read` rules also govern Grep and Glob. A bare
+/// `Read` would approve any path, so text in the PR could have the model open
+/// `~/.ssh` and quote it back; with this rule and `dontAsk` (see
+/// `add_claude_tools`), a read outside the clone is denied.
+const CLAUDE_REPO_RULES: [&str; 1] = ["Read(./**)"];
+
 /// Claude's web tools, offered to the chat only — reviews stay repo-only.
 const CLAUDE_WEB_TOOLS: [&str; 2] = ["WebSearch", "WebFetch"];
 
 /// The only hosts the chat's WebFetch may read: official docs and package
 /// registries. A fetch is a request whose URL the model writes, so an open
 /// WebFetch could be talked (by a page, or by text in the PR) into carrying
-/// diff content to any server. Hosts match exactly — list subdomains too.
-const WEB_FETCH_DOMAINS: [&str; 21] = [
+/// diff content to any server. Hosts match exactly — list subdomains too. No
+/// host anyone can publish to (github.com, raw.githubusercontent.com): a page
+/// there is as untrusted as the PR.
+const WEB_FETCH_DOMAINS: [&str; 19] = [
     "learn.microsoft.com",
     "azure.microsoft.com",
     "devblogs.microsoft.com",
     "docs.github.com",
-    "github.com",
-    "raw.githubusercontent.com",
     "docs.aws.amazon.com",
     "cloud.google.com",
     "ai.google.dev",
@@ -227,18 +234,22 @@ fn web_allowed_rules() -> Vec<String> {
 /// `--allowedTools` alone only pre-approves; it doesn't remove anything, so a
 /// user whose permission mode allows more (e.g. `auto`) let a run use Bash.
 /// `--tools` sets the run's only built-in tools, and `--strict-mcp-config` with
-/// no `--mcp-config` drops the user's MCP servers.
+/// no `--mcp-config` drops the user's MCP servers. `dontAsk` denies every call
+/// the rules don't cover, whatever mode the user runs in: `auto` or bypass
+/// would otherwise approve a read outside the clone or a fetch to another host.
 fn add_claude_tools(cmd: &mut Command, tools: &[&str], allowed: &[String]) {
     cmd.arg("--tools")
         .arg(tools.join(","))
         .arg("--allowedTools")
         .arg(allowed.join(" "))
+        .arg("--permission-mode")
+        .arg("dontAsk")
         .arg("--strict-mcp-config");
 }
 
 /// Limit a Claude run to reading the repo.
 fn add_read_only_tools(cmd: &mut Command) {
-    add_claude_tools(cmd, &CLAUDE_REPO_TOOLS, &CLAUDE_REPO_TOOLS.map(String::from));
+    add_claude_tools(cmd, &CLAUDE_REPO_TOOLS, &CLAUDE_REPO_RULES.map(String::from));
 }
 
 /// The model that did the bulk of a Claude run, from the `modelUsage` map in
@@ -269,14 +280,34 @@ fn parse_claude_json(stdout: &str) -> Option<(String, bool, Option<String>)> {
     Some((text, is_error, main_model(&v)))
 }
 
+/// How argument parsers reject a flag they don't know: commander (Claude,
+/// Copilot), yargs (Gemini), clap (Codex). Seen when the CLI predates a flag
+/// Reviewly passes.
+const UNKNOWN_FLAG_SIGNS: [&str; 5] = [
+    "unknown option",
+    "unknown argument",
+    "unrecognized option",
+    "unrecognized argument",
+    "unexpected argument",
+];
+
 /// Turn a CLI failure (or a success with no output) into a *helpful* error.
-/// Well-known stderr signatures — not-signed-in, rate-limit/quota, unknown
-/// model, context-length — become a friendly one-liner so the real cause
-/// reaches the user; otherwise the trailing stderr (capped) is shown, instead
-/// of a raw multi-KB dump or a silent empty parse failure downstream.
+/// Well-known stderr signatures — an unknown flag, not-signed-in,
+/// rate-limit/quota, unknown model, context-length — become a friendly
+/// one-liner so the real cause reaches the user; otherwise the trailing stderr
+/// (capped) is shown, instead of a raw multi-KB dump or a silent empty parse
+/// failure downstream.
 fn cli_error(name: &str, code: &str, stderr: &str) -> AppError {
     let low = stderr.to_lowercase();
-    let msg = if low.contains("not logged in")
+    // Checked first: "unknown option '--model'" must not read as a bad model.
+    let flag_line = stderr.lines().find(|l| {
+        let l = l.to_lowercase();
+        UNKNOWN_FLAG_SIGNS.iter().any(|s| l.contains(s))
+    });
+    let msg = if let Some(line) = flag_line {
+        let line: String = line.trim().chars().take(160).collect();
+        format!("{name} is too old for this version of Reviewly — it rejected an option ({line}). Update {name}, then retry.")
+    } else if low.contains("not logged in")
         || low.contains("authenticat")
         || low.contains("please run")
         || (low.contains("api key") && (low.contains("missing") || low.contains("not ")))
@@ -1233,15 +1264,11 @@ async fn stream_claude(
     let mut allowed: Vec<String> = Vec::new();
     if has_repo(cwd) {
         tools.extend(CLAUDE_REPO_TOOLS);
-        allowed.extend(CLAUDE_REPO_TOOLS.map(String::from));
+        allowed.extend(CLAUDE_REPO_RULES.map(String::from));
     }
     if web_search {
         tools.extend(CLAUDE_WEB_TOOLS);
         allowed.extend(web_allowed_rules());
-        // The domain rules only pre-approve. `dontAsk` denies every call they
-        // don't cover, so a user's `auto` or bypass mode can't approve a fetch
-        // to some other host.
-        cmd.arg("--permission-mode").arg("dontAsk");
     }
     if !tools.is_empty() {
         add_claude_tools(&mut cmd, &tools, &allowed);
@@ -1551,6 +1578,20 @@ mod tests {
     }
 
     #[test]
+    fn an_old_cli_rejecting_a_flag_is_told_to_update() {
+        for (name, err) in [
+            ("claude", "error: unknown option '--strict-mcp-config'"),
+            ("gemini", "Usage: gemini [options]\n\nUnknown argument: tools"),
+            ("codex", "error: unexpected argument '--foo' found\n\nUsage: codex exec"),
+            // Names --model, but it's the flag that's unknown, not the model.
+            ("copilot", "error: unknown option '--model'"),
+        ] {
+            let msg = cli_error(name, "1", err).to_string();
+            assert!(msg.starts_with(&format!("{name} is too old")), "{msg}");
+        }
+    }
+
+    #[test]
     fn web_rules_search_anywhere_but_fetch_only_listed_hosts() {
         let rules = web_allowed_rules();
         assert_eq!(rules[0], "WebSearch");
@@ -1558,6 +1599,23 @@ mod tests {
         // A bare `WebFetch` rule would approve every host.
         assert!(!rules.contains(&"WebFetch".to_string()));
         assert!(rules.iter().all(|r| !r.contains(' ')));
+        // Hosts anyone can publish to are as untrusted as the PR.
+        assert!(!rules.iter().any(|r| r == "WebFetch(domain:github.com)"));
+    }
+
+    #[test]
+    fn repo_reads_are_scoped_to_the_clone() {
+        // A bare tool name approves every path; only the scoped rule may appear.
+        for tool in CLAUDE_REPO_TOOLS {
+            assert!(!CLAUDE_REPO_RULES.contains(&tool), "{tool}");
+        }
+        let mut cmd = Command::new("claude");
+        add_read_only_tools(&mut cmd);
+        let args: Vec<String> =
+            cmd.as_std().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let at = |flag: &str| args.iter().position(|a| a == flag).map(|i| args[i + 1].as_str());
+        assert_eq!(at("--allowedTools"), Some("Read(./**)"));
+        assert_eq!(at("--permission-mode"), Some("dontAsk"));
     }
 
     #[test]

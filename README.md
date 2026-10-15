@@ -21,7 +21,7 @@ Reviewly is a native desktop console (macOS, Windows, Linux) that turns PR revie
 
 Built with **Tauri 2** (Rust + React). Free and open source under the [GPL-3.0](LICENSE).
 
-> **Local-first by design.** Your GitHub token lives in the OS keychain. AI review runs through *your* local CLI (Claude, Codex, Gemini, GitHub Copilot) or *your* own OpenAI-compatible endpoint — only the PR diff is ever sent, and there is no Reviewly server in the middle.
+> **Local-first by design.** Your GitHub token lives in the OS keychain. AI review runs through *your* local CLI (Claude, Codex, Gemini, GitHub Copilot) or *your* own OpenAI-compatible endpoint — it sees the PR diff, plus read-only access to your local clone when you have one, and there is no Reviewly server in the middle.
 
 ---
 
@@ -133,7 +133,7 @@ Reviewly drives an AI you control — a local CLI or your own endpoint — to he
 | **GitHub Copilot** | the `copilot` CLI on your `PATH`, read-only in your clone | [Copilot CLI](https://github.com/github/copilot-cli) installed & signed in (`copilot login`); each run uses a premium request |
 | **OpenAI-compatible** | an HTTP endpoint you provide | base URL + model (+ optional API key) |
 
-The OpenAI-compatible option works with OpenAI, Ollama, LM Studio, OpenRouter, and anything else that speaks the same API. A **custom instructions** field in Settings is prepended to every prompt, so you can encode your team's review standards once.
+The OpenAI-compatible option works with OpenAI, Ollama, LM Studio, OpenRouter, and anything else that speaks the same API. Keep the CLIs up to date: Reviewly uses their recent command-line options, and if a CLI is too old to know one, the run stops with a message telling you to update it. A **custom instructions** field in Settings is prepended to every prompt, so you can encode your team's review standards once.
 
 ### Checks & CI
 
@@ -245,7 +245,7 @@ Press `?` anywhere for the in-app cheatsheet. (`⌘` is `Ctrl` on Windows/Linux.
 ## Privacy & security
 
 - **Your token stays local.** The GitHub OAuth token is held in the OS keychain, not in a config file. The OAuth client ID is public (as GitHub intends) — there is no client secret.
-- **Your code stays yours.** Reviewly has no backend. The only outbound calls are to **GitHub** (to do your review) and to **the AI backend you explicitly configure** (which receives only the PR diff and conversation, never your whole repo). If you use a local CLI or local model, nothing leaves your machine at all.
+- **Your code stays yours.** Reviewly has no backend. The only outbound calls are to **GitHub** (to do your review) and to **the AI backend you explicitly configure** (which receives the PR diff and conversation, plus any files it reads from your local clone). If you use a local model, nothing leaves your machine at all. Web search in Ask AI (Claude only) is off by default; turned on, search queries go to the web and the AI can open pages only on a fixed list of documentation and package-registry sites.
 - **No telemetry.** Reviewly doesn't phone home, track usage, or collect analytics.
 
 ## Build from source
@@ -272,6 +272,8 @@ bun run lint            # biome check
 bun run build           # build the front end only (Vite)
 bun run tauri build     # produce installers in src-tauri/target/release/bundle
 ```
+
+**Behind a private registry or proxy.** If your `.npmrc` points npm at a company registry, adding or upgrading a dependency makes bun write that registry's URLs into `bun.lock`, and CI can't reach them. Before committing, run `bun run lock:clean`: it removes the URLs and upgrades any sha1 hashes to sha512, and your installs keep going through your registry. CI runs `bun run lock:check` and fails if a lockfile slips through uncleaned.
 
 The GitHub OAuth client ID ships in [`src-tauri/.cargo/config.toml`](src-tauri/.cargo/config.toml) (`REVIEWLY_GITHUB_CLIENT_ID`) — it's public, so the app builds and signs in out of the box. To use your own OAuth app instead, register one with **Device Flow enabled** and the `repo`, `read:user`, `notifications`, and `workflow` scopes, then replace the value there.
 

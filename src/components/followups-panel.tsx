@@ -6,6 +6,7 @@ import { GradeLabel } from "@/components/tour/grade";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { Textarea } from "@/components/ui/textarea";
 import { useAiAvailable } from "@/lib/ai/use-ai-available";
 import { type FollowUpRecord, useFollowUpRunner } from "@/lib/ai/use-followup-checks";
 import type { Evidence } from "@/lib/ai/verify";
@@ -251,6 +252,10 @@ function FollowUpRow({
   viewerLogin: string | undefined;
 }) {
   const [open, setOpen] = useState(false);
+  // The suggested reply being edited, or null. The model wrote it from text in
+  // the PR, so it is never posted as is: it opens here first, for a person to
+  // read and change.
+  const [draft, setDraft] = useState<string | null>(null);
   const qc = useQueryClient();
   // The author's latest reply, then the reviewer's own if it came after.
   const replies = [latestOtherReply(f), latestOwnReplyAfterOthers(f)].filter(
@@ -378,16 +383,40 @@ function FollowUpRow({
           {record.followUp && (
             <div className="mt-1 border-t border-hairline pt-1.5">
               <div className="text-2xs text-muted-foreground">Suggested reply</div>
-              <MarkdownBody className="text-xs">{record.followUp}</MarkdownBody>
+              {draft === null ? (
+                <MarkdownBody className="text-xs">{record.followUp}</MarkdownBody>
+              ) : (
+                <Textarea
+                  className="mt-1 min-h-20 text-xs"
+                  value={draft}
+                  onChange={(e) => setDraft(e.target.value)}
+                  autoFocus
+                />
+              )}
               <div className="mt-1 flex gap-1">
-                <Button
-                  size="xs"
-                  variant="secondary"
-                  disabled={post.isPending}
-                  onClick={() => post.mutate(record.followUp as string)}
-                >
-                  Post reply
-                </Button>
+                {draft === null ? (
+                  <Button
+                    size="xs"
+                    variant="secondary"
+                    onClick={() => setDraft(record.followUp as string)}
+                  >
+                    Edit reply
+                  </Button>
+                ) : (
+                  <>
+                    <Button
+                      size="xs"
+                      variant="secondary"
+                      disabled={post.isPending || !draft.trim()}
+                      onClick={() => post.mutate(draft, { onSuccess: () => setDraft(null) })}
+                    >
+                      Post reply
+                    </Button>
+                    <Button size="xs" variant="ghost" onClick={() => setDraft(null)}>
+                      Cancel
+                    </Button>
+                  </>
+                )}
                 <Button
                   size="xs"
                   variant="ghost"

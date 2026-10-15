@@ -89,6 +89,7 @@ export function MarkdownPreview({
           // Only when the rendered text lines up with the file's head line
           // numbers — otherwise a highlight would claim the wrong lines.
           sourceLines={source.lineMapped}
+          remoteImages
         >
           {source.text}
         </MarkdownBody>

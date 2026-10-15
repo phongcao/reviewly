@@ -30,7 +30,9 @@ function fileText(repoPath: string, headSha: string, path: string): Promise<stri
   const k = at(repoPath, headSha, `file:${path}`);
   let p = fileTexts.get(k);
   if (!p) {
-    p = invoke<string>("read_file", { path: `${repoPath}/${path}` }).catch(() => null);
+    p = invoke<string>("read_file", { path: `${repoPath}/${path}`, root: repoPath }).catch(
+      () => null,
+    );
     fileTexts.set(k, p);
   }
   return p;

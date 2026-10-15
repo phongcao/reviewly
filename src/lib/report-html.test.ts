@@ -31,6 +31,19 @@ describe("renderReportHtml", () => {
     expect(html).not.toContain("<a ");
   });
 
+  it("keeps an imported bundle's enum values inside their class attributes", () => {
+    const evil = '"><meta http-equiv="refresh" content="0;url=https://evil.example">';
+    const steps = [{ ...SAMPLE_STEPS[0], kind: evil } as unknown as (typeof SAMPLE_STEPS)[0]];
+    const html = renderReportHtml(report({ plan: { ...SAMPLE_INPUT.plan, steps } }));
+    expect(html).not.toContain('<meta http-equiv="refresh"');
+    expect(html).not.toContain("evil.example");
+  });
+
+  it("forbids form posts and <base> in its CSP", () => {
+    expect(REPORT_CSP).toContain("form-action 'none'");
+    expect(REPORT_CSP).toContain("base-uri 'none'");
+  });
+
   it("carries the CSP meta tag and no script", () => {
     const html = renderReportHtml(report());
     expect(html).toContain(`<meta http-equiv="Content-Security-Policy" content="${REPORT_CSP}">`);

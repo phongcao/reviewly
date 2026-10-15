@@ -225,6 +225,26 @@ pub async fn gh_rerun_check(
 
 /// Fetch a file's raw content from the GitHub API as decoded UTF-8 text.
 /// Powers the diff viewer's "expand context" (full-file lines between hunks).
+/// The contents-API URL for `path` in `owner/repo`. Each segment is
+/// percent-encoded, so a `?` or `#` in a file name stays part of the path
+/// instead of rewriting the request sent with the user's token, and a `.` or
+/// `..` segment, which would climb to another endpoint, is refused.
+fn contents_url(owner: &str, repo: &str, path: &str) -> AppResult<String> {
+    let mut segments = Vec::new();
+    for seg in path.split('/') {
+        if seg == "." || seg == ".." {
+            return Err(AppError::Other(format!("not a repository path: {path}")));
+        }
+        segments.push(urlencoding::encode(seg));
+    }
+    Ok(format!(
+        "https://api.github.com/repos/{}/{}/contents/{}",
+        urlencoding::encode(owner),
+        urlencoding::encode(repo),
+        segments.join("/"),
+    ))
+}
+
 #[tauri::command]
 pub async fn gh_get_file_content(
     state: State<'_, AppState>,
@@ -236,7 +256,7 @@ pub async fn gh_get_file_content(
     use base64::Engine;
 
     let token = creds::require_token()?;
-    let url = format!("https://api.github.com/repos/{owner}/{repo}/contents/{path}");
+    let url = contents_url(&owner, &repo, &path)?;
     let res = github::auth_request(&state, &token, reqwest::Method::GET, &url)
         .header("Accept", "application/vnd.github+json")
         .query(&[("ref", r#ref.as_str())])
@@ -270,7 +290,7 @@ pub async fn gh_get_file_data_url(
     use crate::commands::git::{image_mime, MAX_IMAGE_BYTES};
 
     let token = creds::require_token()?;
-    let url = format!("https://api.github.com/repos/{owner}/{repo}/contents/{path}");
+    let url = contents_url(&owner, &repo, &path)?;
     let res = github::auth_request(&state, &token, reqwest::Method::GET, &url)
         .header("Accept", "application/vnd.github.raw+json")
         .query(&[("ref", r#ref.as_str())])
@@ -289,4 +309,19 @@ pub async fn gh_get_file_data_url(
         image_mime(&path),
         base64::engine::general_purpose::STANDARD.encode(&bytes)
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contents_url;
+
+    #[test]
+    fn contents_urls_keep_odd_file_names_in_the_path() {
+        assert_eq!(
+            contents_url("o", "r", "docs/a b?x=1#y.md").unwrap(),
+            "https://api.github.com/repos/o/r/contents/docs/a%20b%3Fx%3D1%23y.md"
+        );
+        assert!(contents_url("o", "r", "../../user").is_err());
+        assert!(contents_url("o", "r", "src/./a.rs").is_err());
+    }
 }

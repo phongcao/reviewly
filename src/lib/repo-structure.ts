@@ -3,7 +3,7 @@ import type { LayerEdge } from "@/lib/layer-edges";
 import { classifyRepoFile } from "@/lib/repo-files";
 import { moduleEdges, moduleOrder } from "@/lib/repo-map";
 import { type RepoModule, detectModules, skippedTotal } from "@/lib/repo-modules";
-import { type FileStat, type RepoInfo, invoke } from "@/lib/tauri";
+import { type FileHead, type FileStat, type RepoInfo, invoke } from "@/lib/tauri";
 
 /** Lines read from the top of each file for its imports — see `read_file_heads`. */
 export const HEAD_LINES = 200;
@@ -24,8 +24,8 @@ export interface RepoStructure {
   manifests: { path: string; text: string }[];
 }
 
-const tryRead = (path: string): Promise<string | null> =>
-  invoke<string>("read_file", { path }).catch(() => null);
+const tryRead = (root: string, path: string): Promise<string | null> =>
+  invoke<string>("read_file", { path, root }).catch(() => null);
 
 /**
  * Compute a repository's structure from its clone: file stats → modules →
@@ -42,15 +42,13 @@ export async function computeRepoStructure(root: string): Promise<RepoStructure>
   const modules = detectModules(files);
   const paths = modules.flatMap((m) => m.files);
   const importable = paths.filter((p) => IMPORT_FILE.test(p));
-  const heads = await invoke<{ path: string; text: string }[]>("read_file_heads", {
+  const heads = await invoke<FileHead[]>("read_file_heads", {
     path: root,
     files: importable,
     maxLines: HEAD_LINES,
   });
   const tracked = stats.map((s) => s.path);
-  const tsconfig = tracked.includes("tsconfig.json")
-    ? await tryRead(`${root}/tsconfig.json`)
-    : null;
+  const tsconfig = tracked.includes("tsconfig.json") ? await tryRead(root, "tsconfig.json") : null;
   const aliases: Aliases = {
     ...defaultAliases(tracked),
     ...(tsconfig ? aliasesFromTsconfig(tsconfig) : {}),
@@ -61,7 +59,7 @@ export async function computeRepoStructure(root: string): Promise<RepoStructure>
     await Promise.all(
       MANIFESTS.filter((m) => tracked.includes(m)).map(async (path) => ({
         path,
-        text: (await tryRead(`${root}/${path}`)) ?? "",
+        text: (await tryRead(root, path)) ?? "",
       })),
     )
   ).filter((m) => m.text);
@@ -73,7 +71,7 @@ export async function computeRepoStructure(root: string): Promise<RepoStructure>
     order: moduleOrder(modules, edges),
     skipped: skippedTotal(files),
     paths,
-    readme: readmePath ? await tryRead(`${root}/${readmePath}`) : null,
+    readme: readmePath ? await tryRead(root, readmePath) : null,
     manifests,
   };
 }

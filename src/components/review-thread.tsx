@@ -98,7 +98,7 @@ export function ReviewThreadGroup({
               timestamp={c.created_at}
               avatarClassName="size-4"
             />
-            <MarkdownBody>{c.body}</MarkdownBody>
+            <MarkdownBody remoteImages>{c.body}</MarkdownBody>
             <div className="mt-1.5">
               <ReactionsBar
                 target="review_comment"

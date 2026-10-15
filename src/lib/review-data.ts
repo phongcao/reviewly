@@ -24,6 +24,9 @@ import { getVersion } from "@tauri-apps/api/app";
 const BUNDLE_VERSION = 1;
 const BUNDLE_KIND = "reviewly.review-data";
 
+/** A bundle's PR key: `${owner}/${repo}#${number}`, as `prKey` writes it. */
+const PR_KEY_RE = /^[^/#@\s]+\/[^/#@\s]+#\d+$/;
+
 /** Everything worth carrying for one PR, keyed `${owner}/${repo}#${number}`. */
 export interface PrReviewData {
   /** The layered deep tour — the expensive one: one AI call per layer. */
@@ -165,6 +168,9 @@ export function parseBundle(text: string): ReviewDataBundle {
 
   const prs: Record<string, PrReviewData> = {};
   for (const [key, value] of Object.entries(b.prs)) {
+    // Only `owner/repo#123` keys. That also drops `__proto__`, which as a key
+    // here would replace `prs`'s prototype instead of adding an entry.
+    if (!PR_KEY_RE.test(key)) continue;
     if (!value || typeof value !== "object") continue;
     const e = value as PrReviewData;
     const entry: PrReviewData = {};
@@ -242,12 +248,19 @@ export function bundleFilename(now = new Date()): string {
   return `reviewly-review-data-${now.toISOString().slice(0, 10)}.json`;
 }
 
-/** Serialize and write a bundle to `path`. */
-export async function writeBundle(path: string, bundle: ReviewDataBundle): Promise<void> {
-  await invoke("write_bundle", { path, contents: JSON.stringify(bundle, null, 2) });
+/** Ask where to save, then write the bundle there. The file name written, or
+ * null when the user cancelled. The backend shows the dialog, so the page
+ * never hands it a path to write. */
+export async function exportBundle(bundle: ReviewDataBundle): Promise<string | null> {
+  return invoke<string | null>("export_file", {
+    kind: "bundle",
+    defaultName: bundleFilename(),
+    contents: JSON.stringify(bundle, null, 2),
+  });
 }
 
-/** Read and parse a bundle from `path`. */
-export async function readBundle(path: string): Promise<ReviewDataBundle> {
-  return parseBundle(await invoke<string>("read_bundle", { path }));
+/** Ask for a bundle file and parse it; null when the user cancelled. */
+export async function importBundle(): Promise<ReviewDataBundle | null> {
+  const text = await invoke<string | null>("import_bundle");
+  return text === null ? null : parseBundle(text);
 }

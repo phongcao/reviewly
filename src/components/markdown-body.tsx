@@ -33,6 +33,13 @@ interface Props {
    * rendered document can be mapped back to the file — see `refFromProse`.
    */
   sourceLines?: boolean;
+  /**
+   * Load images from any host. Only for text a person wrote (GitHub bodies and
+   * comments, repo docs): an image loads on render with no click, so a URL the
+   * model wrote could carry repo content to any server. Off, only GitHub
+   * attachments load and other images render as links.
+   */
+  remoteImages?: boolean;
 }
 
 /**
@@ -94,6 +101,17 @@ function MarkdownImage({ src, alt }: ComponentPropsWithoutRef<"img">) {
   return <img src={src} alt={alt ?? ""} />;
 }
 
+/** `img` for untrusted (model-written) text: GitHub attachments, else a link. */
+function LinkedImage({ src, alt }: ComponentPropsWithoutRef<"img">) {
+  if (typeof src !== "string" || !src) return null;
+  if (isGhAttachmentUrl(src)) return <GhAttachment url={src} alt={alt} />;
+  return (
+    <ExternalLink href={src} title={src}>
+      {alt ? `Image: ${alt}` : src}
+    </ExternalLink>
+  );
+}
+
 /** The source of a ```mermaid fence, or null for any other `<pre>`. */
 function mermaidSource(pre: Element | undefined): string | null {
   const code = pre?.children.find((c): c is Element => c.type === "element");
@@ -151,10 +169,11 @@ const rehypePluginsWithLines: Plugins = [...rehypePlugins, rehypeSourceLines];
 
 const components = {
   a: ExternalLink,
-  img: MarkdownImage,
+  img: LinkedImage,
   pre: MarkdownPre,
   table: MarkdownTable,
 };
+const componentsWithImages = { ...components, img: MarkdownImage };
 
 /**
  * Render a GitHub-style markdown body (review body, comment, issue) with
@@ -163,9 +182,16 @@ const components = {
  * `owner/repo#123` / `@user` references, silently drops
  * HTML comments, routes all link
  * clicks to the OS browser, and proxies GitHub-hosted media through Rust
- * with our auth token so screenshots/videos load.
+ * with our auth token so screenshots/videos load. Other images load only with
+ * `remoteImages`.
  */
-export function MarkdownBody({ children, className, urlTransform, sourceLines }: Props) {
+export function MarkdownBody({
+  children,
+  className,
+  urlTransform,
+  sourceLines,
+  remoteImages,
+}: Props) {
   const repo = useContext(MarkdownRepoContext);
   const remarkPlugins = useMemo<NonNullable<Options["remarkPlugins"]>>(
     () => [remarkGfm, [remarkGithubRefs, repo]],
@@ -177,7 +203,7 @@ export function MarkdownBody({ children, className, urlTransform, sourceLines }:
       <ReactMarkdown
         remarkPlugins={remarkPlugins}
         rehypePlugins={sourceLines ? rehypePluginsWithLines : rehypePlugins}
-        components={components}
+        components={remoteImages ? componentsWithImages : components}
         urlTransform={urlTransform}
       >
         {children}

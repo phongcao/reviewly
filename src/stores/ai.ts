@@ -90,7 +90,8 @@ interface State {
   aiTimeoutSecs: number | null;
   setAiTimeoutSecs: (secs: number | null) => void;
   /** Let the PR chat search and fetch from the web (Claude only — the other
-   * providers have no web tool we can enable). Reviews never get it. */
+   * providers have no web tool we can enable). Reviews never get it. Off
+   * until the user turns it on: search queries leave the machine. */
   chatWebSearch: boolean;
   setChatWebSearch: (on: boolean) => void;
 }
@@ -111,7 +112,7 @@ export const useAiProvider = create<State>()(
       setClaudeEffort: (claudeEffort) => set({ claudeEffort }),
       aiTimeoutSecs: null,
       setAiTimeoutSecs: (aiTimeoutSecs) => set({ aiTimeoutSecs }),
-      chatWebSearch: true,
+      chatWebSearch: false,
       setChatWebSearch: (chatWebSearch) => set({ chatWebSearch }),
     }),
     { name: "reviewly.ai", storage: sqlStorage<State>() },

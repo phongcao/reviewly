@@ -669,6 +669,7 @@ export function RepoLayers({
             )}
             <div className="min-h-0 flex-1">
               <RepoCodeView
+                root={root}
                 path={current ? `${root}/${current}` : null}
                 line={focus.line}
                 lineNonce={focus.nonce}

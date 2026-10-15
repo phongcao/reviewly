@@ -87,7 +87,6 @@ import { useReviewPrefs } from "@/stores/review-prefs";
 import { type ReviewEvent, useReviewVerdict } from "@/stores/review-verdict";
 import { checksKey, runKey, useStepCheckRuns, useStepChecks } from "@/stores/step-checks";
 import { getVersion } from "@tauri-apps/api/app";
-import { save } from "@tauri-apps/plugin-dialog";
 import {
   AlertTriangle,
   Check,
@@ -1498,14 +1497,13 @@ function Tour({
         exportedAt: Date.now(),
         app: await getVersion().catch(() => "unknown"),
       });
-      const path = await save({
-        title: "Export review report",
-        defaultPath: reportFilename(r),
-        filters: [{ name: "HTML page", extensions: ["html"] }],
+      const name = await invoke<string | null>("export_file", {
+        kind: "report",
+        defaultName: reportFilename(r),
+        contents: renderReportHtml(r, { diagramSvg }),
       });
-      if (!path) return;
-      await invoke("write_bundle", { path, contents: renderReportHtml(r, { diagramSvg }) });
-      toast.success(`Report exported to ${path.split(/[\\/]/).pop()}`);
+      if (!name) return;
+      toast.success(`Report exported to ${name}`);
     } catch (e) {
       toast.error(`Export failed — ${String(e)}`);
     } finally {

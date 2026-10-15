@@ -164,7 +164,7 @@ export function RepoDetailPage() {
     queryFn: async () => {
       for (const rel of [".github/CODEOWNERS", "CODEOWNERS", "docs/CODEOWNERS"]) {
         try {
-          return parseCodeowners(await invoke<string>("read_file", { path: `${root}/${rel}` }));
+          return parseCodeowners(await invoke<string>("read_file", { path: rel, root }));
         } catch {
           // try the next candidate location
         }
@@ -301,7 +301,7 @@ export function RepoDetailPage() {
           </ResizablePanel>
           <ResizableHandle />
           <ResizablePanel>
-            <RepoCodeView path={selected} line={focus.line} lineNonce={focus.nonce} />
+            <RepoCodeView root={root} path={selected} line={focus.line} lineNonce={focus.nonce} />
           </ResizablePanel>
         </ResizablePanelGroup>
       )}

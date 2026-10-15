@@ -15,11 +15,19 @@ export interface ParsedMessage {
 // Older replies: <action>{json}</action> — robust even when the JSON body contains
 // markdown code fences (``` won't terminate the block, unlike a fenced block).
 const TAG_RE = /<action>\s*([\s\S]*?)<\/action>/g;
-// Fallback: a fenced ```action / ```json block whose body has no inner fences.
-const FENCE_RE = /```[ \t]*[\w-]*[ \t]*\n([\s\S]*?)```/g;
+// A fenced code block: its language and body. Fences open and close at the
+// start of a line, so ``` inside a JSON string can't start one; an unclosed
+// fence runs to the end. Only a ```action block is read for an action — a
+// ```json block is how the model quotes JSON from the PR, and quoted JSON is
+// not a proposal.
+const FENCE_RE = /^[ \t]*```[ \t]*([\w-]*)[^\n]*\n([\s\S]*?)(?:^[ \t]*```[ \t]*$|(?![\s\S]))/gm;
 // Current protocol (and the fallback for a malformed wrapper): a bare JSON
-// object in the prose. Only an object that starts with a "type" key counts.
+// object in the prose. Only an object that starts with a "type" key counts,
+// and only on a line of its own (as CHAT_SYSTEM asks), so JSON quoted
+// mid-sentence, in a blockquote or in `inline code` stays prose.
 const BARE_START_RE = /\{\s*"type"\s*:/g;
+const LINE_BEFORE_RE = /^[ \t]*(?:<action>[ \t]*)?$/;
+const LINE_AFTER_RE = /^[ \t]*(?:<\/(?:action|invoke)>)?(?=[ \t]*(?:\n|$))/;
 
 /** End index (exclusive) of the JSON object opening at `start`, honoring
  * strings and escapes; -1 when it never closes. */
@@ -46,15 +54,17 @@ function stripBare(text: string, actions: AiAction[]): string {
     if (m.index < from) continue; // inside an object already taken
     const end = objectEnd(text, m.index);
     if (end < 0) break;
+    const lineStart = text.lastIndexOf("\n", m.index - 1) + 1;
+    if (!LINE_BEFORE_RE.test(text.slice(lineStart, m.index))) continue;
+    // Also drops a wrapper the model half-wrote around it: an unclosed
+    // <action>, or one it closed with its tool-call tag (`</invoke>`) by mistake.
+    const after = LINE_AFTER_RE.exec(text.slice(end));
+    if (!after) continue;
     const action = tryAction(text.slice(m.index, end));
     if (!action) continue;
     actions.push(action);
-    // Drop a wrapper the model half-wrote around it: an unclosed <action>, or
-    // one it closed with its tool-call tag (`</invoke>`) by mistake.
-    const before = text.slice(from, m.index).replace(/<action>\s*$/, "");
-    const after = /^\s*<\/(?:action|invoke)>/.exec(text.slice(end));
-    out += before;
-    from = end + (after?.[0].length ?? 0);
+    out += text.slice(from, m.index).replace(/<action>[ \t]*$/, "");
+    from = end + after[0].length;
   }
   return out + text.slice(from);
 }
@@ -67,28 +77,30 @@ function tryAction(s: string): AiAction | null {
   }
 }
 
-/** Pull AI action blocks out of an assistant message, leaving prose behind. */
-export function parseActions(content: string): ParsedMessage {
-  const actions: AiAction[] = [];
-
-  let text = content.replace(TAG_RE, (_match, inner: string) => {
+/** Pull actions out of prose (text outside code fences): tags, then bare objects. */
+function stripProse(prose: string, actions: AiAction[]): string {
+  const text = prose.replace(TAG_RE, (_match, inner: string) => {
     const action = tryAction(inner);
     if (action) actions.push(action);
     return ""; // strip the tag block whether or not it parsed
   });
+  return stripBare(text, actions);
+}
 
-  text = text.replace(FENCE_RE, (match, inner: string) => {
-    if (!inner.trim().startsWith("{")) return match; // keep non-JSON code blocks
-    const action = tryAction(inner);
-    if (action) {
-      actions.push(action);
-      return "";
-    }
-    return match;
-  });
-
-  text = stripBare(text, actions);
-
+/** Pull AI action blocks out of an assistant message, leaving prose behind.
+ * Nothing inside a code fence counts except a ```action block. */
+export function parseActions(content: string): ParsedMessage {
+  const actions: AiAction[] = [];
+  let text = "";
+  let from = 0;
+  for (const m of content.matchAll(FENCE_RE)) {
+    text += stripProse(content.slice(from, m.index), actions);
+    const action = m[1] === "action" ? tryAction(m[2]) : null;
+    if (action) actions.push(action);
+    else text += m[0];
+    from = m.index + m[0].length;
+  }
+  text += stripProse(content.slice(from), actions);
   return { text: text.trim(), actions };
 }
 

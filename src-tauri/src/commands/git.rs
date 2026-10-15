@@ -4,7 +4,7 @@ use base64::Engine;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter, State};
 use tokio::process::Command;
@@ -193,15 +193,20 @@ pub struct FileHead {
     pub text: String,
 }
 
-/// The first `max_lines` lines of one text file under `root`, or None for a
-/// missing, binary, or oversized file. Reads only as far as it needs.
-fn file_head(root: &std::path::Path, rel: &str, max_lines: usize) -> Option<FileHead> {
+/// `path` (relative to `root`, or absolute) resolved, if it exists and stays
+/// inside `root` — which must already be canonical. Catches `..` with either
+/// separator, an absolute path, and a symlink out of the tree.
+fn resolve_within(root: &Path, path: &Path) -> Option<PathBuf> {
+    let full = std::fs::canonicalize(root.join(path)).ok()?;
+    full.starts_with(root).then_some(full)
+}
+
+/// The first `max_lines` lines of one text file under `root` (canonical), or
+/// None for a missing, binary, or oversized file, or one outside `root`. Reads
+/// only as far as it needs.
+fn file_head(root: &Path, rel: &str, max_lines: usize) -> Option<FileHead> {
     use std::io::{BufReader, Read};
-    let full = root.join(rel);
-    // Refuse paths that climb out of the repository.
-    if rel.split('/').any(|seg| seg == "..") {
-        return None;
-    }
+    let full = resolve_within(root, Path::new(rel))?;
     let meta = std::fs::metadata(&full).ok()?;
     if !meta.is_file() || meta.len() > MAX_FILE_BYTES {
         return None;
@@ -233,16 +238,29 @@ pub async fn read_file_heads(
 ) -> AppResult<Vec<FileHead>> {
     let max = max_lines.unwrap_or(200);
     tokio::task::spawn_blocking(move || {
-        let root = PathBuf::from(&path);
+        let Ok(root) = std::fs::canonicalize(&path) else { return Vec::new() };
         files.iter().filter_map(|f| file_head(&root, f, max)).collect()
     })
     .await
     .map_err(|e| AppError::Other(format!("file heads: {e}")))
 }
 
-/// Read a UTF-8 text file for the code viewer. Rejects large or binary files.
+/// `path` (relative to `root`, or absolute) resolved inside the repository at
+/// `root`, or an error. Every webview read names its repository: paths come
+/// from tours, model replies and PR file lists, and none of them may reach
+/// past the clone.
+fn confine(root: &str, path: &str) -> AppResult<PathBuf> {
+    std::fs::canonicalize(root)
+        .ok()
+        .and_then(|root| resolve_within(&root, Path::new(path)))
+        .ok_or_else(|| AppError::Other("path is outside the repository".into()))
+}
+
+/// Read a UTF-8 text file under `root` for the code viewer. Rejects large or
+/// binary files, and a `path` that resolves outside `root`.
 #[tauri::command]
-pub async fn read_file(path: String) -> AppResult<String> {
+pub async fn read_file(path: String, root: String) -> AppResult<String> {
+    let path = confine(&root, &path)?;
     let meta = std::fs::metadata(&path).map_err(|e| AppError::Other(format!("stat: {e}")))?;
     if meta.len() > MAX_FILE_BYTES {
         return Err(AppError::Other("file too large to preview".into()));
@@ -279,14 +297,16 @@ pub(crate) fn image_mime(path: &str) -> &'static str {
 /// Read a small image file and return it as a `data:<mime>;base64,…` URL the UI
 /// can drop straight into an `<img src>`. The text `read_file` rejects these
 /// (null bytes) — this is the image-preview path. MIME is inferred from the
-/// extension; unknown types fall back to octet-stream.
+/// extension; unknown types fall back to octet-stream. Like `read_file`, only
+/// inside `root`.
 #[tauri::command]
-pub async fn read_file_data_url(path: String) -> AppResult<String> {
+pub async fn read_file_data_url(path: String, root: String) -> AppResult<String> {
+    let path = confine(&root, &path)?;
     let meta = std::fs::metadata(&path).map_err(|e| AppError::Other(format!("stat: {e}")))?;
     if meta.len() > MAX_IMAGE_BYTES {
         return Err(AppError::Other("image too large to preview".into()));
     }
-    let mime = image_mime(&path);
+    let mime = image_mime(&path.to_string_lossy());
     let bytes = std::fs::read(&path).map_err(|e| AppError::Other(format!("read: {e}")))?;
     Ok(format!(
         "data:{mime};base64,{}",
@@ -1486,18 +1506,12 @@ fn editor_cli_args(target_id: &str, file: &str, line: Option<u32>, column: Optio
 }
 
 /// Resolve what to hand the editor: a file inside the repo when one is named,
-/// otherwise the repository itself (the long-standing behaviour).
-fn editor_open_path(repo_path: &str, file: Option<&str>) -> String {
-    match file {
-        Some(f) if !f.trim().is_empty() => {
-            let p = std::path::Path::new(f);
-            if p.is_absolute() {
-                f.to_string()
-            } else {
-                std::path::Path::new(repo_path).join(f).to_string_lossy().into_owned()
-            }
-        }
-        _ => repo_path.to_string(),
+/// otherwise the repository itself (the long-standing behaviour). A named file
+/// must exist inside the repo, relative or absolute.
+fn editor_open_path(repo_path: &str, file: Option<&str>) -> AppResult<String> {
+    match file.map(str::trim).filter(|f| !f.is_empty()) {
+        Some(f) => Ok(confine(repo_path, f)?.to_string_lossy().into_owned()),
+        None => Ok(repo_path.to_string()),
     }
 }
 
@@ -1515,7 +1529,7 @@ pub async fn open_local_editor(
         .find(|target| target.id == target_id)
         .ok_or_else(|| AppError::Other("editor is not installed".into()))?;
 
-    let opened = editor_open_path(&path, file.as_deref());
+    let opened = editor_open_path(&path, file.as_deref())?;
 
     if let Some(cmd) = target.command {
         let mut args = editor_cli_args(&target_id, &opened, line, column);
@@ -1558,8 +1572,8 @@ pub async fn open_local_editor(
 #[cfg(test)]
 mod tests {
     use super::{
-        editor_cli_args, editor_open_path, git_file_stats, git_repo_info, read_file_heads,
-        FileHead, FileStat,
+        editor_cli_args, editor_open_path, git_file_stats, git_repo_info, read_file,
+        read_file_data_url, read_file_heads, FileHead, FileStat,
     };
 
     /// A throwaway git repo with a text file, a file with no trailing newline,
@@ -1614,6 +1628,41 @@ mod tests {
         assert_eq!(info.head.len(), 40);
         assert!(info.dirty, "the untracked file makes the tree dirty");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn file_reads_stay_inside_the_root() {
+        let base = std::env::temp_dir().join(format!("reviewly-within-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("in.txt"), "inside").unwrap();
+        std::fs::write(base.join("secret.txt"), "outside").unwrap();
+        let root_s = root.to_string_lossy().into_owned();
+        let outside = base.join("secret.txt").to_string_lossy().into_owned();
+
+        let heads = read_file_heads(
+            root_s.clone(),
+            vec!["in.txt".into(), "../secret.txt".into(), outside.clone()],
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(heads, vec![FileHead { path: "in.txt".into(), text: "inside".into() }]);
+
+        let read = |path: String| read_file(path, root_s.clone());
+        assert_eq!(read(format!("{root_s}/in.txt")).await.unwrap(), "inside");
+        assert_eq!(read("in.txt".into()).await.unwrap(), "inside");
+        assert!(read(format!("{root_s}/../secret.txt")).await.is_err());
+        assert!(read(outside.clone()).await.is_err());
+        // The image read is confined the same way.
+        assert!(read_file_data_url(outside.clone(), root_s.clone()).await.is_err());
+        assert!(read_file_data_url(format!("{root_s}/in.txt"), root_s.clone()).await.is_ok());
+        // So is the editor: it opens files in the repo, never beside it.
+        assert!(editor_open_path(&root_s, Some(&outside)).is_err());
+        assert!(editor_open_path(&root_s, Some("../secret.txt")).is_err());
+        assert!(editor_open_path(&root_s, Some("in.txt")).unwrap().ends_with("in.txt"));
+        std::fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -1687,20 +1736,10 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_file_resolves_against_the_repo_root() {
-        assert_eq!(editor_open_path("/r", Some("src/a.ts")), "/r/src/a.ts");
-    }
-
-    #[test]
-    fn an_absolute_file_is_left_alone() {
-        assert_eq!(editor_open_path("/r", Some("/other/a.ts")), "/other/a.ts");
-    }
-
-    #[test]
     fn no_file_still_opens_the_repository() {
-        assert_eq!(editor_open_path("/r", None), "/r");
-        assert_eq!(editor_open_path("/r", Some("")), "/r");
-        assert_eq!(editor_open_path("/r", Some("   ")), "/r");
+        assert_eq!(editor_open_path("/r", None).unwrap(), "/r");
+        assert_eq!(editor_open_path("/r", Some("")).unwrap(), "/r");
+        assert_eq!(editor_open_path("/r", Some("   ")).unwrap(), "/r");
     }
 
     /// Back-compat guard: the header menu still calls this command with only

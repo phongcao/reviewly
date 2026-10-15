@@ -45,14 +45,16 @@ pub async fn auth_device_poll(
 ) -> AppResult<github::Viewer> {
     let token = device::poll(&state, &device_code, interval, 900).await?;
     creds::save_token(&token)?;
+    state.cache_clear();
     let viewer = github::viewer(&state, &token).await?;
     let _ = app.emit("auth:ready", &viewer);
     Ok(viewer)
 }
 
 #[tauri::command]
-pub fn auth_sign_out(app: AppHandle) -> AppResult<()> {
+pub fn auth_sign_out(app: AppHandle, state: State<'_, AppState>) -> AppResult<()> {
     creds::delete_token()?;
+    state.cache_clear();
     let _ = app.emit("auth:signed_out", ());
     Ok(())
 }
@@ -100,6 +102,7 @@ pub async fn auth_use_gh_cli(
     // Verify by hitting /user first so we don't store a stale token.
     let viewer = github::viewer(&state, &token).await?;
     creds::save_token(&token)?;
+    state.cache_clear();
     let _ = app.emit("auth:ready", &viewer);
     Ok(viewer)
 }

@@ -242,6 +242,12 @@ export interface FileStat {
   binary: boolean;
 }
 
+/** `read_file_heads` — the first lines of one text file. */
+export interface FileHead {
+  path: string;
+  text: string;
+}
+
 export interface PullFile {
   sha: string | null;
   filename: string;

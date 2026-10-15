@@ -81,7 +81,9 @@ export function useStepCheckRunner({
         // around the anchor, numbered, and the file's length for the parser.
         const fileText =
           repo && cwd
-            ? await invoke<string>("read_file", { path: `${cwd}/${step.path}` }).catch(() => "")
+            ? await invoke<string>("read_file", { path: `${cwd}/${step.path}`, root: cwd }).catch(
+                () => "",
+              )
             : null;
         const fileLines = fileText === null ? [] : fileText.split("\n");
         const from = Math.max(1, step.line - REPO_EXCERPT_LINES);

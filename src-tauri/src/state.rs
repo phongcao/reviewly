@@ -79,6 +79,13 @@ impl AppState {
         self.gh_cache.get(key).map(|e| e.value.clone())
     }
 
+    /// Drop every cached response. The cache is keyed by request alone, not by
+    /// account, so it's emptied whenever the signed-in token changes: search
+    /// results from one account can name another's private repositories.
+    pub fn cache_clear(&self) {
+        self.gh_cache.clear();
+    }
+
     /// Mark a key's cached value as fresh again (on a 304 Not Modified).
     pub fn cache_refresh(&self, key: &str) {
         if let Some(mut e) = self.gh_cache.get_mut(key) {
